@@ -122,9 +122,17 @@ DEFAULT_TOWN_TUNE = [
 TOWN_TUNE_PATH = os.path.expanduser(
     os.environ.get("AC_UI_TOWN_TUNE_PATH", "~/.local/share/ac-terminal-radio/town_tune.json")
 )
-TOWN_TUNE_ENABLED = os.environ.get("AC_UI_TOWN_TUNE", "0").lower() in ("1", "true", "yes")
-TOWN_TUNE_TEMPO = int(os.environ.get("AC_UI_TOWN_TUNE_TEMPO", "120"))
+TOWN_TUNE_ENABLED = os.environ.get("AC_UI_TOWN_TUNE", "1").lower() in ("1", "true", "yes")
+TOWN_TUNE_CHIME_ENABLED = os.environ.get("AC_UI_TOWN_TUNE_CHIME", "0").lower() in ("1", "true", "yes")
+TOWN_TUNE_TEMPO = int(os.environ.get("AC_UI_TOWN_TUNE_TEMPO", "50"))
+TOWN_TUNE_STEP_FRACTION = float(os.environ.get("AC_UI_TOWN_TUNE_STEP", "1.0"))
 TOWN_TUNE_GAIN = float(os.environ.get("AC_UI_TOWN_TUNE_GAIN", "0.6"))
+TOWN_TUNE_PROGRAM = int(os.environ.get("AC_UI_TOWN_TUNE_PROGRAM", "12"))
+FLUIDSYNTH_OPTS = os.environ.get(
+    "AC_UI_FLUIDSYNTH_OPTS",
+    "-o synth.reverb.active=1 -o synth.reverb.room-size=0.75 -o synth.reverb.damp=0.4 "
+    "-o synth.reverb.width=0.9 -o synth.reverb.level=0.3",
+).strip()
 FLUIDSYNTH = os.environ.get("AC_UI_FLUIDSYNTH", "fluidsynth")
 FLUIDSYNTH_AUDIO = os.environ.get("AC_UI_FLUIDSYNTH_AUDIO", "").strip()
 SOUNDFONT_PATH = os.path.expanduser(
@@ -672,7 +680,7 @@ def _var_len(value):
         value >>= 7
     return bytes(reversed(buf))
 
-def write_town_tune_midi(notes, path, tempo_bpm=120, ticks_per_beat=480, step_fraction=0.25):
+def write_town_tune_midi(notes, path, tempo_bpm=120, ticks_per_beat=480, step_fraction=1.0, program=0):
     notes = normalize_town_tune(notes)
     step_ticks = max(1, int(ticks_per_beat * step_fraction))
     events = []
@@ -706,9 +714,9 @@ def write_town_tune_midi(notes, path, tempo_bpm=120, ticks_per_beat=480, step_fr
     track.extend(_var_len(0))
     track.extend(b"\xFF\x51\x03")
     track.extend(struct.pack(">I", mpqn)[1:])
-    # Program change (Acoustic Grand)
+    # Program change
     track.extend(_var_len(0))
-    track.extend(bytes([0xC0, 0]))
+    track.extend(bytes([0xC0, program & 0x7F]))
     # Notes
     last_time = 0
     for t, is_on, midi_note in events:
@@ -740,8 +748,16 @@ def spawn_town_tune(audio_device=None):
     notes = load_town_tune()
     tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".mid", delete=False)
     tmp.close()
-    write_town_tune_midi(notes, tmp.name, tempo_bpm=TOWN_TUNE_TEMPO)
+    write_town_tune_midi(
+        notes,
+        tmp.name,
+        tempo_bpm=TOWN_TUNE_TEMPO,
+        step_fraction=TOWN_TUNE_STEP_FRACTION,
+        program=TOWN_TUNE_PROGRAM,
+    )
     cmd = [FLUIDSYNTH, "-ni", "-g", str(TOWN_TUNE_GAIN)]
+    if FLUIDSYNTH_OPTS:
+        cmd += FLUIDSYNTH_OPTS.split()
     if FLUIDSYNTH_AUDIO:
         cmd += ["-a", FLUIDSYNTH_AUDIO]
     elif audio_device and audio_device.startswith("pulse/"):
@@ -773,8 +789,16 @@ def town_tune_cli(action=None):
             return 1
         tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".mid", delete=False)
         tmp.close()
-        write_town_tune_midi(notes, tmp.name, tempo_bpm=TOWN_TUNE_TEMPO)
+        write_town_tune_midi(
+            notes,
+            tmp.name,
+            tempo_bpm=TOWN_TUNE_TEMPO,
+            step_fraction=TOWN_TUNE_STEP_FRACTION,
+            program=TOWN_TUNE_PROGRAM,
+        )
         cmd = [FLUIDSYNTH, "-ni", "-g", str(TOWN_TUNE_GAIN)]
+        if FLUIDSYNTH_OPTS:
+            cmd += FLUIDSYNTH_OPTS.split()
         if FLUIDSYNTH_AUDIO:
             cmd += ["-a", FLUIDSYNTH_AUDIO]
         cmd += [SOUNDFONT_PATH, tmp.name]
@@ -1454,9 +1478,10 @@ def play_chime(audio_device=None):
         pass
 
 def start_hour_chime(audio_device=None):
-    proc, tmp = spawn_town_tune(audio_device)
-    if proc:
-        return proc, "town tune", tmp
+    if TOWN_TUNE_CHIME_ENABLED:
+        proc, tmp = spawn_town_tune(audio_device)
+        if proc:
+            return proc, "town tune", tmp
     if not HOUR_CHIME_PATH:
         return None, None, None
     if not os.path.exists(HOUR_CHIME_PATH):

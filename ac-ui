@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap
+import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap, tempfile, struct
 from collections import deque
 
 MUSIC_DIR = os.path.expanduser("~/.local/share/ac-terminal-radio/music")
@@ -107,6 +107,36 @@ DEFAULT_HOUR_CHIME_NAME = "wild-world-town-tune.wav"
 DEFAULT_HOUR_CHIME = os.path.join(CHIME_DIR, DEFAULT_HOUR_CHIME_NAME)
 SOURCE_HOUR_CHIME = "/home/jfitz/Documents/Animal Crossing ) [x1FWild World： Town Tune (Defaultu0jiqLfo].wav"
 
+# Town tune (16-step) + FluidSynth support
+TOWN_TUNE_STEPS = 16
+TOWN_TUNE_NOTES = [
+    "C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5",
+    "D5", "E5", "F5", "G5", "A5", "B5", "C6", "D6",
+]
+TOWN_TUNE_REST = "REST"
+TOWN_TUNE_HOLD = "HOLD"
+DEFAULT_TOWN_TUNE = [
+    "C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5",
+    "B4", "A4", "G4", "F4", "E4", "D4", "C4", "REST",
+]
+TOWN_TUNE_PATH = os.path.expanduser(
+    os.environ.get("AC_UI_TOWN_TUNE_PATH", "~/.local/share/ac-terminal-radio/town_tune.json")
+)
+TOWN_TUNE_ENABLED = os.environ.get("AC_UI_TOWN_TUNE", "0").lower() in ("1", "true", "yes")
+TOWN_TUNE_TEMPO = int(os.environ.get("AC_UI_TOWN_TUNE_TEMPO", "120"))
+TOWN_TUNE_GAIN = float(os.environ.get("AC_UI_TOWN_TUNE_GAIN", "0.6"))
+FLUIDSYNTH = os.environ.get("AC_UI_FLUIDSYNTH", "fluidsynth")
+FLUIDSYNTH_AUDIO = os.environ.get("AC_UI_FLUIDSYNTH_AUDIO", "").strip()
+SOUNDFONT_PATH = os.path.expanduser(
+    os.environ.get("AC_UI_SOUNDFONT", "~/.local/share/ac-terminal-radio/soundfonts/FluidR3_GM.sf2")
+)
+
+# Local stats (on by default)
+STATS_ENABLED = os.environ.get("AC_UI_STATS", "1").lower() in ("1", "true", "yes")
+STATS_DIR = os.path.expanduser(os.environ.get("AC_UI_STATS_DIR", "~/.local/share/ac-terminal-radio"))
+STATS_JSON = os.path.join(STATS_DIR, "stats.json")
+STATS_CSV = os.path.join(STATS_DIR, "stats.csv")
+
 HOUR_CHIME_PATH = os.path.expanduser(os.environ.get("AC_UI_HOUR_CHIME", DEFAULT_HOUR_CHIME))
 if os.environ.get("AC_UI_HOUR_CHIME") is None:
     # Auto-import the default chime into the app folder if present.
@@ -130,6 +160,8 @@ def parse_cli_args(argv):
     mode = "run"
     games = None
     import_paths = []
+    tune_action = None
+    layout_opts = None
     i = 1
     while i < len(argv):
         arg = argv[i]
@@ -137,10 +169,35 @@ def parse_cli_args(argv):
             print("Usage:")
             print("  ac-ui [--games GCN,WW]")
             print("  ac-ui import <files...>")
+            print("  ac-ui tune [show|play]")
+            print("  ac-ui stats")
+            print("  ac-ui layout-sweep")
             sys.exit(0)
         if arg == "import":
             mode = "import"
             import_paths = argv[i + 1:]
+            break
+        if arg == "tune":
+            mode = "tune"
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                tune_action = argv[i + 1]
+            break
+        if arg == "stats":
+            mode = "stats"
+            break
+        if arg == "layout-sweep":
+            mode = "layout-sweep"
+            layout_opts = {}
+            i += 1
+            while i < len(argv):
+                if argv[i].startswith("--"):
+                    key = argv[i][2:].replace("-", "_")
+                    if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                        layout_opts[key] = argv[i + 1]
+                        i += 1
+                    else:
+                        layout_opts[key] = "1"
+                i += 1
             break
         if arg.startswith("--games="):
             games = arg.split("=", 1)[1]
@@ -150,13 +207,607 @@ def parse_cli_args(argv):
         i += 1
     if games:
         games = {g.strip().upper() for g in games.split(",") if g.strip()}
-    return mode, games, import_paths
+    return mode, games, import_paths, tune_action, layout_opts
 
 def parse_filename(name):
     m = FILENAME_RE.match(name)
     if not m:
         return None
     return m.groupdict()
+
+def _normalize_tune_token(token):
+    if token is None:
+        return None
+    t = str(token).strip().upper()
+    if t in ("", "NONE"):
+        return None
+    if t in ("-", "REST", "R"):
+        return TOWN_TUNE_REST
+    if t in ("H", "HOLD", "_"):
+        return TOWN_TUNE_HOLD
+    # Normalize note names like c4 -> C4
+    if len(t) >= 2 and t[0] in "ABCDEFG":
+        note = t[0]
+        suffix = t[1:]
+        if suffix and suffix[0] in ("#", "B"):
+            note = note + suffix[0]
+            suffix = suffix[1:]
+        if suffix.isdigit():
+            return f"{note}{suffix}"
+    return None
+
+def normalize_town_tune(notes):
+    out = []
+    for n in notes:
+        tok = _normalize_tune_token(n)
+        if tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD) or tok in TOWN_TUNE_NOTES:
+            out.append(tok)
+        else:
+            out.append(TOWN_TUNE_REST)
+    if len(out) < TOWN_TUNE_STEPS:
+        out.extend([TOWN_TUNE_REST] * (TOWN_TUNE_STEPS - len(out)))
+    return out[:TOWN_TUNE_STEPS]
+
+def load_town_tune():
+    notes = list(DEFAULT_TOWN_TUNE)
+    try:
+        if os.path.exists(TOWN_TUNE_PATH):
+            with open(TOWN_TUNE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "notes" in data:
+                data = data["notes"]
+            if isinstance(data, list):
+                notes = data
+    except Exception:
+        pass
+    return normalize_town_tune(notes)
+
+def save_town_tune(notes):
+    notes = normalize_town_tune(notes)
+    os.makedirs(os.path.dirname(TOWN_TUNE_PATH), exist_ok=True)
+    with open(TOWN_TUNE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"notes": notes}, f, indent=2)
+    return notes
+
+def load_stats():
+    data = {
+        "total_listen_seconds": 0,
+        "hour_buckets": [0] * 24,
+        "sessions": 0,
+        "last_session": None,
+    }
+    try:
+        if os.path.exists(STATS_JSON):
+            with open(STATS_JSON, "r", encoding="utf-8") as f:
+                src = json.load(f)
+            if isinstance(src, dict):
+                data.update(src)
+    except Exception:
+        pass
+    # Normalize buckets
+    hb = data.get("hour_buckets")
+    if not isinstance(hb, list) or len(hb) != 24:
+        data["hour_buckets"] = [0] * 24
+    return data
+
+def save_stats(data):
+    os.makedirs(STATS_DIR, exist_ok=True)
+    with open(STATS_JSON, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def append_stats_csv(row):
+    os.makedirs(STATS_DIR, exist_ok=True)
+    new_file = not os.path.exists(STATS_CSV)
+    with open(STATS_CSV, "a", encoding="utf-8") as f:
+        if new_file:
+            f.write("session_start,session_end,listen_seconds,top_hours\n")
+        f.write(row + "\n")
+
+def start_stats_writer():
+    q = queue.Queue()
+    stop_evt = threading.Event()
+
+    def worker():
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            kind, payload = item
+            try:
+                if kind == "json":
+                    save_stats(payload)
+                elif kind == "csv":
+                    append_stats_csv(payload)
+            except Exception:
+                pass
+        stop_evt.set()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return q, stop_evt
+
+def format_seconds(sec):
+    sec = int(max(0, sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def stats_cli():
+    if not os.path.exists(STATS_JSON):
+        print("No stats yet. Enable with AC_UI_STATS=1 and listen for a bit.")
+        return 0
+    data = load_stats()
+    total = data.get("total_listen_seconds", 0)
+    hb = data.get("hour_buckets", [0] * 24)
+    top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
+    top_fmt = ", ".join([f"{h:02d}:00 ({format_seconds(v)})" for h, v in top if v > 0]) or "(none)"
+    print("AC-UI Listening Stats")
+    print(f"Total listening time: {format_seconds(total)}")
+    print(f"Top hours: {top_fmt}")
+    return 0
+
+def _int_opt(opts, key, default):
+    try:
+        return int(opts.get(key, default))
+    except Exception:
+        return default
+
+def _str_opt(opts, key, default):
+    return str(opts.get(key, default))
+
+def build_layout_preview(term_cols, term_rows):
+    # Minimal, deterministic preview for layout debugging
+    hour = 14
+    remaining = 30 * 60 + 44
+    current_track = "/music/14-GCN-normal.mp3"
+    current_track_hour = 14
+    output_vol = 75
+    muted = False
+    history = deque(["14-GCN-normal.mp3"])
+    next_candidates = [
+        "14-GCN-cheery.mp3",
+        "14-NH-winter.flac",
+        "14-NH-rainy.flac",
+        "... +2 more",
+    ]
+    showing_chime = False
+    chime_kind = None
+    vis_idx = 0
+    stats_data = {
+        "total_listen_seconds": 16,
+        "hour_buckets": [0] * 24,
+    }
+    stats_data["hour_buckets"][14] = 16
+    session_listen = 16
+
+    # Layout sizing (mirror main loop logic)
+    layout_mode = "normal"
+    if term_cols < 58 or term_rows < 18:
+        layout_mode = "tiny"
+    elif term_cols < 78 or term_rows < 22:
+        layout_mode = "small"
+
+    tiny_term = layout_mode == "tiny"
+    small_term = layout_mode in ("tiny", "small")
+    ultra_compact = term_rows < 10
+    info_max_width = max(10, term_cols - 5)
+    min_spectrum_rows = 6
+    base_spectrum = 3 if ultra_compact else 4 if tiny_term else 6 if small_term else CAVA_HEIGHT
+    spectrum_height = max(min_spectrum_rows, base_spectrum)
+
+    lines = []
+    info = []
+    info_plain = []
+    def add_info_line(text, color_code="2"):
+        text = truncate_plain(text, info_max_width)
+        info_plain.append(text)
+        info.append(c(text, color_code))
+
+    tline = f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    lines.append(c(tline, "2"))
+
+    max_info_rows = term_rows - min_spectrum_rows - 1 - 1 - 2
+    compact_info = max_info_rows < 10 or term_cols < 70 or ultra_compact
+
+    if not ultra_compact:
+        if (not compact_info):
+            title = ["AC-UI"]
+            info.extend([c(line, "38;5;77") for line in title])
+            info_plain.extend([line for line in title])
+
+        if not compact_info:
+            controls_plain = "Controls: [n] next track   [e] edit town tune   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
+            if tiny_term:
+                controls_plain = "Keys: n next  e tune  q quit  s audio output  ? help / more  +/- vol"
+            max_controls_width = max(20, term_cols - 6)
+            controls_wrapped = wrap_plain(controls_plain, max_controls_width)
+            for line in controls_wrapped:
+                add_info_line(line, "33")
+            add_info_line("", "2")
+
+        fline = "Filter: Game=ALL  Variant=ALL"
+        add_info_line(fline, "2")
+        vline = f"Visualizer: {VIS_MODES[vis_idx]}"
+        add_info_line(vline, "2")
+        if showing_chime:
+            label = chime_kind or "hour chime"
+            line1_plain = f"Hour folder: --    Now playing: ({label})"
+            add_info_line(line1_plain, "36")
+        elif current_track:
+            line1_plain = f"Hour folder: {current_track_hour:02d}    Now playing: {os.path.basename(current_track)}"
+            add_info_line(line1_plain, "36")
+            if not compact_info:
+                line2_plain = "Playback: 00:16 / 02:19"
+                add_info_line(line2_plain, "35")
+            if not compact_info:
+                vline = f"Volume: {int(output_vol):3d}%"
+                add_info_line(vline, "33")
+            if not compact_info:
+                mline = f"Mute: {'ON' if muted else 'OFF'}"
+                add_info_line(mline, "33")
+        else:
+            line1_plain = f"Hour folder: {hour:02d}    Now playing: (none found)"
+            add_info_line(line1_plain, "36")
+        if not compact_info:
+            add_info_line("", "2")
+        ulabel = "Until next hour:"
+        uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
+        uline = f"{ulabel} {uvalue}"
+        add_info_line(uline, "95")
+
+    info_box = None
+    info_w = 0
+    if not ultra_compact:
+        if max_info_rows <= 0:
+            info_plain = []
+            info = []
+        elif len(info_plain) > max_info_rows:
+            info_plain = info_plain[:max_info_rows]
+            info = info[:max_info_rows]
+        if info_plain and (not (compact_info)):
+            info_w_needed = max([len(line) for line in info_plain] + [0])
+            info_w_cache = min(info_max_width, info_w_needed)
+            info_box, info_w = build_box(info_plain, info, info_w_cache)
+
+    stats_box = None
+    stats_w = 0
+    if (not ultra_compact) and STATS_ENABLED and stats_data is not None:
+        total_sec = int(stats_data.get("total_listen_seconds", 0) + session_listen)
+        hb = stats_data.get("hour_buckets", [0] * 24)
+        top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
+        top_fmt = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none)"
+        stats_plain = [
+            "Stats",
+            f"Total: {format_seconds(total_sec)}",
+            f"Session: {format_seconds(session_listen)}",
+            f"Top hours: {top_fmt}",
+        ]
+        stats_color = [
+            c(stats_plain[0], "36"),
+            c(stats_plain[1], "2"),
+            c(stats_plain[2], "2"),
+            c(stats_plain[3], "2"),
+        ]
+        stats_box, stats_w = build_box(stats_plain, stats_color)
+
+    if info_box or stats_box:
+        side_by_side = False
+        if info_box and stats_box:
+            total_w = (info_w + 4) + (stats_w + 4)
+            side_by_side = (total_w + 3 <= term_cols)
+        rows_needed = 0
+        if info_box and stats_box:
+            rows_needed = max(len(info_box), len(stats_box)) if side_by_side else (len(info_box) + len(stats_box))
+        elif info_box:
+            rows_needed = len(info_box)
+        elif stats_box:
+            rows_needed = len(stats_box)
+        available = term_rows - min_spectrum_rows - 1 - len(lines)
+        if rows_needed > available:
+            stats_box = None
+            side_by_side = False
+            rows_needed = len(info_box) if info_box else 0
+        if info_box and rows_needed > available:
+            max_rows = max(0, available - 2)
+            if len(info_plain) > max_rows:
+                info_plain = info_plain[:max_rows]
+                info = info[:max_rows]
+                info_w_needed = max([len(line) for line in info_plain] + [0])
+                info_w_cache = min(info_max_width, info_w_needed)
+                info_box, info_w = build_box(info_plain, info, info_w_cache)
+
+    if info_box and stats_box:
+        total_w = (info_w + 4) + (stats_w + 4)
+        if total_w + 3 <= term_cols:
+            target_len = max(len(info_box), len(stats_box))
+            info_box = pad_box_lines(info_box, info_w, target_len)
+            stats_box = pad_box_lines(stats_box, stats_w, target_len)
+            for left, right in zip(info_box, stats_box):
+                lines.append(left + "   " + right)
+        else:
+            lines.extend(info_box)
+            lines.extend(stats_box)
+    elif info_box:
+        lines.extend(info_box)
+    elif stats_box:
+        lines.extend(stats_box)
+
+    show_history = (not tiny_term) and (not ultra_compact) and (not compact_info)
+    show_up_next = (not (tiny_term or small_term)) and (not ultra_compact) and (not compact_info)
+    rows_budget = term_rows - len(lines) - min_spectrum_rows - 1
+    if rows_budget <= 0:
+        show_history = False
+        show_up_next = False
+    panel_max_width = info_max_width
+    if show_history and show_up_next:
+        panel_max_width = max(10, (term_cols - 10) // 2)
+
+    hist_box = None
+    up_box = None
+    if show_history:
+        hist_title = "Recently played"
+        hist_title_trunc = truncate_plain(hist_title, info_max_width)
+        hist_list = list(history)[-HISTORY_MAX:]
+        hist_lines = [hist_title_trunc] + (hist_list if hist_list else ["(none yet)"])
+        hist_lines = [truncate_plain(s, panel_max_width) for s in hist_lines]
+        hist_plain = hist_lines
+        hist_color = [c(hist_title_trunc, "36")] + [c(s, "2") for s in hist_lines[1:]]
+        hist_box, hist_w = build_box(hist_plain, hist_color)
+
+    if show_up_next:
+        if next_candidates:
+            shown = list(next_candidates[:UP_NEXT_MAX])
+            header_plain = f"Up next ({min(len(next_candidates), UP_NEXT_MAX)}/{len(next_candidates)})"
+            header_plain_trunc = truncate_plain(header_plain, info_max_width)
+            up_plain = [header_plain_trunc] + shown
+            up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
+            up_color = [c(header_plain_trunc, "36")] + [c(s, "2") for s in up_plain[1:]]
+        else:
+            up_title = "Up next"
+            up_title_trunc = truncate_plain(up_title, info_max_width)
+            up_plain = [up_title_trunc, "(no candidates)"]
+            up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
+            up_color = [c(up_title_trunc, "36"), c("(no candidates)", "2")]
+        up_box, up_w = build_box(up_plain, up_color)
+
+    if hist_box and up_box:
+        panel_height = max(len(hist_box), len(up_box))
+    elif hist_box:
+        panel_height = len(hist_box)
+    elif up_box:
+        panel_height = len(up_box)
+    else:
+        panel_height = 0
+    if panel_height and (len(lines) + panel_height + min_spectrum_rows + 1 > term_rows):
+        hist_box = None
+        up_box = None
+
+    if hist_box and up_box:
+        total_w = (hist_w + 4) + (up_w + 4)
+        if total_w + 3 <= term_cols:
+            target_len = max(len(hist_box), len(up_box))
+            hist_box = pad_box_lines(hist_box, hist_w, target_len)
+            up_box = pad_box_lines(up_box, up_w, target_len)
+            for left, right in zip(hist_box, up_box):
+                lines.append(left + "   " + right)
+        else:
+            lines.extend(hist_box)
+            lines.extend(up_box)
+    elif hist_box:
+        lines.extend(hist_box)
+    elif up_box:
+        lines.extend(up_box)
+
+    while lines and lines[-1].strip() == "" and (len(lines) + min_spectrum_rows + 1 > term_rows):
+        lines.pop()
+
+    prefix = "  "
+    rows_used = len(lines)
+    available_rows = max(0, term_rows - rows_used - 1)
+    spectrum_height_dyn = min(spectrum_height, max(0, available_rows))
+    bars_len = max(10, term_cols - len(prefix) - CAVA_MARGIN)
+    mock_bars = [((i % 7) + 1) / 8 for i in range(max(CAVA_MIN_BARS, bars_len))]
+    if spectrum_height_dyn > 0:
+        bars = mock_bars[:bars_len]
+        lines.extend([prefix + ln for ln in spectrum_lines(bars, height=spectrum_height_dyn, use_color=False, mode="bars")])
+        lines.append(prefix + ("-" * bars_len))
+
+    if len(lines) < term_rows:
+        lines.extend([""] * (term_rows - len(lines)))
+    elif len(lines) > term_rows:
+        lines = lines[:term_rows]
+    return [strip_ansi(ln) for ln in lines]
+
+def layout_sweep_cli(opts=None):
+    opts = opts or {}
+    min_rows = _int_opt(opts, "min_rows", 10)
+    max_rows = _int_opt(opts, "max_rows", 40)
+    min_cols = _int_opt(opts, "min_cols", 60)
+    max_cols = _int_opt(opts, "max_cols", 190)
+    step_rows = _int_opt(opts, "step_rows", 1)
+    step_cols = _int_opt(opts, "step_cols", 1)
+    out_dir = os.path.expanduser(_str_opt(opts, "out", "~/.local/share/ac-terminal-radio/layout_sweep"))
+    os.makedirs(out_dir, exist_ok=True)
+    count = 0
+    for rows in range(min_rows, max_rows + 1, step_rows):
+        for cols in range(min_cols, max_cols + 1, step_cols):
+            lines = build_layout_preview(cols, rows)
+            path = os.path.join(out_dir, f"layout_{rows}x{cols}.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            count += 1
+    print(f"Wrote {count} layout files to {out_dir}")
+    return 0
+
+def note_name_to_midi(name):
+    name = name.upper()
+    if name == TOWN_TUNE_REST or name == TOWN_TUNE_HOLD:
+        return None
+    if len(name) < 2:
+        return None
+    note = name[0]
+    rest = name[1:]
+    accidental = 0
+    if rest and rest[0] in ("#", "B"):
+        accidental = 1 if rest[0] == "#" else -1
+        rest = rest[1:]
+    if not rest.isdigit():
+        return None
+    octave = int(rest)
+    base = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}.get(note)
+    if base is None:
+        return None
+    return 12 * (octave + 1) + base + accidental
+
+def _var_len(value):
+    buf = [value & 0x7F]
+    value >>= 7
+    while value:
+        buf.append(0x80 | (value & 0x7F))
+        value >>= 7
+    return bytes(reversed(buf))
+
+def write_town_tune_midi(notes, path, tempo_bpm=120, ticks_per_beat=480, step_fraction=0.25):
+    notes = normalize_town_tune(notes)
+    step_ticks = max(1, int(ticks_per_beat * step_fraction))
+    events = []
+    time_ticks = 0
+    i = 0
+    while i < len(notes):
+        tok = notes[i]
+        if tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD):
+            time_ticks += step_ticks
+            i += 1
+            continue
+        midi_note = note_name_to_midi(tok)
+        if midi_note is None:
+            time_ticks += step_ticks
+            i += 1
+            continue
+        dur = step_ticks
+        j = i + 1
+        while j < len(notes) and notes[j] == TOWN_TUNE_HOLD:
+            dur += step_ticks
+            j += 1
+        events.append((time_ticks, 1, midi_note))  # note on
+        events.append((time_ticks + dur, 0, midi_note))  # note off
+        time_ticks += dur
+        i = j
+    events.sort(key=lambda e: (e[0], e[1]))  # note-off before note-on at same time
+
+    track = bytearray()
+    # Tempo meta event
+    mpqn = int(60_000_000 / max(1, int(tempo_bpm)))
+    track.extend(_var_len(0))
+    track.extend(b"\xFF\x51\x03")
+    track.extend(struct.pack(">I", mpqn)[1:])
+    # Program change (Acoustic Grand)
+    track.extend(_var_len(0))
+    track.extend(bytes([0xC0, 0]))
+    # Notes
+    last_time = 0
+    for t, is_on, midi_note in events:
+        delta = t - last_time
+        track.extend(_var_len(delta))
+        if is_on:
+            track.extend(bytes([0x90, midi_note, 90]))
+        else:
+            track.extend(bytes([0x80, midi_note, 0]))
+        last_time = t
+    # End of track
+    track.extend(_var_len(0))
+    track.extend(b"\xFF\x2F\x00")
+
+    with open(path, "wb") as f:
+        f.write(b"MThd")
+        f.write(struct.pack(">IHHH", 6, 0, 1, ticks_per_beat))
+        f.write(b"MTrk")
+        f.write(struct.pack(">I", len(track)))
+        f.write(track)
+
+def spawn_town_tune(audio_device=None):
+    if not TOWN_TUNE_ENABLED:
+        return None, None
+    if not shutil.which(FLUIDSYNTH):
+        return None, None
+    if not os.path.exists(SOUNDFONT_PATH):
+        return None, None
+    notes = load_town_tune()
+    tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".mid", delete=False)
+    tmp.close()
+    write_town_tune_midi(notes, tmp.name, tempo_bpm=TOWN_TUNE_TEMPO)
+    cmd = [FLUIDSYNTH, "-ni", "-g", str(TOWN_TUNE_GAIN)]
+    if FLUIDSYNTH_AUDIO:
+        cmd += ["-a", FLUIDSYNTH_AUDIO]
+    elif audio_device and audio_device.startswith("pulse/"):
+        sink = audio_device.split("/", 1)[1]
+        cmd += ["-a", "pulseaudio", "-o", f"audio.pulseaudio.device={sink}"]
+    cmd += [SOUNDFONT_PATH, tmp.name]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return proc, tmp.name
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        return None, None
+
+def town_tune_cli(action=None):
+    notes = load_town_tune()
+    if action in ("show", "print"):
+        print("Town tune (16 steps):")
+        print(" ".join(f"{i+1:02d}:{n}" for i, n in enumerate(notes)))
+        return 0
+    if action in ("play", "preview"):
+        if not shutil.which(FLUIDSYNTH):
+            print("fluidsynth not found in PATH.")
+            return 1
+        if not os.path.exists(SOUNDFONT_PATH):
+            print(f"SoundFont missing: {SOUNDFONT_PATH}")
+            return 1
+        tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".mid", delete=False)
+        tmp.close()
+        write_town_tune_midi(notes, tmp.name, tempo_bpm=TOWN_TUNE_TEMPO)
+        cmd = [FLUIDSYNTH, "-ni", "-g", str(TOWN_TUNE_GAIN)]
+        if FLUIDSYNTH_AUDIO:
+            cmd += ["-a", FLUIDSYNTH_AUDIO]
+        cmd += [SOUNDFONT_PATH, tmp.name]
+        try:
+            subprocess.run(cmd)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+        return 0
+    # Interactive editor
+    print("Town tune editor (16 steps).")
+    print("Available notes:")
+    print("  " + " ".join(TOWN_TUNE_NOTES))
+    print("Special tokens: REST (silence), HOLD (extend previous note)")
+    print("Press Enter to keep the current value.")
+    updated = []
+    for i in range(TOWN_TUNE_STEPS):
+        current = notes[i]
+        resp = input(f"Step {i+1:02d} [{current}]: ").strip()
+        if not resp:
+            updated.append(current)
+            continue
+        tok = _normalize_tune_token(resp)
+        if tok in TOWN_TUNE_NOTES or tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD):
+            updated.append(tok)
+        else:
+            print("  Invalid token; using REST.")
+            updated.append(TOWN_TUNE_REST)
+    save_town_tune(updated)
+    print(f"Saved to {TOWN_TUNE_PATH}")
+    return 0
 
 def collect_catalog():
     games = set()
@@ -802,6 +1453,29 @@ def play_chime(audio_device=None):
     except Exception:
         pass
 
+def start_hour_chime(audio_device=None):
+    proc, tmp = spawn_town_tune(audio_device)
+    if proc:
+        return proc, "town tune", tmp
+    if not HOUR_CHIME_PATH:
+        return None, None, None
+    if not os.path.exists(HOUR_CHIME_PATH):
+        return None, None, None
+    cmd = [
+        MPV,
+        "--no-video",
+        "--quiet",
+        "--no-terminal",
+    ]
+    if audio_device:
+        cmd.append(f"--audio-device={audio_device}")
+    cmd.append(HOUR_CHIME_PATH)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return proc, "hour chime", None
+    except Exception:
+        return None, None, None
+
 
 def render(lines):
     # Minimize flicker by reusing the screen and only clearing to end of line.
@@ -823,6 +1497,221 @@ def render(lines):
             sys.stdout.write("\n")
     sys.stdout.write("\033[J")
     sys.stdout.flush()
+
+def _read_key(fd, timeout=0.1):
+    r, _, _ = select.select([fd], [], [], timeout)
+    if not r:
+        return None
+    try:
+        ch = os.read(fd, 1).decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    if ch != "\x1b":
+        return ch
+    # Read escape sequence (arrows)
+    seq = ""
+    r, _, _ = select.select([fd], [], [], 0.01)
+    if r:
+        try:
+            seq += os.read(fd, 1).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    r, _, _ = select.select([fd], [], [], 0.01)
+    if r:
+        try:
+            seq += os.read(fd, 1).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    if seq.startswith("["):
+        if seq.endswith("A"):
+            return "UP"
+        if seq.endswith("B"):
+            return "DOWN"
+        if seq.endswith("C"):
+            return "RIGHT"
+        if seq.endswith("D"):
+            return "LEFT"
+    return "ESC"
+
+def _render_tune_editor(notes, cursor, status=None):
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    term_cols = size.columns
+    term_rows = size.lines
+
+    row_w = 8
+    cell_w = 3
+    gap = 1
+    staff_h = len(TOWN_TUNE_NOTES)
+    total_w = row_w * cell_w + (row_w - 1) * gap
+    pad = max(0, (term_cols - total_w) // 2)
+    pad_s = " " * pad
+    required_rows = staff_h * 2 + 8
+
+    def compact():
+        def token(tok):
+            if tok == TOWN_TUNE_REST:
+                return "--"
+            if tok == TOWN_TUNE_HOLD:
+                return "=="
+            return tok
+        def build_row(start_idx):
+            row = []
+            for i in range(start_idx, start_idx + row_w):
+                tok = token(notes[i])
+                cell = f"[{tok:2}]" if i == cursor else f" {tok:2} "
+                row.append(cell)
+            return pad_s + " ".join(row)
+        lines = []
+        lines.append(c("Town Tune Editor (compact)", "36"))
+        lines.append("")
+        lines.append(build_row(0))
+        lines.append(build_row(8))
+        lines.append("")
+        lines.append(c("Terminal too small for staff view.", "33"))
+        if status:
+            lines.append(c(status, "35"))
+        if len(lines) < term_rows:
+            lines.extend([""] * (term_rows - len(lines)))
+        elif len(lines) > term_rows:
+            lines = lines[:term_rows]
+        return lines
+
+    if term_rows < required_rows or term_cols < total_w + 2:
+        return compact()
+
+    def cell_for(tok):
+        if tok == TOWN_TUNE_REST:
+            return "-- "
+        if tok == TOWN_TUNE_HOLD:
+            return "== "
+        return f"{tok:<3}"
+
+    def cursor_row(start_idx):
+        cells = []
+        for i in range(start_idx, start_idx + row_w):
+            if i == cursor:
+                cells.append("^".center(cell_w))
+            else:
+                cells.append(" " * cell_w)
+        return pad_s + (" " * gap).join(cells)
+
+    def build_staff(start_idx):
+        lines = []
+        # High notes at top
+        for y in range(staff_h):
+            pitch = TOWN_TUNE_NOTES[staff_h - 1 - y]
+            is_staff = (y % 2 == 1)
+            cells = []
+            for i in range(start_idx, start_idx + row_w):
+                tok = notes[i]
+                cell = ("-" * cell_w) if is_staff else (" " * cell_w)
+                if tok == pitch:
+                    cell = cell_for(tok)
+                elif tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD) and y == staff_h // 2:
+                    cell = cell_for(tok)
+                if i == cursor and tok == pitch:
+                    cell = c(cell, "38;5;226") if USE_COLOR else cell
+                cells.append(cell)
+            lines.append(pad_s + (" " * gap).join(cells))
+        return lines
+
+    lines = []
+    lines.append(c("Town Tune Editor (16 steps)", "36"))
+    lines.append("")
+    lines.append(cursor_row(0))
+    lines.extend(build_staff(0))
+    lines.append("")
+    lines.append(cursor_row(8))
+    lines.extend(build_staff(8))
+    lines.append("")
+    help_line = "Arrows: move/change pitch  r=rest  h=hold  p=preview  s=save  q=save+quit"
+    lines.append(c(help_line, "33"))
+    if status:
+        lines.append(c(status, "35"))
+
+    if len(lines) < term_rows:
+        lines.extend([""] * (term_rows - len(lines)))
+    elif len(lines) > term_rows:
+        lines = lines[:term_rows]
+    return lines
+
+def run_tune_editor(audio_device=None):
+    notes = load_town_tune()
+    cursor = 0
+    status = None
+    last_lines = None
+    preview_proc = None
+    preview_tmp = None
+
+    def stop_preview():
+        nonlocal preview_proc, preview_tmp
+        if preview_proc and preview_proc.poll() is None:
+            try:
+                preview_proc.terminate()
+            except Exception:
+                pass
+        preview_proc = None
+        if preview_tmp:
+            try:
+                os.unlink(preview_tmp)
+            except Exception:
+                pass
+            preview_tmp = None
+
+    try:
+        while True:
+            lines = _render_tune_editor(notes, cursor, status=status)
+            if lines != last_lines:
+                render(lines)
+                last_lines = list(lines)
+            status = None
+
+            key = _read_key(sys.stdin.fileno(), timeout=0.2)
+            if not key:
+                continue
+            if key in ("q", "Q", "ESC"):
+                save_town_tune(notes)
+                stop_preview()
+                return
+            if key in ("s", "S"):
+                save_town_tune(notes)
+                status = f"Saved: {TOWN_TUNE_PATH}"
+                continue
+            if key in ("p", "P"):
+                stop_preview()
+                preview_proc, preview_tmp = spawn_town_tune(audio_device)
+                if preview_proc:
+                    status = "Previewing tune..."
+                else:
+                    status = "Preview unavailable (fluidsynth or soundfont missing)."
+                continue
+            if key in ("LEFT",):
+                cursor = (cursor - 1) % TOWN_TUNE_STEPS
+                continue
+            if key in ("RIGHT",):
+                cursor = (cursor + 1) % TOWN_TUNE_STEPS
+                continue
+            if key in ("r", "R"):
+                notes[cursor] = TOWN_TUNE_REST
+                continue
+            if key in ("h", "H"):
+                notes[cursor] = TOWN_TUNE_HOLD
+                continue
+            if key in ("UP", "DOWN"):
+                choices = list(TOWN_TUNE_NOTES) + [TOWN_TUNE_REST, TOWN_TUNE_HOLD]
+                cur = notes[cursor]
+                try:
+                    idx = choices.index(cur)
+                except Exception:
+                    idx = 0
+                if key == "UP":
+                    idx = (idx + 1) % len(choices)
+                else:
+                    idx = (idx - 1) % len(choices)
+                notes[cursor] = choices[idx]
+                continue
+    finally:
+        stop_preview()
 
 def truncate_plain(s, maxlen):
     if maxlen <= 0:
@@ -895,9 +1784,15 @@ def build_title_art(text, width):
 
 def main():
     global TITLE_ART_COLORED, TITLE_ART_BASE, TITLE_LOLCAT_PATH, BOX_GRADIENT_PHASE, BOX_BORDER_POS
-    mode, allowed_games, import_paths = parse_cli_args(sys.argv)
+    mode, allowed_games, import_paths, tune_action, layout_opts = parse_cli_args(sys.argv)
     if mode == "import":
         sys.exit(import_files(import_paths))
+    if mode == "tune":
+        sys.exit(town_tune_cli(tune_action))
+    if mode == "stats":
+        sys.exit(stats_cli())
+    if mode == "layout-sweep":
+        sys.exit(layout_sweep_cli(layout_opts))
     # basic checks
     if not os.path.isdir(MUSIC_DIR):
         print(f"Missing music dir: {MUSIC_DIR}")
@@ -975,12 +1870,23 @@ def main():
     fade = None
     transition = None
     chime_proc = None
+    chime_kind = None
+    chime_temp_path = None
     showing_chime = False
     show_help = False
     history = deque(maxlen=HISTORY_MAX)
     next_candidates = []
     next_candidates_ts = 0.0
     next_candidates_key = None
+    stats_data = load_stats() if STATS_ENABLED else None
+    session_start = time.time()
+    session_listen = 0.0
+    stats_last_ts = time.time()
+    stats_last_flush = time.time()
+    stats_q = None
+    stats_stop = None
+    if STATS_ENABLED:
+        stats_q, stats_stop = start_stats_writer()
 
     catalog_games, catalog_variants = collect_catalog()
     games_list = ["ALL"] + sorted(catalog_games)
@@ -1303,6 +2209,39 @@ def main():
     def handle_exit(signum=None, frame=None):
         stop_cava()
         stop_mpv()
+        if STATS_ENABLED and stats_data is not None:
+            stats_data["total_listen_seconds"] = int(stats_data.get("total_listen_seconds", 0) + session_listen)
+            stats_data["sessions"] = int(stats_data.get("sessions", 0) + 1)
+            stats_data["last_session"] = {
+                "start": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_start)),
+                "end": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())),
+                "listen_seconds": int(session_listen),
+            }
+            if stats_q:
+                stats_q.put(("json", stats_data))
+            else:
+                save_stats(stats_data)
+            top = sorted([(i, v) for i, v in enumerate(stats_data.get("hour_buckets", [0] * 24))],
+                         key=lambda x: x[1], reverse=True)[:3]
+            top_hours = ";".join([f"{h:02d}" for h, v in top if v > 0])
+            row = f"{stats_data['last_session']['start']},{stats_data['last_session']['end']},{int(session_listen)},{top_hours}"
+            if stats_q:
+                stats_q.put(("csv", row))
+                stats_q.put(None)
+                if stats_stop:
+                    stats_stop.wait(timeout=1.0)
+            else:
+                append_stats_csv(row)
+        if chime_proc and chime_proc.poll() is None:
+            try:
+                chime_proc.terminate()
+            except Exception:
+                pass
+        if chime_temp_path:
+            try:
+                os.unlink(chime_temp_path)
+            except Exception:
+                pass
         teardown_private_sink(private_module, loopback_module)
         enable_autowrap()
         show_cursor()
@@ -1388,20 +2327,13 @@ def main():
                     last_term_cols = term_cols
                     last_term_rows = term_rows
                     info_w_cache = 0
-                    # Hysteresis to avoid layout flapping near thresholds
-                    if layout_mode == "tiny":
-                        if term_cols >= 62 and term_rows >= 22:
-                            layout_mode = "small" if (term_cols < 82 or term_rows < 26) else "normal"
-                    elif layout_mode == "small":
-                        if term_cols < 58 or term_rows < 18:
-                            layout_mode = "tiny"
-                        elif term_cols >= 82 and term_rows >= 26:
-                            layout_mode = "normal"
+                    # Layout mode based on current size (no hysteresis)
+                    if term_cols < 58 or term_rows < 18:
+                        layout_mode = "tiny"
+                    elif term_cols < 78 or term_rows < 22:
+                        layout_mode = "small"
                     else:
-                        if term_cols < 58 or term_rows < 18:
-                            layout_mode = "tiny"
-                        elif term_cols < 78 or term_rows < 22:
-                            layout_mode = "small"
+                        layout_mode = "normal"
 
                 # Responsive layout for small terminals
                 tiny_term = layout_mode == "tiny"
@@ -1465,9 +2397,9 @@ def main():
                             info_plain.extend([line for line in TITLE_ART])
 
                     if not compact_info:
-                        controls_plain = "Controls: [n] next track   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
+                        controls_plain = "Controls: [n] next track   [e] edit town tune   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
                         if tiny_term:
-                            controls_plain = "Keys: n next  q quit  s audio output  ? help / more  +/- vol"
+                            controls_plain = "Keys: n next  e tune  q quit  s audio output  ? help / more  +/- vol"
                         # Wrap controls to fit the terminal width so the info box doesn't overflow
                         max_controls_width = max(20, term_cols - 6)
                         controls_wrapped = wrap_plain(controls_plain, max_controls_width)
@@ -1479,8 +2411,9 @@ def main():
                     add_info_line(fline, "2")
                     vline = f"Visualizer: {VIS_MODES[vis_idx]}"
                     add_info_line(vline, "2")
-                    if showing_chime and HOUR_CHIME_PATH:
-                        line1_plain = "Hour folder: --    Now playing: (hour chime)"
+                    if showing_chime:
+                        label = chime_kind or "hour chime"
+                        line1_plain = f"Hour folder: --    Now playing: ({label})"
                         add_info_line(line1_plain, "36")
                     elif current_track:
                         display_hour = current_track_hour if current_track_hour is not None else hour
@@ -1516,22 +2449,110 @@ def main():
                     next_candidates_ts = now
                     next_candidates_key = cand_key
 
+                # Local listening stats (opt-in)
+                if STATS_ENABLED and stats_data is not None:
+                    now_ts = time.time()
+                    dt = max(0.0, now_ts - stats_last_ts)
+                    stats_last_ts = now_ts
+                    playing = (current_track is not None and mpv_proc and mpv_proc.poll() is None and not muted)
+                    if playing:
+                        session_listen += dt
+                        hb = stats_data.get("hour_buckets", [0] * 24)
+                        h = int(time.strftime("%H", time.localtime(now_ts)))
+                        hb[h] = hb[h] + dt
+                        stats_data["hour_buckets"] = hb
+                    if now_ts - stats_last_flush > 10.0:
+                        stats_last_flush = now_ts
+                        stats_data["total_listen_seconds"] = int(stats_data.get("total_listen_seconds", 0))
+                        if stats_q:
+                            stats_q.put(("json", dict(stats_data)))
+                        else:
+                            save_stats(stats_data)
+
+                info_box = None
+                info_w = 0
                 if not ultra_compact:
-                    # Box the info section (width based on plain text)
+                    # Box the info section (width based on plain text).
+                    # If help is requested in compact mode, drop the info box to make room.
                     if max_info_rows <= 0:
                         info_plain = []
                         info = []
                     elif len(info_plain) > max_info_rows:
                         info_plain = info_plain[:max_info_rows]
                         info = info[:max_info_rows]
-                    if info_plain:
+                    if info_plain and (not (show_help and compact_info)):
                         info_w_needed = max([len(line) for line in info_plain] + [0])
                         info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
                         info_box, info_w = build_box(info_plain, info, info_w_cache)
+
+                stats_box = None
+                stats_w = 0
+                if (not ultra_compact) and STATS_ENABLED and stats_data is not None:
+                    total_sec = int(stats_data.get("total_listen_seconds", 0) + session_listen)
+                    hb = stats_data.get("hour_buckets", [0] * 24)
+                    top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
+                    top_fmt = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none)"
+                    stats_plain = [
+                        "Stats",
+                        f"Total: {format_seconds(total_sec)}",
+                        f"Session: {format_seconds(session_listen)}",
+                        f"Top hours: {top_fmt}",
+                    ]
+                    stats_color = [
+                        c(stats_plain[0], "36"),
+                        c(stats_plain[1], "2"),
+                        c(stats_plain[2], "2"),
+                        c(stats_plain[3], "2"),
+                    ]
+                    stats_box, stats_w = build_box(stats_plain, stats_color)
+
+                # Ensure we preserve space for the visualizer
+                if info_box or stats_box:
+                    side_by_side = False
+                    if info_box and stats_box:
+                        total_w = (info_w + 4) + (stats_w + 4)
+                        side_by_side = (total_w + 3 <= term_cols)
+                    rows_needed = 0
+                    if info_box and stats_box:
+                        rows_needed = max(len(info_box), len(stats_box)) if side_by_side else (len(info_box) + len(stats_box))
+                    elif info_box:
+                        rows_needed = len(info_box)
+                    elif stats_box:
+                        rows_needed = len(stats_box)
+                    available = term_rows - min_spectrum_rows - 1 - len(lines)
+                    if rows_needed > available:
+                        # First drop stats if needed
+                        stats_box = None
+                        side_by_side = False
+                        rows_needed = len(info_box) if info_box else 0
+                    if info_box and rows_needed > available:
+                        # Trim info rows to fit
+                        max_rows = max(0, available - 2)
+                        if len(info_plain) > max_rows:
+                            info_plain = info_plain[:max_rows]
+                            info = info[:max_rows]
+                            info_w_needed = max([len(line) for line in info_plain] + [0])
+                            info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
+                            info_box, info_w = build_box(info_plain, info, info_w_cache)
+
+                if info_box and stats_box:
+                    total_w = (info_w + 4) + (stats_w + 4)
+                    if total_w + 3 <= term_cols:
+                        target_len = max(len(info_box), len(stats_box))
+                        info_box = pad_box_lines(info_box, info_w, target_len)
+                        stats_box = pad_box_lines(stats_box, stats_w, target_len)
+                        for left, right in zip(info_box, stats_box):
+                            lines.append(left + "   " + right)
+                    else:
                         lines.extend(info_box)
+                        lines.extend(stats_box)
+                elif info_box:
+                    lines.extend(info_box)
+                elif stats_box:
+                    lines.extend(stats_box)
 
                 # Help overlay panel (skip if space is tight to keep spectrum visible)
-                render_help = show_help and (not compact_info)
+                render_help = show_help and (not ultra_compact)
                 rows_after_info = len(lines)
                 if term_rows - rows_after_info - min_spectrum_rows - 1 <= 0:
                     render_help = False
@@ -1539,7 +2560,7 @@ def main():
                     help_sink = current_output_sink or get_default_sink() or "(unknown)"
                     help_lines = [
                         "Help",
-                        "n: next track   m: mute   q: quit",
+                        "n: next track   m: mute   e: edit town tune   q: quit",
                         "g: cycle game   v: cycle variant",
                         "h: simulate hour change   t: vis mode   s: audio output",
                         "+/-: volume     ?: toggle help",
@@ -1594,15 +2615,27 @@ def main():
                         up_color = [c(up_title_trunc, "36"), c("(no candidates)", "2")]
                     up_box, up_w = build_box(up_plain, up_color)
 
+                # Hard guard: never steal rows from the visualizer
+                panel_height = 0
+                if hist_box and up_box:
+                    panel_height = max(len(hist_box), len(up_box))
+                elif hist_box:
+                    panel_height = len(hist_box)
+                elif up_box:
+                    panel_height = len(up_box)
+                if panel_height and (len(lines) + panel_height + min_spectrum_rows + 1 > term_rows):
+                    hist_box = None
+                    up_box = None
+
                 if hist_box and up_box:
                     # side-by-side if they fit, otherwise stack
                     total_w = (hist_w + 4) + (up_w + 4)
-                    if total_w <= term_cols:
+                    if total_w + 3 <= term_cols:
                         target_len = max(len(hist_box), len(up_box))
                         hist_box = pad_box_lines(hist_box, hist_w, target_len)
                         up_box = pad_box_lines(up_box, up_w, target_len)
                         for left, right in zip(hist_box, up_box):
-                            lines.append(left + drop_first_visible(right))
+                            lines.append(left + "   " + right)
                     else:
                         lines.extend(hist_box)
                         lines.extend(up_box)
@@ -1610,6 +2643,10 @@ def main():
                     lines.extend(hist_box)
                 elif up_box:
                     lines.extend(up_box)
+
+                # If we're tight on height, drop trailing blank lines to preserve visualizer rows
+                while lines and lines[-1].strip() == "" and (len(lines) + min_spectrum_rows + 1 > term_rows):
+                    lines.pop()
 
                 prefix = "  "
                 # Fit spectrum to remaining terminal rows to avoid overlap/flicker
@@ -1718,36 +2755,29 @@ def main():
                             current_track = None
                             current_track_hour = None
                             showing_chime = True
-                            if HOUR_CHIME_PATH:
-                                try:
-                                    chime_proc = subprocess.Popen(
-                                        [MPV, "--no-video", "--quiet", "--no-terminal"] + ([f"--audio-device={audio_device}"] if audio_device else []) + [HOUR_CHIME_PATH],
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL,
-                                    )
-                                except Exception:
-                                    chime_proc = None
+                            chime_proc, chime_kind, chime_temp_path = start_hour_chime(audio_device)
+                            if chime_proc is not None:
                                 transition["phase"] = "chime"
                             else:
+                                showing_chime = False
                                 transition["phase"] = "fade_in"
                                 transition["start_ts"] = time.time()
                     elif phase == "chime":
                         if chime_proc is None:
-                            if HOUR_CHIME_PATH:
-                                try:
-                                    chime_proc = subprocess.Popen(
-                                        [MPV, "--no-video", "--quiet", "--no-terminal"] + ([f"--audio-device={audio_device}"] if audio_device else []) + [HOUR_CHIME_PATH],
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL,
-                                    )
-                                except Exception:
-                                    chime_proc = None
-                            else:
+                            chime_proc, chime_kind, chime_temp_path = start_hour_chime(audio_device)
+                            if chime_proc is None:
                                 transition["phase"] = "fade_in"
                                 transition["start_ts"] = time.time()
                         if chime_proc is None or chime_proc.poll() is not None:
                             chime_proc = None
                             showing_chime = False
+                            chime_kind = None
+                            if chime_temp_path:
+                                try:
+                                    os.unlink(chime_temp_path)
+                                except Exception:
+                                    pass
+                                chime_temp_path = None
                             transition["phase"] = "fade_in"
                             transition["start_ts"] = time.time()
                     elif phase == "fade_in":
@@ -1809,6 +2839,9 @@ def main():
                         next_candidates_ts = 0.0
                     if ch.lower() == "t":
                         vis_idx = (vis_idx + 1) % len(VIS_MODES)
+                    if ch.lower() == "e":
+                        run_tune_editor(audio_device)
+                        last_lines = None
                     if ch.lower() == "s":
                         if PRIVATE_SINK and private_sink and shutil.which("pactl"):
                             sinks = list_sinks()

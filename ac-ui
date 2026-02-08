@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap, tempfile, struct
+import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap, tempfile, struct, math
 from collections import deque
 
 MUSIC_DIR = os.path.expanduser("~/.local/share/ac-terminal-radio/music")
@@ -55,8 +55,10 @@ def c256(text, code):
         return text
     return f"[38;5;{code}m{text}[0m"
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 def strip_ansi(s):
-    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+    return ANSI_RE.sub("", s)
 
 def visible_len(s):
     return len(strip_ansi(s))
@@ -73,9 +75,11 @@ TITLE_ART = []
 TITLE_ART_COLORED = False
 TITLE_ART_BASE = []
 TITLE_LOLCAT_PATH = None
+TITLE_ART_VERSION = 0
 SHOW_TITLE_ART = os.environ.get("AC_UI_TITLE_ART", "1").lower() not in ("0", "false", "no")
 DEBUG_ART = os.environ.get("AC_UI_DEBUG_ART", "0").lower() in ("1", "true", "yes")
 GRADIENT_ANIMATE = os.environ.get("AC_UI_GRADIENT_ANIM", "1").lower() not in ("0", "false", "no")
+FOCUS_THROTTLE = os.environ.get("AC_UI_FOCUS_THROTTLE", "0").lower() in ("1", "true", "yes")
 try:
     GRADIENT_SPEED = float(os.environ.get("AC_UI_GRADIENT_SPEED", "0.02"))
 except Exception:
@@ -101,6 +105,15 @@ VIS_MODE = os.environ.get("AC_UI_VIS", "bars").strip().lower()
 if VIS_MODE not in ("bars", "spectrum"):
     VIS_MODE = "bars"
 VIS_MODES = ("bars", "spectrum")
+CONTROL_TEXT = "Controls: [n] next track   [e] edit town tune   [q] quit   [s] audio output   [8] background mode   [?] help / more controls   [+/-] volume"
+CONTROL_TEXT_TINY = "Keys: n next  e tune  q quit  s audio output  8 bg mode  ? help / more  +/- vol"
+HELP_LINES_BASE = [
+    "Help",
+    "n: next track   m: mute   e: edit town tune   q: quit",
+    "g: cycle game   v: cycle variant   8: background mode",
+    "h: simulate hour change   t: vis mode   s: audio output",
+    "+/-: volume     ?: toggle help",
+]
 
 CHIME_DIR = os.path.join(MUSIC_DIR, "chimes")
 DEFAULT_HOUR_CHIME_NAME = "wild-world-town-tune.wav"
@@ -972,57 +985,12 @@ def spectrum_lines(bars, height=CAVA_HEIGHT, use_color=None, mode="bars", trail_
     n = len(bars)
     if n == 0:
         return ["(no spectrum data)"]
-    lines = ["" for _ in range(height)]
-    if mode == "circle":
-        center = (height - 1) / 2.0
-        rmax = center
-        base_r = rmax * 0.6
-        for i, val in enumerate(bars):
-            v = max(0.0, min(1.0, val))
-            color = spectrum_color(i, n) if use_color else None
-            angle = (i / max(1, n)) * (2.0 * 3.1415926)
-            # base ring
-            y_base = int(round(center - (base_r * __import__("math").sin(angle))))
-            # dynamic ring
-            dyn_r = base_r + v * (rmax - base_r)
-            y_dyn = int(round(center - (dyn_r * __import__("math").sin(angle))))
-            for row in range(height):
-                ch = " "
-                if row == y_base:
-                    ch = "."
-                if row == y_dyn:
-                    ch = "o"
-                if use_color and ch != " ":
-                    lines[row] += f"\x1b[38;5;{color}m{ch}\x1b[0m"
-                else:
-                    lines[row] += ch
-        return lines
-
+    # Build rows as lists of fragments to avoid O(n^2) string concatenation.
+    row_fragments = [[] for _ in range(height)]
     for i, val in enumerate(bars):
         v = max(0.0, min(1.0, val))
         color = spectrum_color(i, n) if use_color else None
-        if mode == "wave":
-            center = (height - 1) / 2.0
-            y = int(round(center - (v * center)))
-            y_trail = None
-            if trail_bars is not None:
-                tv = max(0.0, min(1.0, trail_bars[i]))
-                y_trail = int(round(center - (tv * center)))
-            for row in range(height):
-                # Draw a small vertical ribbon from center to the wave point
-                if row == y:
-                    ch = "*"
-                elif y_trail is not None and row == y_trail:
-                    ch = "+"
-                elif (row > y and row <= center) or (row < y and row >= center):
-                    ch = "|"
-                else:
-                    ch = " "
-                if use_color and ch != " ":
-                    lines[row] += f"[38;5;{color}m{ch}[0m"
-                else:
-                    lines[row] += ch
-        elif mode == "spectrum":
+        if mode == "spectrum":
             pv = v
             if peak_bars is not None:
                 pv = max(0.0, min(1.0, peak_bars[i]))
@@ -1036,19 +1004,19 @@ def spectrum_lines(bars, height=CAVA_HEIGHT, use_color=None, mode="bars", trail_
                 else:
                     ch = " "
                 if use_color and ch != " ":
-                    lines[row] += f"[38;5;{color}m{ch}[0m"
+                    row_fragments[row].append(f"[38;5;{color}m{ch}[0m")
                 else:
-                    lines[row] += ch
+                    row_fragments[row].append(ch)
         else:
             fill = int(v * height + 0.5)
             for row in range(height):
                 filled = (height - row) <= fill
                 ch = "#" if filled else " "
                 if use_color:
-                    lines[row] += f"[38;5;{color}m{ch}[0m"
+                    row_fragments[row].append(f"[38;5;{color}m{ch}[0m")
                 else:
-                    lines[row] += ch
-    return lines
+                    row_fragments[row].append(ch)
+    return ["".join(parts) for parts in row_fragments]
 
 def wrap_plain(text, width):
     if width <= 0:
@@ -1448,9 +1416,13 @@ def enable_autowrap():
 
 def enter_alt_screen():
     sys.stdout.write("\033[?1049h\033[H\033[2J")
+    # enable focus tracking (supported by many terminals)
+    sys.stdout.write("\033[?1004h")
     sys.stdout.flush()
 
 def exit_alt_screen():
+    # disable focus tracking
+    sys.stdout.write("\033[?1004l")
     sys.stdout.write("\033[?1049l")
     sys.stdout.flush()
 
@@ -1502,11 +1474,12 @@ def start_hour_chime(audio_device=None):
         return None, None, None
 
 
-def render(lines):
+def render(lines, width=None, height=None):
     # Minimize flicker by reusing the screen and only clearing to end of line.
-    size = shutil.get_terminal_size(fallback=(80, 24))
-    width = size.columns
-    height = size.lines
+    if width is None or height is None:
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        width = size.columns
+        height = size.lines
     sys.stdout.write("\033[H")
     # Ensure we never write more than the screen height
     if len(lines) < height:
@@ -1515,7 +1488,8 @@ def render(lines):
         lines = lines[:height]
     for idx, line in enumerate(lines):
         # Avoid auto-wrap at terminal width (visible chars only)
-        if visible_len(line) >= width:
+        vis = len(line) if "\x1b[" not in line else visible_len(line)
+        if vis >= width:
             line = truncate_ansi_visible(line, max(0, width - 1))
         sys.stdout.write(line + "\033[K")
         if idx < height - 1:
@@ -1547,6 +1521,10 @@ def _read_key(fd, timeout=0.1):
             seq += os.read(fd, 1).decode("utf-8", errors="ignore")
         except Exception:
             pass
+    if seq == "[I":
+        return "FOCUS_IN"
+    if seq == "[O":
+        return "FOCUS_OUT"
     if seq.startswith("["):
         if seq.endswith("A"):
             return "UP"
@@ -1808,7 +1786,7 @@ def build_title_art(text, width):
 
 
 def main():
-    global TITLE_ART_COLORED, TITLE_ART_BASE, TITLE_LOLCAT_PATH, BOX_GRADIENT_PHASE, BOX_BORDER_POS
+    global TITLE_ART_COLORED, TITLE_ART_BASE, TITLE_LOLCAT_PATH, BOX_GRADIENT_PHASE, BOX_BORDER_POS, TITLE_ART_VERSION
     mode, allowed_games, import_paths, tune_action, layout_opts = parse_cli_args(sys.argv)
     if mode == "import":
         sys.exit(import_files(import_paths))
@@ -1850,6 +1828,22 @@ def main():
     last_term_rows = None
     layout_mode = "normal"
     info_w_cache = 0
+    info_cache_key = None
+    info_plain_cache = ()
+    info_color_cache = ()
+    stats_cache_key = None
+    stats_box_cache = None
+    stats_w_cache = 0
+    help_cache_key = None
+    help_box_cache = None
+    help_sink_cache = None
+    help_sink_cache_ts = 0.0
+    hist_cache_key = None
+    hist_box_cache = None
+    hist_w_cache = 0
+    up_cache_key = None
+    up_box_cache = None
+    up_w_cache = 0
 
     last_query_ts = 0.0
     mpv_query_interval = 0.5
@@ -1872,6 +1866,7 @@ def main():
     TITLE_ART_BASE = art_base
     global TITLE_LOLCAT_PATH
     TITLE_LOLCAT_PATH = lolcat_path
+    TITLE_ART_VERSION += 1
     if DEBUG_ART:
         has_ansi = any("\x1b[" in ln for ln in TITLE_ART)
         sys.stderr.write(
@@ -1894,6 +1889,8 @@ def main():
     mute_prev_vol = 50
     fade = None
     transition = None
+    background_mode = False
+    focused = True
     chime_proc = None
     chime_kind = None
     chime_temp_path = None
@@ -1910,6 +1907,8 @@ def main():
     stats_last_flush = time.time()
     stats_q = None
     stats_stop = None
+    last_time_str = None
+    last_time_sec = None
     if STATS_ENABLED:
         stats_q, stats_stop = start_stats_writer()
 
@@ -2181,10 +2180,10 @@ def main():
         if current_track in tracks:
             tracks = [t for t in tracks if t != current_track]
         if not tracks:
-            return []
+            return ()
         if len(tracks) <= QUEUE_SIZE:
-            return [os.path.basename(t) for t in tracks]
-        return [os.path.basename(t) for t in random.sample(tracks, QUEUE_SIZE)]
+            return tuple(os.path.basename(t) for t in tracks)
+        return tuple(os.path.basename(t) for t in random.sample(tracks, QUEUE_SIZE))
 
 
     def set_volume(vol, ipc_path=None):
@@ -2342,6 +2341,7 @@ def main():
                             )
                             TITLE_ART[:] = [ln.rstrip("\n") for ln in colored.splitlines()]
                             TITLE_ART_COLORED = True
+                            TITLE_ART_VERSION += 1
                             last_title_anim_ts = now
                         except Exception:
                             pass
@@ -2397,14 +2397,12 @@ def main():
 
                 # Render UI without full-screen clear to reduce flicker
                 lines = []
-                info = []
-                info_plain = []
-                def add_info_line(text, color_code="2"):
-                    text = truncate_plain(text, info_max_width)
-                    info_plain.append(text)
-                    info.append(c(text, color_code))
 
-                tline = f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                now_sec = int(now)
+                if last_time_sec != now_sec:
+                    last_time_sec = now_sec
+                    last_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now_sec))
+                tline = f"Time: {last_time_str}"
                 # Always show system time at top
                 lines.append(c(tline, "2"))
 
@@ -2412,63 +2410,98 @@ def main():
                 max_info_rows = term_rows - min_spectrum_rows - 1 - 1 - 2  # divider + time + box borders
                 compact_info = max_info_rows < 10 or term_cols < 70 or ultra_compact
 
+                info = []
+                info_plain = []
                 if not ultra_compact:
-                    if (not compact_info) and TITLE_ART:
-                        if TITLE_ART_COLORED:
-                            info.extend([line for line in TITLE_ART])
-                            info_plain.extend([strip_ansi(line) for line in TITLE_ART])
+                    display_vol = output_vol if (PRIVATE_SINK and loopback_module) else (int(vol) if vol is not None else None)
+                    info_key = (
+                        term_cols,
+                        info_max_width,
+                        compact_info,
+                        tiny_term,
+                        TITLE_ART_VERSION,
+                        games_list[game_idx],
+                        variants_list[variant_idx],
+                        VIS_MODES[vis_idx],
+                        showing_chime,
+                        chime_kind,
+                        os.path.basename(current_track) if current_track else None,
+                        current_track_hour,
+                        hour,
+                        int(tpos) if tpos is not None else None,
+                        int(dur) if dur is not None else None,
+                        int(display_vol) if display_vol is not None else None,
+                        muted,
+                        int(remaining),
+                    )
+                    if info_key != info_cache_key:
+                        info = []
+                        info_plain = []
+
+                        def add_info_line(text, color_code="2"):
+                            text = truncate_plain(text, info_max_width)
+                            info_plain.append(text)
+                            info.append(c(text, color_code))
+
+                        if (not compact_info) and TITLE_ART:
+                            if TITLE_ART_COLORED:
+                                info.extend([line for line in TITLE_ART])
+                                info_plain.extend([strip_ansi(line) for line in TITLE_ART])
+                            else:
+                                info.extend([c(line, "38;5;77") for line in TITLE_ART])
+                                info_plain.extend([line for line in TITLE_ART])
+
+                        if not compact_info:
+                            controls_plain = CONTROL_TEXT_TINY if tiny_term else CONTROL_TEXT
+                            # Wrap controls to fit the terminal width so the info box doesn't overflow
+                            max_controls_width = max(20, term_cols - 6)
+                            controls_wrapped = wrap_plain(controls_plain, max_controls_width)
+                            for line in controls_wrapped:
+                                add_info_line(line, "33")
+                            add_info_line("", "2")
+
+                        fline = f"Filter: Game={games_list[game_idx]}  Variant={variants_list[variant_idx]}"
+                        add_info_line(fline, "2")
+                        vline = f"Visualizer: {VIS_MODES[vis_idx]}"
+                        add_info_line(vline, "2")
+                        if showing_chime:
+                            label = chime_kind or "hour chime"
+                            line1_plain = f"Hour folder: --    Now playing: ({label})"
+                            add_info_line(line1_plain, "36")
+                        elif current_track:
+                            display_hour = current_track_hour if current_track_hour is not None else hour
+                            line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {os.path.basename(current_track)}"
+                            add_info_line(line1_plain, "36")
+                            if not compact_info:
+                                line2_plain = f"Playback: {fmt_mmss(tpos or -1)} / {fmt_mmss(dur or -1)}"
+                                add_info_line(line2_plain, "35")
+                            if (display_vol is not None) and (not compact_info):
+                                vline = f"Volume: {int(display_vol):3d}%"
+                                add_info_line(vline, "33")
+                            if not compact_info:
+                                mline = f"Mute: {'ON' if muted else 'OFF'}"
+                                add_info_line(mline, "33")
                         else:
-                            info.extend([c(line, "38;5;77") for line in TITLE_ART])
-                            info_plain.extend([line for line in TITLE_ART])
-
-                    if not compact_info:
-                        controls_plain = "Controls: [n] next track   [e] edit town tune   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
-                        if tiny_term:
-                            controls_plain = "Keys: n next  e tune  q quit  s audio output  ? help / more  +/- vol"
-                        # Wrap controls to fit the terminal width so the info box doesn't overflow
-                        max_controls_width = max(20, term_cols - 6)
-                        controls_wrapped = wrap_plain(controls_plain, max_controls_width)
-                        for line in controls_wrapped:
-                            add_info_line(line, "33")
-                        add_info_line("", "2")
-
-                    fline = f"Filter: Game={games_list[game_idx]}  Variant={variants_list[variant_idx]}"
-                    add_info_line(fline, "2")
-                    vline = f"Visualizer: {VIS_MODES[vis_idx]}"
-                    add_info_line(vline, "2")
-                    if showing_chime:
-                        label = chime_kind or "hour chime"
-                        line1_plain = f"Hour folder: --    Now playing: ({label})"
-                        add_info_line(line1_plain, "36")
-                    elif current_track:
-                        display_hour = current_track_hour if current_track_hour is not None else hour
-                        line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {os.path.basename(current_track)}"
-                        add_info_line(line1_plain, "36")
+                            line1_plain = f"Hour folder: {hour:02d}    Now playing: (none found)"
+                            add_info_line(line1_plain, "36")
                         if not compact_info:
-                            line2_plain = f"Playback: {fmt_mmss(tpos or -1)} / {fmt_mmss(dur or -1)}"
-                            add_info_line(line2_plain, "35")
-                        display_vol = output_vol if (PRIVATE_SINK and loopback_module) else (int(vol) if vol is not None else None)
-                        if (display_vol is not None) and (not compact_info):
-                            vline = f"Volume: {int(display_vol):3d}%"
-                            add_info_line(vline, "33")
-                        if not compact_info:
-                            mline = f"Mute: {'ON' if muted else 'OFF'}"
-                            add_info_line(mline, "33")
+                            add_info_line("", "2")
+                        ulabel = "Until next hour:"
+                        uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
+                        uline = f"{ulabel} {uvalue}"
+                        add_info_line(uline, "95")
+
+                        info_cache_key = info_key
+                        info_plain_cache = tuple(info_plain)
+                        info_color_cache = tuple(info)
                     else:
-                        line1_plain = f"Hour folder: {hour:02d}    Now playing: (none found)"
-                        add_info_line(line1_plain, "36")
-                    if not compact_info:
-                        add_info_line("", "2")
-                    ulabel = "Until next hour:"
-                    uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
-                    uline = f"{ulabel} {uvalue}"
-                    add_info_line(uline, "95")
+                        info_plain = list(info_plain_cache)
+                        info = list(info_color_cache)
 
                 # Refresh "next candidates" at most once per second or on filter/hour change
                 active_games = None if game_idx == 0 else {games_list[game_idx]}
                 active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
-                cand_key = (hour, tuple(sorted(active_games)) if active_games else ("ALL",),
-                            tuple(sorted(active_variants)) if active_variants else ("ALL",))
+                cand_key = (hour, game_idx, variant_idx)
                 if now - next_candidates_ts > 1.0 or cand_key != next_candidates_key:
                     next_candidates = compute_next_candidates(hour, active_games, active_variants)
                     next_candidates_ts = now
@@ -2517,19 +2550,24 @@ def main():
                     hb = stats_data.get("hour_buckets", [0] * 24)
                     top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
                     top_fmt = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none)"
-                    stats_plain = [
-                        "Stats",
-                        f"Total: {format_seconds(total_sec)}",
-                        f"Session: {format_seconds(session_listen)}",
-                        f"Top hours: {top_fmt}",
-                    ]
-                    stats_color = [
-                        c(stats_plain[0], "36"),
-                        c(stats_plain[1], "2"),
-                        c(stats_plain[2], "2"),
-                        c(stats_plain[3], "2"),
-                    ]
-                    stats_box, stats_w = build_box(stats_plain, stats_color)
+                    stats_key = (total_sec, int(session_listen), top_fmt)
+                    if stats_key != stats_cache_key:
+                        stats_plain = [
+                            "Stats",
+                            f"Total: {format_seconds(total_sec)}",
+                            f"Session: {format_seconds(session_listen)}",
+                            f"Top hours: {top_fmt}",
+                        ]
+                        stats_color = [
+                            c(stats_plain[0], "36"),
+                            c(stats_plain[1], "2"),
+                            c(stats_plain[2], "2"),
+                            c(stats_plain[3], "2"),
+                        ]
+                        stats_box_cache, stats_w_cache = build_box(stats_plain, stats_color)
+                        stats_cache_key = stats_key
+                    stats_box = stats_box_cache
+                    stats_w = stats_w_cache
 
                 # Ensure we preserve space for the visualizer
                 if info_box or stats_box:
@@ -2582,22 +2620,30 @@ def main():
                 if term_rows - rows_after_info - min_spectrum_rows - 1 <= 0:
                     render_help = False
                 if (not ultra_compact) and render_help:
-                    help_sink = current_output_sink or get_default_sink() or "(unknown)"
-                    help_lines = [
-                        "Help",
-                        "n: next track   m: mute   e: edit town tune   q: quit",
-                        "g: cycle game   v: cycle variant",
-                        "h: simulate hour change   t: vis mode   s: audio output",
-                        "+/-: volume     ?: toggle help",
-                        f"Audio output: {help_sink}",
-                    ]
-                    help_w = max(len(s) for s in help_lines)
-                    help_border = "+" + ("-" * (help_w + 2)) + "+"
-                    lines.append(c(help_border, "2"))
-                    for s in help_lines:
-                        pad = " " * (help_w - len(s))
-                        lines.append(c(f"| {s}{pad} |", "2"))
-                    lines.append(c(help_border, "2"))
+                    if current_output_sink:
+                        help_sink = current_output_sink
+                        help_sink_cache = help_sink
+                        help_sink_cache_ts = now
+                    else:
+                        if help_sink_cache is None or (now - help_sink_cache_ts) > 5.0:
+                            help_sink_cache = get_default_sink() or "(unknown)"
+                            help_sink_cache_ts = now
+                        help_sink = help_sink_cache
+                    help_key = (help_sink,)
+                    if help_key != help_cache_key:
+                        help_lines = list(HELP_LINES_BASE)
+                        help_lines.append(f"Audio output: {help_sink}")
+                        help_lines.append("Focus throttle: AC_UI_FOCUS_THROTTLE=1")
+                        help_w = max(len(s) for s in help_lines)
+                        help_border = "+" + ("-" * (help_w + 2)) + "+"
+                        help_box_cache = [c(help_border, "2")]
+                        for s in help_lines:
+                            pad = " " * (help_w - len(s))
+                            help_box_cache.append(c(f"| {s}{pad} |", "2"))
+                        help_box_cache.append(c(help_border, "2"))
+                        help_cache_key = help_key
+                    if help_box_cache:
+                        lines.extend(help_box_cache)
 
                 # History / up-next panels (responsive)
                 show_history = (not tiny_term) and (not ultra_compact) and (not compact_info)
@@ -2612,33 +2658,46 @@ def main():
 
                 hist_box = None
                 up_box = None
+                hist_w = 0
+                up_w = 0
                 if show_history:
-                    hist_title = "Recently played"
-                    hist_title_trunc = truncate_plain(hist_title, info_max_width)
-                    hist_list = list(history)[-HISTORY_MAX:]
-                    hist_lines = [hist_title_trunc] + (hist_list if hist_list else ["(none yet)"])
-                    hist_lines = [truncate_plain(s, panel_max_width) for s in hist_lines]
-                    hist_plain = hist_lines
-                    hist_color = [c(hist_title_trunc, "36")] + [c(s, "2") for s in hist_lines[1:]]
-                    hist_box, hist_w = build_box(hist_plain, hist_color)
+                    hist_list = tuple(history)[-HISTORY_MAX:]
+                    hist_key = (hist_list, panel_max_width, info_max_width)
+                    if hist_key != hist_cache_key:
+                        hist_title = "Recently played"
+                        hist_title_trunc = truncate_plain(hist_title, info_max_width)
+                        hist_lines = [hist_title_trunc] + (list(hist_list) if hist_list else ["(none yet)"])
+                        hist_lines = [truncate_plain(s, panel_max_width) for s in hist_lines]
+                        hist_plain = hist_lines
+                        hist_color = [c(hist_title_trunc, "36")] + [c(s, "2") for s in hist_lines[1:]]
+                        hist_box_cache, hist_w_cache = build_box(hist_plain, hist_color)
+                        hist_cache_key = hist_key
+                    hist_box = hist_box_cache
+                    hist_w = hist_w_cache
 
                 if show_up_next:
-                    if next_candidates:
-                        shown = list(next_candidates[:UP_NEXT_MAX])
-                        if len(next_candidates) > UP_NEXT_MAX:
-                            shown.append(f"... +{len(next_candidates) - UP_NEXT_MAX} more")
-                        header_plain = f"Up next ({min(len(next_candidates), UP_NEXT_MAX)}/{len(next_candidates)})"
-                        header_plain_trunc = truncate_plain(header_plain, info_max_width)
-                        up_plain = [header_plain_trunc] + shown
-                        up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
-                        up_color = [c(header_plain_trunc, "36")] + [c(s, "2") for s in up_plain[1:]]
-                    else:
-                        up_title = "Up next"
-                        up_title_trunc = truncate_plain(up_title, info_max_width)
-                        up_plain = [up_title_trunc, "(no candidates)"]
-                        up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
-                        up_color = [c(up_title_trunc, "36"), c("(no candidates)", "2")]
-                    up_box, up_w = build_box(up_plain, up_color)
+                    next_list = next_candidates
+                    up_key = (next_list, panel_max_width, info_max_width, UP_NEXT_MAX)
+                    if up_key != up_cache_key:
+                        if next_list:
+                            shown = list(next_list[:UP_NEXT_MAX])
+                            if len(next_list) > UP_NEXT_MAX:
+                                shown.append(f"... +{len(next_list) - UP_NEXT_MAX} more")
+                            header_plain = f"Up next ({min(len(next_list), UP_NEXT_MAX)}/{len(next_list)})"
+                            header_plain_trunc = truncate_plain(header_plain, info_max_width)
+                            up_plain = [header_plain_trunc] + shown
+                            up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
+                            up_color = [c(header_plain_trunc, "36")] + [c(s, "2") for s in up_plain[1:]]
+                        else:
+                            up_title = "Up next"
+                            up_title_trunc = truncate_plain(up_title, info_max_width)
+                            up_plain = [up_title_trunc, "(no candidates)"]
+                            up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
+                            up_color = [c(up_title_trunc, "36"), c("(no candidates)", "2")]
+                        up_box_cache, up_w_cache = build_box(up_plain, up_color)
+                        up_cache_key = up_key
+                    up_box = up_box_cache
+                    up_w = up_w_cache
 
                 # Hard guard: never steal rows from the visualizer
                 panel_height = 0
@@ -2829,17 +2888,23 @@ def main():
                     lines = lines[:term_rows]
 
                 if lines != last_lines:
-                    render(lines)
+                    render(lines, term_cols, term_rows)
                     last_lines = list(lines)
 
-                # Non-blocking key read (fixed refresh rate)
+                # Non-blocking key read (dynamic refresh rate)
+                refresh_interval = IDLE_REFRESH if (background_mode or (FOCUS_THROTTLE and not focused)) else REFRESH_INTERVAL
                 fd = sys.stdin.fileno()
-                r, _, _ = select.select([fd], [], [], REFRESH_INTERVAL)
-                if r:
-                    try:
-                        ch = os.read(fd, 1).decode("utf-8", errors="ignore")
-                    except Exception:
-                        ch = ""
+                ch = _read_key(fd, timeout=refresh_interval)
+                if ch:
+                    if ch == "FOCUS_IN":
+                        if FOCUS_THROTTLE:
+                            focused = True
+                            last_lines = None
+                        continue
+                    if ch == "FOCUS_OUT":
+                        if FOCUS_THROTTLE:
+                            focused = False
+                        continue
                     # Track non-m keypresses to prevent auto-repeat toggling
                     if ch.lower() == "q":
                         handle_exit()
@@ -2897,6 +2962,9 @@ def main():
                             set_output_volume(output_vol + 5)
                         else:
                             mpv_command(ipc_path, ["add", "volume", 5])
+                    if ch == "8":
+                        background_mode = not background_mode
+                        last_lines = None
                     if ch.lower() == "m":
                         # debounce + ignore auto-repeat bursts
                         now_ts = time.time()

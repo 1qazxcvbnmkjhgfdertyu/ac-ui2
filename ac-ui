@@ -143,7 +143,7 @@ except Exception:
 VIS_MODES = (
     "bars", "peaks", "shades", "outline", "spectrum",
     "flame", "wave", "scope",
-    "butterfly", "led_matrix", "matrix_rain", "heartbeat",
+    "butterfly", "led_matrix", "matrix_rain", "heartbeat", "braille",
 )
 VIS_MODE_ALIASES = {
     "classic": "peaks",
@@ -351,18 +351,19 @@ ACGC_TOWN_TUNE_ASSET_ROOT = os.path.expanduser(
     os.environ.get("AC_UI_ACGC_TOWN_TUNE_ASSET_ROOT", "~/.local/share/ac-terminal-radio/acgc_engine")
 )
 ACGC_TOWN_TUNE_BUNDLED_DUMPER = os.path.join(ACGC_TOWN_TUNE_ASSET_ROOT, "AnimalCrossing-renderer")
+ACGC_TOWN_TUNE_PATH_DUMPER = shutil.which("AnimalCrossing") or ""
 ACGC_TOWN_TUNE_DUMPER = os.path.expanduser(
     os.environ.get(
         "AC_UI_ACGC_TOWN_TUNE_DUMPER",
         ACGC_TOWN_TUNE_BUNDLED_DUMPER
         if os.path.exists(ACGC_TOWN_TUNE_BUNDLED_DUMPER)
-        else "/home/mrf/ACGC-PC-Port/pc/build-linux32/bin/AnimalCrossing",
+        else ACGC_TOWN_TUNE_PATH_DUMPER,
     )
 )
 ACGC_TOWN_TUNE_DISC = os.path.expanduser(
     os.environ.get(
         "AC_UI_ACGC_DISC_PATH",
-        os.environ.get("ACGC_DISC_PATH", "/home/mrf/Downloads/Animal Crossing (USA)/Animal Crossing (USA).iso"),
+        os.environ.get("ACGC_DISC_PATH", ""),
     )
 )
 try:
@@ -2399,9 +2400,10 @@ def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=N
         title_block_vis = t_vis + 2
         if title_block_vis <= inner_w:
             insert = (inner_w - title_block_vis) // 2 + 1  # offset into border string
+            _t_col = gradient_at(_active_tod_grad, 90)
             t_colored = (
                 c256(BOX_TITLE_L, hilite)
-                + f"[1;37m{t_plain}[0m"
+                + f"\x1b[1;38;5;{_t_col}m{t_plain}\x1b[0m"
                 + c256(BOX_TITLE_R, hilite)
             )
             # Rebuild top stripping ansi for position counting
@@ -2432,9 +2434,10 @@ def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=N
         title_block_vis = t_vis + 2
         if title_block_vis <= inner_w:
             insert = (inner_w - title_block_vis) // 2 + 1
+            _t2_col = gradient_at(_active_tod_grad, 65)
             t_colored = (
                 c256(BOX_TITLE_L, hilite)
-                + f"[2;37m{t_plain}[0m"
+                + f"\x1b[2;38;5;{_t2_col}m{t_plain}\x1b[0m"
                 + c256(BOX_TITLE_R, hilite)
             )
             bot_plain_raw = BOX_CHARS["bl"] + BOX_CHARS["h"] * inner_w + BOX_CHARS["br"]
@@ -4647,6 +4650,7 @@ def main():
         current_track = track
         current_track_hour = hour
         current_ipc = next_ipc
+        update_history(track)
         return proc, next_ipc, track
 
     def update_history(track_path):
@@ -5068,13 +5072,15 @@ def main():
                         elif current_track:
                             display_hour = current_track_hour if current_track_hour is not None else hour
                             track_name = os.path.basename(current_track)
+                            _meta = parse_filename(track_name)
+                            display_name = f"{_meta['game']}: {_meta['variant']}" if _meta else track_name
                             play_sym = SYM_PAUSE if (muted or background_mode) else SYM_PLAY
-                            line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {track_name}"
+                            line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {display_name}"
                             if USE_COLOR:
                                 _sym_hi = gradient_at(_tod_grad, 90)
                                 sym_color = "\x1b[2;32m" if muted else f"\x1b[1;38;5;{_sym_hi}m"
                                 info_plain.append(truncate_plain(line1_plain, info_max_width))
-                                info.append(f"{sym_color}{play_sym}\x1b[0m [38;5;{_sym_hi}m{display_hour:02d}h[0m  [2;36mNow playing:[0m [97m{track_name}[0m{(chr(32)+chr(32)+chr(0x1b)+"[2m"+humanize_seconds(dur)+chr(0x1b)+"[0m") if dur else ""}")
+                                info.append(f"{sym_color}{play_sym}\x1b[0m [38;5;{_sym_hi}m{display_hour:02d}h[0m  [2;36mNow playing:[0m [97m{display_name}[0m{(chr(32)+chr(32)+chr(0x1b)+"[2m"+humanize_seconds(dur)+chr(0x1b)+"[0m") if dur else ""}")
                             else:
                                 add_info_line(line1_plain, "36")
                             if not compact_info:
@@ -5785,6 +5791,7 @@ def main():
                         next_hour = (hour + 1) % 24
                         if transition is None:
                             start_hour_transition(next_hour, simulate=True)
+                            state_banner = (f"→ Simulating {next_hour:02d}:00", gradient_at(_active_tod_grad, 70), time.monotonic() + 2.0)
                     if ch.lower() == "g":
                         game_idx = (game_idx + 1) % len(games_list)
                         persist_ui_state()

@@ -3109,6 +3109,34 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
 
     def build_lines():
         term_cols, term_rows = shutil.get_terminal_size(fallback=(80, 24))
+        LABEL_W = 4
+        BAND_W  = 4
+        MIN_EQ_COLS = LABEL_W + EQ_BAND_COUNT * BAND_W  # 44
+
+        # ── Compact fallback for narrow terminals ─────────────────────────
+        if term_cols < MIN_EQ_COLS or term_rows < 8:
+            lines = []
+            lines.append(c("10-BAND EQ", "36"))
+            lines.append(c(f"Preset: {preset_names[preset_idx]}   Band: {EQ_FREQ_LABELS[cursor]} Hz   Gain: {bands[cursor]:+.1f} dB", "33"))
+            lines.append("")
+            row = []
+            for i, label in enumerate(EQ_FREQ_LABELS):
+                gain = bands[i]
+                if i == cursor:
+                    row.append(c(f"[{label}:{gain:+.0f}]", "1;32"))
+                elif gain != 0.0:
+                    row.append(c(f" {label}:{gain:+.0f} ", "36"))
+                else:
+                    row.append(f" {label}: 0 ")
+            lines.append("".join(row))
+            lines.append("")
+            lines.append(c("←/→ band   ↑/↓ or +/-  ±1 dB   p preset   r flat   s save   q done", "33"))
+            if status:
+                lines.append(c(status, "35"))
+            if len(lines) < term_rows:
+                lines.extend([""] * (term_rows - len(lines)))
+            return lines, term_cols, term_rows
+
         lines = []
 
         # ── Header ──────────────────────────────────────────────────────────
@@ -3134,8 +3162,7 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
         center_r = half_rows            # index of the 0-dB row
 
         # Band column width: label up to 3 chars + 1 space = 4 each, plus 1 leading label col
-        LABEL_W = 4   # "+12 " / "  0 " / "-12 "
-        BAND_W  = 4   # " ██ "
+        # LABEL_W / BAND_W defined at function start
 
         for r in range(bar_rows):
             dist = center_r - r   # positive = above 0 dB, negative = below
@@ -5150,7 +5177,7 @@ def main():
                     hb = stats_data.get("hour_buckets", [0] * 24)
                     top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
                     top_fmt = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none)"
-                    stats_key = (total_sec, int(session_listen), top_fmt, hour)
+                    stats_key = (total_sec, int(session_listen), top_fmt, hour, now_sec)
                     if stats_key != stats_cache_key:
                         # Derived stats from hour_buckets
                         hb_total = sum(hb)
@@ -5343,7 +5370,7 @@ def main():
                 up_w = 0
                 if show_history:
                     hist_list = tuple(history)[-HISTORY_MAX:]
-                    hist_key = (hist_list, panel_max_width, info_max_width, hour)
+                    hist_key = (hist_list, panel_max_width, info_max_width, hour, now_sec)
                     if hist_key != hist_cache_key:
                         hist_title = "Recently played"
                         hist_title_trunc = truncate_plain(hist_title, info_max_width)
@@ -5375,7 +5402,7 @@ def main():
 
                 if show_up_next:
                     next_list = next_candidates
-                    up_key = (next_list, panel_max_width, info_max_width, UP_NEXT_MAX)
+                    up_key = (next_list, panel_max_width, info_max_width, UP_NEXT_MAX, now_sec)
                     if up_key != up_cache_key:
                         if next_list:
                             def _fmt_candidate(name):

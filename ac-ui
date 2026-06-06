@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap, tempfile, struct, math
+import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap, tempfile, struct, math, errno, stat, wave, unicodedata
 from collections import deque
 
 MUSIC_DIR = os.path.expanduser("~/.local/share/ac-terminal-radio/music")
@@ -19,6 +19,7 @@ LOOPBACK_SYNC_INTERVAL = 1.0
 HISTORY_MAX = 6
 QUEUE_SIZE = 5
 UP_NEXT_MAX = 3
+AUDIO_WARMUP_GRACE = 1.5
 
 try:
     REFRESH_INTERVAL = float(os.environ.get("AC_UI_REFRESH", "0.033"))
@@ -29,6 +30,34 @@ try:
     IDLE_REFRESH = float(os.environ.get("AC_UI_IDLE_REFRESH", "0.10"))
 except Exception:
     IDLE_REFRESH = 0.10
+
+def env_int(name, default, min_value=None, max_value=None):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def env_float(name, default, min_value=None, max_value=None):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except Exception:
+        value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+def env_bool01(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return 1 if default else 0
+    return 0 if raw.strip().lower() in ("0", "false", "no", "off") else 1
 
 PRIVATE_SINK = os.environ.get("AC_UI_PRIVATE_SINK", "1").lower() in ("1", "true", "yes")
 OUTPUT_SINK = os.environ.get("AC_UI_OUTPUT_SINK", "").strip()
@@ -60,8 +89,18 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 def strip_ansi(s):
     return ANSI_RE.sub("", s)
 
+def char_cell_width(ch):
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+def plain_visible_len(s):
+    return sum(char_cell_width(ch) for ch in s)
+
 def visible_len(s):
-    return len(strip_ansi(s))
+    return plain_visible_len(strip_ansi(s))
 
 def drop_first_visible(s):
     if not s:
@@ -101,42 +140,242 @@ try:
 except Exception:
     TITLE_ANIM_FPS = 1.0
 
+VIS_MODES = (
+    "bars", "peaks", "shades", "outline", "spectrum",
+    "flame", "wave", "scope",
+    "butterfly", "led_matrix", "matrix_rain", "heartbeat",
+)
+VIS_MODE_ALIASES = {
+    "classic": "peaks",
+    "classic-peak": "peaks",
+    "peak": "peaks",
+    "ascii": "shades",
+    "blocks": "bars",
+    "line": "outline",
+    "fire": "flame",
+    "oscilloscope": "wave",
+    "lissajous": "scope",
+    "xy": "scope",
+    "led": "led_matrix",
+    "classic-led": "led_matrix",
+    "matrix": "matrix_rain",
+    "rain": "matrix_rain",
+    "ecg": "heartbeat",
+    "pulse": "heartbeat",
+    "hires": "braille",
+    "2x": "braille",
+}
 VIS_MODE = os.environ.get("AC_UI_VIS", "bars").strip().lower()
-if VIS_MODE not in ("bars", "spectrum"):
+VIS_MODE = VIS_MODE_ALIASES.get(VIS_MODE, VIS_MODE)
+if VIS_MODE not in VIS_MODES:
     VIS_MODE = "bars"
-VIS_MODES = ("bars", "spectrum")
-CONTROL_TEXT = "Controls: [n] next track   [e] edit town tune   [q] quit   [s] audio output   [8] background mode   [?] help / more controls   [+/-] volume"
-CONTROL_TEXT_TINY = "Keys: n next  e tune  q quit  s audio output  8 bg mode  ? help / more  +/- vol"
+VIS_BAR_BLOCKS = (" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
+VIS_SHADE_BLOCKS = (" ", "░", "▒", "▓", "█")
+VIS_PEAK_GLYPHS = ("⎺", "⎻", "⎼", "⎽")
+MATRIX_RAIN_CHARS = (
+    "ｦｧｨｩｪｫｬｭｮｯｰｱｲｳｴｵｶｷｸｹｺ"
+    "ｻｼｽｾｿﾀﾁﾂﾃﾄ0123456789"
+)
+
+
+def apply_cava_preset():
+    """Apply AC_UI_PRESET defaults only for env vars the user did not set."""
+    preset = os.environ.get("AC_UI_PRESET", "").strip().lower()
+    if not preset:
+        return
+    profiles = {
+        "acoustic": {
+            "AC_UI_CAVA_FRAMERATE": "60",
+            "AC_UI_CAVA_NOISE_REDUCTION": "0.85",
+            "AC_UI_CAVA_SENSITIVITY": "80",
+            "AC_UI_CAVA_LOWER_CUTOFF": "80",
+            "AC_UI_CAVA_HIGHER_CUTOFF": "12000",
+        },
+        "bass": {
+            "AC_UI_CAVA_FRAMERATE": "60",
+            "AC_UI_CAVA_NOISE_REDUCTION": "0.55",
+            "AC_UI_CAVA_SENSITIVITY": "140",
+            "AC_UI_CAVA_LOWER_CUTOFF": "30",
+            "AC_UI_CAVA_HIGHER_CUTOFF": "8000",
+        },
+        "crisp": {
+            "AC_UI_CAVA_FRAMERATE": "90",
+            "AC_UI_CAVA_NOISE_REDUCTION": "0.65",
+            "AC_UI_CAVA_SENSITIVITY": "110",
+            "AC_UI_CAVA_LOWER_CUTOFF": "50",
+            "AC_UI_CAVA_HIGHER_CUTOFF": "18000",
+        },
+    }
+    for key, val in profiles.get(preset, {}).items():
+        if key not in os.environ:
+            os.environ[key] = val
+
+
+apply_cava_preset()
+EQ_ENABLED = env_bool01("AC_UI_EQ", True)
+EQ_BAND_COUNT = 10
+EQ_BAND_MIN = -12.0
+EQ_BAND_MAX = 12.0
+EQ_FREQ_LABELS = ("70", "180", "320", "600", "1k", "3k", "6k", "12k", "14k", "16k")
+EQ_PRESETS = {
+    "flat": [0.0] * EQ_BAND_COUNT,
+    "bass": [6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "treble": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 4.0, 5.0, 6.0],
+    "vocal": [-2.0, -1.0, 0.0, 2.0, 4.0, 3.0, 1.0, 0.0, -1.0, -2.0],
+    "piano": [1.0, 2.0, 1.0, 0.0, -1.0, 0.0, 1.0, 2.0, 1.0, 0.0],
+}
+EQ_CONFIG_PATH = os.path.expanduser(
+    os.environ.get("AC_UI_EQ_PATH", "~/.config/ac-ui/eq.json")
+)
+CAVA_FRAMERATE = env_int("AC_UI_CAVA_FRAMERATE", 60, 1, 240)
+CAVA_AUTOSENS = env_bool01("AC_UI_CAVA_AUTOSENS", True)
+CAVA_SENSITIVITY = env_int("AC_UI_CAVA_SENSITIVITY", 100, 1, 1000)
+CAVA_LOWER_CUTOFF = env_int("AC_UI_CAVA_LOWER_CUTOFF", 50, 1, 20000)
+CAVA_HIGHER_CUTOFF = env_int("AC_UI_CAVA_HIGHER_CUTOFF", 20000, CAVA_LOWER_CUTOFF + 1, 96000)
+CAVA_NOISE_REDUCTION_SET = "AC_UI_CAVA_NOISE_REDUCTION" in os.environ
+CAVA_NOISE_REDUCTION = env_float("AC_UI_CAVA_NOISE_REDUCTION", 0.77, 0.0, 1.0)
+CAVA_CHANNELS = os.environ.get("AC_UI_CAVA_CHANNELS", "mono").strip().lower()
+if CAVA_CHANNELS not in ("mono", "stereo"):
+    CAVA_CHANNELS = "mono"
+SYM_PLAY     = "▶"
+SYM_PAUSE    = "⏸"
+SYM_STOP     = "⏹"
+SYM_MUTE     = "🔇"
+SYM_ARROW_U  = "↑"
+SYM_ARROW_D  = "↓"
+SYM_ARROW_L  = "←"
+SYM_ARROW_R  = "→"
+SYM_ENTER    = "↵"
+SYM_VOL_UP   = "▲"
+SYM_VOL_DN   = "▼"
+SYM_NOTE     = "♪"
+SYM_ELLIPSIS = "…"
+SUPERSCRIPT  = ("⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹")
+CONTROL_TEXT = "Controls: [n]ext  [T]une  [E]Q  [t]vis  [m]ute  [q]uit  [s]ink  [?]help  [+/-]vol  [g]ame  [v]ariant"
+CONTROL_TEXT_TINY = "n next  T tune  E eq  t vis  m mute  q quit  s sink  ? help  +/- vol"
 HELP_LINES_BASE = [
     "Help",
-    "n: next track   m: mute   e: edit town tune   q: quit",
-    "g: cycle game   v: cycle variant   8: background mode",
-    "h: simulate hour change   t: vis mode   s: audio output",
-    "+/-: volume     ?: toggle help",
+    f"{SYM_ARROW_R} [n]ext track   [m]ute   [T]own tune   [q]uit",
+    f"[g] cycle game   [v] cycle variant   [8] background mode",
+    f"[h] simulate hour   [t] vis mode   [E] EQ   [s] audio output",
+    f"[+/-] volume   [{SYM_ARROW_U}{SYM_ARROW_D}] tune editor nav   [?] toggle help",
 ]
 
 CHIME_DIR = os.path.join(MUSIC_DIR, "chimes")
-DEFAULT_HOUR_CHIME_NAME = "wild-world-town-tune.wav"
+DEFAULT_HOUR_CHIME_NAME = "acgc-town-tune-default.wav"
 DEFAULT_HOUR_CHIME = os.path.join(CHIME_DIR, DEFAULT_HOUR_CHIME_NAME)
+LEGACY_HOUR_CHIME = os.path.join(CHIME_DIR, "wild-world-town-tune.wav")
 SOURCE_HOUR_CHIME = "/home/jfitz/Documents/Animal Crossing ) [x1FWild World： Town Tune (Defaultu0jiqLfo].wav"
 
-# Town tune (16-step) + FluidSynth support
+# Town tune (16-step) + FluidSynth support.
+# Canonical values mirror ACGC:
+# m_melody.c packs 16 4-bit values into one u64, and m_mscore_ovl.c maps
+# 0..12 to notes, 13 to random, 14 to Z/hold, and 15 to off.
 TOWN_TUNE_STEPS = 16
 TOWN_TUNE_NOTES = [
+    "G3", "A3", "B3", "C4", "D4", "E4", "F4",
+    "G4", "A4", "B4", "C5", "D5", "E5",
+]
+TOWN_TUNE_HOLD = "HOLD"
+TOWN_TUNE_OFF = "OFF"
+TOWN_TUNE_RANDOM = "RANDOM"
+TOWN_TUNE_VALUE_TO_TOKEN = {
+    **{i: note for i, note in enumerate(TOWN_TUNE_NOTES)},
+    13: TOWN_TUNE_RANDOM,
+    14: TOWN_TUNE_HOLD,
+    15: TOWN_TUNE_OFF,
+}
+TOWN_TUNE_TOKEN_TO_VALUE = {token: value for value, token in TOWN_TUNE_VALUE_TO_TOKEN.items()}
+DEFAULT_TOWN_TUNE_VALUES = [0x7, 0xC, 0xF, 0x7, 0x6, 0xB, 0xF, 0x9, 0xA, 0xE, 0xD, 0xE, 0x3, 0xF, 0xE, 0xE]
+DEFAULT_TOWN_TUNE = [TOWN_TUNE_VALUE_TO_TOKEN[v] for v in DEFAULT_TOWN_TUNE_VALUES]
+# Terminal rendering metadata copied from m_mscore_ovl.c note_moji[].
+# The source values drive frame type, vertical offset, and frame colors.
+ACGC_NOTE_UI = (
+    {"label": "G", "frame": "normal", "ofs_y": -29.0, "prim": (0, 10, 0), "env": (70, 155, 255)},
+    {"label": "A", "frame": "normal", "ofs_y": -29.0, "prim": (0, 10, 0), "env": (0, 200, 205)},
+    {"label": "B", "frame": "normal", "ofs_y": -29.0, "prim": (0, 20, 0), "env": (0, 225, 150)},
+    {"label": "C", "frame": "normal", "ofs_y": -23.0, "prim": (0, 40, 0), "env": (20, 235, 0)},
+    {"label": "D", "frame": "normal", "ofs_y": -23.0, "prim": (0, 40, 0), "env": (90, 245, 0)},
+    {"label": "E", "frame": "normal", "ofs_y": -23.0, "prim": (0, 40, 0), "env": (130, 255, 0)},
+    {"label": "F", "frame": "normal", "ofs_y": -23.0, "prim": (0, 50, 0), "env": (155, 255, 0)},
+    {"label": "G", "frame": "normal", "ofs_y": -23.0, "prim": (0, 50, 0), "env": (175, 255, 0)},
+    {"label": "A", "frame": "normal", "ofs_y": -23.0, "prim": (0, 60, 0), "env": (195, 255, 0)},
+    {"label": "B", "frame": "normal", "ofs_y": -23.0, "prim": (0, 60, 0), "env": (225, 255, 0)},
+    {"label": "C", "frame": "normal", "ofs_y": -16.0, "prim": (0, 60, 0), "env": (255, 235, 0)},
+    {"label": "D", "frame": "normal", "ofs_y": -16.0, "prim": (0, 60, 0), "env": (255, 215, 0)},
+    {"label": "E", "frame": "normal", "ofs_y": -16.0, "prim": (0, 70, 0), "env": (255, 175, 0)},
+    {"label": "?", "frame": "random", "ofs_y": -20.0, "prim": (70, 60, 30), "env": (255, 110, 110)},
+    {"label": "Z", "frame": "rest", "ofs_y": -29.0, "prim": (10, 10, 0), "env": (165, 100, 255)},
+    {"label": "-", "frame": "off", "ofs_y": -29.0, "prim": (60, 0, 60), "env": (255, 50, 255)},
+)
+ACGC_NOTE_FRAME_UI = {
+    "normal": {"offset": (0.0, 0.0), "shape": "normal"},
+    "rest": {"offset": (-1.0, 20.0), "shape": "rest"},
+    "off": {"offset": (1.0, 1.0), "shape": "off"},
+    "random": {"offset": (-1.0, 5.0), "shape": "random"},
+}
+ACGC_MSCORE_CURSOR_OK = 16
+ACGC_MSCORE_SLOT_STEP = 21.0
+ACGC_MSCORE_FIRST_ROW_X = -91.0
+ACGC_MSCORE_SECOND_ROW_X = -71.0
+ACGC_MSCORE_ROW_Y = (20.0, -30.0)
+ACGC_MSCORE_TERMINAL_STEP = 7
+ACGC_MSCORE_TERMINAL_FIRST_INDENT = 7
+ACGC_MSCORE_TERMINAL_SECOND_INDENT = ACGC_MSCORE_TERMINAL_FIRST_INDENT + round(
+    ((ACGC_MSCORE_SECOND_ROW_X - ACGC_MSCORE_FIRST_ROW_X) / ACGC_MSCORE_SLOT_STEP) * ACGC_MSCORE_TERMINAL_STEP
+)
+ACGC_MSCORE_TERMINAL_SLOT_POS = tuple(i * ACGC_MSCORE_TERMINAL_STEP for i in range(8))
+ACGC_MSCORE_OPEN_AUTOPLAY_DELAY = 10.0 / 60.0
+ACGC_MSCORE_MODAL_ERASE = "erase"
+ACGC_MSCORE_MODAL_END = "end"
+ACGC_MSCORE_END_OPTIONS = ("Yes", "Rewrite", "Throw it out")
+ACGC_MSCORE_GLYPH_SELECTED = (255, 0, 0)
+ACGC_MSCORE_GLYPH_IDLE = (0, 0, 255)
+ACGC_MSCORE_ERASE_CHOICE_ACTIVE = (70, 70, 225)
+ACGC_MSCORE_ERASE_CHOICE_IDLE = (140, 160, 205)
+LEGACY_TOWN_TUNE_NOTES = (
     "C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5",
     "D5", "E5", "F5", "G5", "A5", "B5", "C6", "D6",
-]
-TOWN_TUNE_REST = "REST"
-TOWN_TUNE_HOLD = "HOLD"
-DEFAULT_TOWN_TUNE = [
-    "C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5",
-    "B4", "A4", "G4", "F4", "E4", "D4", "C4", "REST",
-]
+)
 TOWN_TUNE_PATH = os.path.expanduser(
     os.environ.get("AC_UI_TOWN_TUNE_PATH", "~/.local/share/ac-terminal-radio/town_tune.json")
 )
 TOWN_TUNE_ENABLED = os.environ.get("AC_UI_TOWN_TUNE", "1").lower() in ("1", "true", "yes")
 TOWN_TUNE_CHIME_ENABLED = os.environ.get("AC_UI_TOWN_TUNE_CHIME", "0").lower() in ("1", "true", "yes")
+TOWN_TUNE_SAMPLE_DIR = os.path.expanduser(
+    os.environ.get("AC_UI_TOWN_TUNE_SAMPLE_DIR", "~/.local/share/ac-terminal-radio/town_tune_samples")
+)
+ACGC_TOWN_TUNE_RENDER = os.environ.get("AC_UI_ACGC_TOWN_TUNE_RENDER", "1").lower() in ("1", "true", "yes")
+ACGC_TOWN_TUNE_ASSET_ROOT = os.path.expanduser(
+    os.environ.get("AC_UI_ACGC_TOWN_TUNE_ASSET_ROOT", "~/.local/share/ac-terminal-radio/acgc_engine")
+)
+ACGC_TOWN_TUNE_BUNDLED_DUMPER = os.path.join(ACGC_TOWN_TUNE_ASSET_ROOT, "AnimalCrossing-renderer")
+ACGC_TOWN_TUNE_DUMPER = os.path.expanduser(
+    os.environ.get(
+        "AC_UI_ACGC_TOWN_TUNE_DUMPER",
+        ACGC_TOWN_TUNE_BUNDLED_DUMPER
+        if os.path.exists(ACGC_TOWN_TUNE_BUNDLED_DUMPER)
+        else "/home/mrf/ACGC-PC-Port/pc/build-linux32/bin/AnimalCrossing",
+    )
+)
+ACGC_TOWN_TUNE_DISC = os.path.expanduser(
+    os.environ.get(
+        "AC_UI_ACGC_DISC_PATH",
+        os.environ.get("ACGC_DISC_PATH", "/home/mrf/Downloads/Animal Crossing (USA)/Animal Crossing (USA).iso"),
+    )
+)
+try:
+    TOWN_TUNE_STEP_SECONDS = float(os.environ.get("AC_UI_TOWN_TUNE_STEP_SECONDS", "0.228125"))
+except Exception:
+    TOWN_TUNE_STEP_SECONDS = 0.228125
+try:
+    ACGC_TOWN_TUNE_DUMP_SECONDS = max(1, int(os.environ.get("AC_UI_ACGC_TOWN_TUNE_DUMP_SECONDS", "5")))
+except Exception:
+    ACGC_TOWN_TUNE_DUMP_SECONDS = 5
+try:
+    ACGC_TOWN_TUNE_DUMP_TIMEOUT = max(2.0, float(os.environ.get("AC_UI_ACGC_TOWN_TUNE_DUMP_TIMEOUT", "12")))
+except Exception:
+    ACGC_TOWN_TUNE_DUMP_TIMEOUT = 12.0
 TOWN_TUNE_TEMPO = int(os.environ.get("AC_UI_TOWN_TUNE_TEMPO", "50"))
 TOWN_TUNE_STEP_FRACTION = float(os.environ.get("AC_UI_TOWN_TUNE_STEP", "1.0"))
 TOWN_TUNE_GAIN = float(os.environ.get("AC_UI_TOWN_TUNE_GAIN", "0.6"))
@@ -148,25 +387,42 @@ FLUIDSYNTH_OPTS = os.environ.get(
 ).strip()
 FLUIDSYNTH = os.environ.get("AC_UI_FLUIDSYNTH", "fluidsynth")
 FLUIDSYNTH_AUDIO = os.environ.get("AC_UI_FLUIDSYNTH_AUDIO", "").strip()
-SOUNDFONT_PATH = os.path.expanduser(
-    os.environ.get("AC_UI_SOUNDFONT", "~/.local/share/ac-terminal-radio/soundfonts/FluidR3_GM.sf2")
-)
+FLUIDSYNTH_DEFAULT_AUDIO = os.environ.get("AC_UI_FLUIDSYNTH_DEFAULT_AUDIO", "pulseaudio").strip()
+SOUNDFONT_CANDIDATES = [
+    "~/.local/share/ac-terminal-radio/soundfonts/FluidR3_GM.sf2",
+    "/usr/share/soundfonts/FluidR3_GM.sf2",
+    "/usr/share/soundfonts/default.sf2",
+]
+if os.environ.get("AC_UI_SOUNDFONT"):
+    SOUNDFONT_PATH = os.path.expanduser(os.environ["AC_UI_SOUNDFONT"])
+else:
+    SOUNDFONT_PATH = next(
+        (os.path.expanduser(path) for path in SOUNDFONT_CANDIDATES if os.path.exists(os.path.expanduser(path))),
+        os.path.expanduser(SOUNDFONT_CANDIDATES[0]),
+    )
 
 # Local stats (on by default)
 STATS_ENABLED = os.environ.get("AC_UI_STATS", "1").lower() in ("1", "true", "yes")
 STATS_DIR = os.path.expanduser(os.environ.get("AC_UI_STATS_DIR", "~/.local/share/ac-terminal-radio"))
 STATS_JSON = os.path.join(STATS_DIR, "stats.json")
 STATS_CSV = os.path.join(STATS_DIR, "stats.csv")
+UI_STATE_PATH = os.path.expanduser(
+    os.environ.get("AC_UI_STATE_PATH", os.path.join(STATS_DIR, "state.json"))
+)
 
 HOUR_CHIME_PATH = os.path.expanduser(os.environ.get("AC_UI_HOUR_CHIME", DEFAULT_HOUR_CHIME))
 if os.environ.get("AC_UI_HOUR_CHIME") is None:
-    # Auto-import the default chime into the app folder if present.
-    if not os.path.exists(HOUR_CHIME_PATH) and os.path.exists(SOURCE_HOUR_CHIME):
+    # Auto-import the legacy default chime into the app folder if present.
+    if not os.path.exists(LEGACY_HOUR_CHIME) and os.path.exists(SOURCE_HOUR_CHIME):
         try:
             os.makedirs(CHIME_DIR, exist_ok=True)
-            shutil.copy2(SOURCE_HOUR_CHIME, HOUR_CHIME_PATH)
+            shutil.copy2(SOURCE_HOUR_CHIME, LEGACY_HOUR_CHIME)
         except Exception:
             pass
+    HOUR_CHIME_PATH = next(
+        (path for path in (DEFAULT_HOUR_CHIME, LEGACY_HOUR_CHIME) if os.path.exists(path)),
+        DEFAULT_HOUR_CHIME,
+    )
 if not os.path.exists(HOUR_CHIME_PATH):
     HOUR_CHIME_PATH = None
 
@@ -176,6 +432,7 @@ except Exception:
     CROSSFADE_SECONDS = 3.5
 
 FILENAME_RE = re.compile(r"^(?P<hour>[01]\d|2[0-3])-(?P<game>[A-Z0-9]+)-(?P<variant>[a-z0-9_-]+)\.(?P<ext>mp3|flac)$")
+TRACK_LIST_CACHE = {}
 
 def parse_cli_args(argv):
     mode = "run"
@@ -190,7 +447,7 @@ def parse_cli_args(argv):
             print("Usage:")
             print("  ac-ui [--games GCN,WW]")
             print("  ac-ui import <files...>")
-            print("  ac-ui tune [show|play]")
+            print("  ac-ui tune [show|play|reset]")
             print("  ac-ui stats")
             print("  ac-ui layout-sweep")
             sys.exit(0)
@@ -236,15 +493,53 @@ def parse_filename(name):
         return None
     return m.groupdict()
 
+def invalidate_track_cache(hour=None):
+    if hour is None:
+        TRACK_LIST_CACHE.clear()
+    else:
+        TRACK_LIST_CACHE.pop(int(hour), None)
+
+def _hour_track_dir(hour):
+    return os.path.join(MUSIC_DIR, f"{int(hour):02d}")
+
+def _scan_hour_tracks(hour):
+    hour = int(hour)
+    d = _hour_track_dir(hour)
+    if not os.path.isdir(d):
+        TRACK_LIST_CACHE.pop(hour, None)
+        return ()
+    try:
+        st = os.stat(d)
+    except OSError:
+        TRACK_LIST_CACHE.pop(hour, None)
+        return ()
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = TRACK_LIST_CACHE.get(hour)
+    if cached and cached["sig"] == sig:
+        return cached["entries"]
+    entries = []
+    for name in os.listdir(d):
+        lower = name.lower()
+        if not (lower.endswith(".mp3") or lower.endswith(".flac")):
+            continue
+        meta = parse_filename(name)
+        entries.append((name, meta, os.path.join(d, name)))
+    entries.sort(key=lambda item: item[0])
+    entries = tuple(entries)
+    TRACK_LIST_CACHE[hour] = {"sig": sig, "entries": entries}
+    return entries
+
 def _normalize_tune_token(token):
     if token is None:
         return None
     t = str(token).strip().upper()
     if t in ("", "NONE"):
         return None
-    if t in ("-", "REST", "R"):
-        return TOWN_TUNE_REST
-    if t in ("H", "HOLD", "_"):
+    if t in ("-", "OFF", "O", "X"):
+        return TOWN_TUNE_OFF
+    if t in ("?", "RANDOM", "RAND"):
+        return TOWN_TUNE_RANDOM
+    if t in ("Z", "H", "HOLD", "_"):
         return TOWN_TUNE_HOLD
     # Normalize note names like c4 -> C4
     if len(t) >= 2 and t[0] in "ABCDEFG":
@@ -257,16 +552,71 @@ def _normalize_tune_token(token):
             return f"{note}{suffix}"
     return None
 
+def _coerce_tune_value(token):
+    if isinstance(token, bool):
+        return None
+    if isinstance(token, int):
+        return token & 0xF
+    if isinstance(token, str):
+        t = token.strip()
+        if not t:
+            return None
+        try:
+            value = int(t, 0)
+        except ValueError:
+            return None
+        if 0 <= value <= 15:
+            return value
+    return None
+
+def _coerce_tune_token(token):
+    value = _coerce_tune_value(token)
+    if value is not None:
+        return TOWN_TUNE_VALUE_TO_TOKEN[value]
+    tok = _normalize_tune_token(token)
+    if tok in (TOWN_TUNE_HOLD, TOWN_TUNE_OFF, TOWN_TUNE_RANDOM) or tok in TOWN_TUNE_NOTES:
+        return tok
+    if tok in LEGACY_TOWN_TUNE_NOTES:
+        midi_note = note_name_to_midi(tok)
+        if midi_note is None:
+            return TOWN_TUNE_OFF
+        best = min(
+            TOWN_TUNE_NOTES,
+            key=lambda cand: abs(note_name_to_midi(cand) - midi_note),
+        )
+        return best
+    return TOWN_TUNE_OFF
+
+def town_tune_tokens_to_values(notes):
+    return [TOWN_TUNE_TOKEN_TO_VALUE.get(_coerce_tune_token(n), 15) for n in normalize_town_tune(notes)]
+
+def town_tune_values_to_tokens(values):
+    out = []
+    for value in values:
+        coerced = _coerce_tune_value(value)
+        out.append(TOWN_TUNE_VALUE_TO_TOKEN[15 if coerced is None else coerced])
+    if len(out) < TOWN_TUNE_STEPS:
+        out.extend([TOWN_TUNE_OFF] * (TOWN_TUNE_STEPS - len(out)))
+    return out[:TOWN_TUNE_STEPS]
+
+def pack_town_tune_values(values):
+    packed = 0
+    for i, value in enumerate(town_tune_tokens_to_values(town_tune_values_to_tokens(values))):
+        packed |= (value & 0xF) << (60 - i * 4)
+    return packed
+
+def unpack_town_tune_packed(packed):
+    if isinstance(packed, str):
+        packed = int(packed.strip(), 0)
+    packed = int(packed)
+    return [(packed >> (60 - i * 4)) & 0xF for i in range(TOWN_TUNE_STEPS)]
+
 def normalize_town_tune(notes):
     out = []
     for n in notes:
-        tok = _normalize_tune_token(n)
-        if tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD) or tok in TOWN_TUNE_NOTES:
-            out.append(tok)
-        else:
-            out.append(TOWN_TUNE_REST)
+        out.append(_coerce_tune_token(n))
     if len(out) < TOWN_TUNE_STEPS:
-        out.extend([TOWN_TUNE_REST] * (TOWN_TUNE_STEPS - len(out)))
+        out.extend([TOWN_TUNE_OFF] * (TOWN_TUNE_STEPS - len(out)))
     return out[:TOWN_TUNE_STEPS]
 
 def load_town_tune():
@@ -275,19 +625,38 @@ def load_town_tune():
         if os.path.exists(TOWN_TUNE_PATH):
             with open(TOWN_TUNE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and "notes" in data:
-                data = data["notes"]
+            if isinstance(data, dict):
+                if "packed" in data:
+                    notes = town_tune_values_to_tokens(unpack_town_tune_packed(data["packed"]))
+                    data = None
+                elif "values" in data:
+                    notes = town_tune_values_to_tokens(data["values"])
+                    data = None
+                elif "notes" in data:
+                    data = data["notes"]
             if isinstance(data, list):
-                notes = data
+                if all(_coerce_tune_value(item) is not None for item in data):
+                    notes = town_tune_values_to_tokens(data)
+                else:
+                    notes = data
     except Exception:
         pass
     return normalize_town_tune(notes)
 
 def save_town_tune(notes):
     notes = normalize_town_tune(notes)
+    values = town_tune_tokens_to_values(notes)
     os.makedirs(os.path.dirname(TOWN_TUNE_PATH), exist_ok=True)
     with open(TOWN_TUNE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"notes": notes}, f, indent=2)
+        json.dump(
+            {
+                "notes": notes,
+                "values": values,
+                "packed": f"0x{pack_town_tune_values(values):016X}",
+            },
+            f,
+            indent=2,
+        )
     return notes
 
 def load_stats():
@@ -314,6 +683,45 @@ def load_stats():
 def save_stats(data):
     os.makedirs(STATS_DIR, exist_ok=True)
     with open(STATS_JSON, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def load_ui_state():
+    data = {
+        "output_vol": 75,
+        "muted": False,
+        "mute_prev_vol": 50,
+        "vis_mode": VIS_MODE,
+        "game": "ALL",
+        "variant": "ALL",
+    }
+    try:
+        if os.path.exists(UI_STATE_PATH):
+            with open(UI_STATE_PATH, "r", encoding="utf-8") as f:
+                src = json.load(f)
+            if isinstance(src, dict):
+                data.update(src)
+    except Exception:
+        pass
+    try:
+        data["output_vol"] = int(max(0, min(100, data.get("output_vol", 75))))
+    except Exception:
+        data["output_vol"] = 75
+    data["muted"] = bool(data.get("muted", False))
+    try:
+        data["mute_prev_vol"] = int(max(0, min(100, data.get("mute_prev_vol", data["output_vol"]))))
+    except Exception:
+        data["mute_prev_vol"] = data["output_vol"]
+    if data.get("vis_mode") not in VIS_MODES:
+        data["vis_mode"] = VIS_MODE
+    if not isinstance(data.get("game"), str):
+        data["game"] = "ALL"
+    if not isinstance(data.get("variant"), str):
+        data["variant"] = "ALL"
+    return data
+
+def save_ui_state(data):
+    os.makedirs(os.path.dirname(UI_STATE_PATH), exist_ok=True)
+    with open(UI_STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 def append_stats_csv(row):
@@ -441,16 +849,6 @@ def build_layout_preview(term_cols, term_rows):
             info.extend([c(line, "38;5;77") for line in title])
             info_plain.extend([line for line in title])
 
-        if not compact_info:
-            controls_plain = "Controls: [n] next track   [e] edit town tune   [q] quit   [s] audio output   [?] help / more controls   [+/-] volume"
-            if tiny_term:
-                controls_plain = "Keys: n next  e tune  q quit  s audio output  ? help / more  +/- vol"
-            max_controls_width = max(20, term_cols - 6)
-            controls_wrapped = wrap_plain(controls_plain, max_controls_width)
-            for line in controls_wrapped:
-                add_info_line(line, "33")
-            add_info_line("", "2")
-
         fline = "Filter: Game=ALL  Variant=ALL"
         add_info_line(fline, "2")
         vline = f"Visualizer: {VIS_MODES[vis_idx]}"
@@ -466,11 +864,8 @@ def build_layout_preview(term_cols, term_rows):
                 line2_plain = "Playback: 00:16 / 02:19"
                 add_info_line(line2_plain, "35")
             if not compact_info:
-                vline = f"Volume: {int(output_vol):3d}%"
-                add_info_line(vline, "33")
-            if not compact_info:
-                mline = f"Mute: {'ON' if muted else 'OFF'}"
-                add_info_line(mline, "33")
+                mute_tag = "  [MUTED]" if muted else ""
+                add_info_line(f"Volume: {int(output_vol):3d}%{mute_tag}", "33")
         else:
             line1_plain = f"Hour folder: {hour:02d}    Now playing: (none found)"
             add_info_line(line1_plain, "36")
@@ -491,7 +886,7 @@ def build_layout_preview(term_cols, term_rows):
             info_plain = info_plain[:max_info_rows]
             info = info[:max_info_rows]
         if info_plain and (not (compact_info)):
-            info_w_needed = max([len(line) for line in info_plain] + [0])
+            info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
             info_w_cache = min(info_max_width, info_w_needed)
             info_box, info_w = build_box(info_plain, info, info_w_cache)
 
@@ -538,24 +933,29 @@ def build_layout_preview(term_cols, term_rows):
             if len(info_plain) > max_rows:
                 info_plain = info_plain[:max_rows]
                 info = info[:max_rows]
-                info_w_needed = max([len(line) for line in info_plain] + [0])
+                info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
                 info_w_cache = min(info_max_width, info_w_needed)
                 info_box, info_w = build_box(info_plain, info, info_w_cache)
 
+    _info_row_w = 0
     if info_box and stats_box:
         total_w = (info_w + 4) + (stats_w + 4)
         if total_w + 3 <= term_cols:
+            _info_row_w = total_w + 3
             target_len = max(len(info_box), len(stats_box))
             info_box = pad_box_lines(info_box, info_w, target_len)
             stats_box = pad_box_lines(stats_box, stats_w, target_len)
             for left, right in zip(info_box, stats_box):
                 lines.append(left + "   " + right)
         else:
+            _info_row_w = info_w + 4
             lines.extend(info_box)
             lines.extend(stats_box)
     elif info_box:
+        _info_row_w = info_w + 4
         lines.extend(info_box)
     elif stats_box:
+        _info_row_w = stats_w + 4
         lines.extend(stats_box)
 
     show_history = (not tiny_term) and (not ultra_compact) and (not compact_info)
@@ -564,9 +964,12 @@ def build_layout_preview(term_cols, term_rows):
     if rows_budget <= 0:
         show_history = False
         show_up_next = False
-    panel_max_width = info_max_width
     if show_history and show_up_next:
-        panel_max_width = max(10, (term_cols - 10) // 2)
+        panel_max_width = max(10, (_info_row_w - 11) // 2) if _info_row_w > 11 else max(10, (term_cols - 10) // 2)
+    elif _info_row_w > 4:
+        panel_max_width = max(10, _info_row_w - 4)
+    else:
+        panel_max_width = info_max_width
 
     hist_box = None
     up_box = None
@@ -667,7 +1070,7 @@ def layout_sweep_cli(opts=None):
 
 def note_name_to_midi(name):
     name = name.upper()
-    if name == TOWN_TUNE_REST or name == TOWN_TUNE_HOLD:
+    if name in (TOWN_TUNE_HOLD, TOWN_TUNE_OFF, TOWN_TUNE_RANDOM):
         return None
     if len(name) < 2:
         return None
@@ -699,12 +1102,19 @@ def write_town_tune_midi(notes, path, tempo_bpm=120, ticks_per_beat=480, step_fr
     events = []
     time_ticks = 0
     i = 0
+    rng = random.Random()
     while i < len(notes):
         tok = notes[i]
-        if tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD):
+        if tok == TOWN_TUNE_OFF:
             time_ticks += step_ticks
             i += 1
             continue
+        if tok == TOWN_TUNE_HOLD:
+            time_ticks += step_ticks
+            i += 1
+            continue
+        if tok == TOWN_TUNE_RANDOM:
+            tok = rng.choice(TOWN_TUNE_NOTES)
         midi_note = note_name_to_midi(tok)
         if midi_note is None:
             time_ticks += step_ticks
@@ -751,34 +1161,233 @@ def write_town_tune_midi(notes, path, tempo_bpm=120, ticks_per_beat=480, step_fr
         f.write(struct.pack(">I", len(track)))
         f.write(track)
 
-def spawn_town_tune(audio_device=None):
+def _town_tune_sample_path(note):
+    return os.path.join(TOWN_TUNE_SAMPLE_DIR, f"{note}.wav")
+
+def _load_wav_pcm(path):
+    with wave.open(path, "rb") as wf:
+        params = wf.getparams()
+        pcm = wf.readframes(wf.getnframes())
+    return params, pcm
+
+def _pad_pcm_segment(segment, wanted_bytes, frame_size):
+    if len(segment) >= wanted_bytes:
+        return segment[:wanted_bytes]
+    if frame_size <= 0:
+        return segment + (b"\x00" * (wanted_bytes - len(segment)))
+    if len(segment) >= frame_size:
+        last_frame = segment[-frame_size:]
+    else:
+        last_frame = b"\x00" * frame_size
+    pad = bytearray(segment)
+    while len(pad) + frame_size <= wanted_bytes:
+        pad.extend(last_frame)
+    if len(pad) < wanted_bytes:
+        pad.extend(b"\x00" * (wanted_bytes - len(pad)))
+    return bytes(pad)
+
+def _run_acgc_audio_dump(args, path, timeout):
+    if not ACGC_TOWN_TUNE_RENDER:
+        return False
+    if not ACGC_TOWN_TUNE_DUMPER or not os.path.exists(ACGC_TOWN_TUNE_DUMPER):
+        return False
+
+    asset_root = ACGC_TOWN_TUNE_ASSET_ROOT
+    asset_file = os.path.join(asset_root, "assets", "audiorom.img")
+    use_assets = os.path.exists(asset_file)
+    use_disc = ACGC_TOWN_TUNE_DISC and os.path.exists(ACGC_TOWN_TUNE_DISC)
+    if not use_assets and not use_disc:
+        return False
+
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+    except Exception:
+        pass
+
+    env = os.environ.copy()
+    env.setdefault("SDL_AUDIODRIVER", "dummy")
+    env.setdefault("SDL_VIDEODRIVER", "dummy")
+    if use_assets:
+        env.pop("ACGC_DISC_PATH", None)
+        cmd = [ACGC_TOWN_TUNE_DUMPER] + list(args)
+        cwd = asset_root
+    else:
+        cmd = [ACGC_TOWN_TUNE_DUMPER, "--disc", ACGC_TOWN_TUNE_DISC] + list(args)
+        cwd = None
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            cwd=cwd,
+            timeout=timeout,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 44
+
+def render_town_tune_from_game(notes, path):
+    values = town_tune_tokens_to_values(notes)
+    packed = f"{pack_town_tune_values(values):016X}"
+    return _run_acgc_audio_dump(
+        ["--dump-town-values", packed, path, "--dump-seconds", str(ACGC_TOWN_TUNE_DUMP_SECONDS)],
+        path,
+        ACGC_TOWN_TUNE_DUMP_TIMEOUT,
+    )
+
+def render_town_tune_note_from_game(note, path):
+    note = _coerce_tune_token(note)
+    if note not in TOWN_TUNE_NOTES:
+        return False
+    value = TOWN_TUNE_TOKEN_TO_VALUE[note]
+    timeout = max(2.0, min(ACGC_TOWN_TUNE_DUMP_TIMEOUT, 4.0))
+    return _run_acgc_audio_dump(
+        ["--dump-town-note", str(value), path, "--dump-seconds", "1"],
+        path,
+        timeout,
+    )
+
+def _resolve_town_tune_audition_note(tok, notes=None, cursor=None):
+    tok = _coerce_tune_token(tok)
+    if tok in TOWN_TUNE_NOTES:
+        return tok
+    if tok == TOWN_TUNE_RANDOM:
+        return random.choice(TOWN_TUNE_NOTES)
+    if tok != TOWN_TUNE_HOLD or not notes or cursor is None:
+        return None
+    for offset in range(1, TOWN_TUNE_STEPS + 1):
+        prev = _coerce_tune_token(notes[(cursor - offset) % TOWN_TUNE_STEPS])
+        if prev in TOWN_TUNE_NOTES:
+            return prev
+        if prev == TOWN_TUNE_RANDOM:
+            return random.choice(TOWN_TUNE_NOTES)
+        if prev == TOWN_TUNE_OFF:
+            return None
+    return None
+
+def render_town_tune_note_preview(tok, path, notes=None, cursor=None):
+    note = _resolve_town_tune_audition_note(tok, notes=notes, cursor=cursor)
+    if note is None:
+        return False
+    if render_town_tune_note_from_game(note, path):
+        return True
+    sample_path = _town_tune_sample_path(note)
+    if not os.path.exists(sample_path):
+        return False
+    try:
+        shutil.copyfile(sample_path, path)
+    except Exception:
+        return False
+    return os.path.exists(path) and os.path.getsize(path) > 44
+
+def render_town_tune_from_samples(notes, path):
+    notes = normalize_town_tune(notes)
+    if not os.path.isdir(TOWN_TUNE_SAMPLE_DIR):
+        return False
+    sample_paths = {note: _town_tune_sample_path(note) for note in TOWN_TUNE_NOTES}
+    if not all(os.path.exists(sample_path) for sample_path in sample_paths.values()):
+        return False
+
+    ref_params = None
+    sample_pcm = {}
+    for note, sample_path in sample_paths.items():
+        params, pcm = _load_wav_pcm(sample_path)
+        if ref_params is None:
+            ref_params = params
+        elif (params.nchannels != ref_params.nchannels or
+              params.sampwidth != ref_params.sampwidth or
+              params.framerate != ref_params.framerate):
+            return False
+        sample_pcm[note] = pcm
+
+    nchannels = ref_params.nchannels
+    sampwidth = ref_params.sampwidth
+    framerate = ref_params.framerate
+    frame_size = nchannels * sampwidth
+    step_frames = max(1, int(round(framerate * TOWN_TUNE_STEP_SECONDS)))
+    step_bytes = step_frames * frame_size
+
+    out = bytearray()
+    current_note = None
+    current_offset_frames = 0
+    for tok in notes:
+        tok = _coerce_tune_token(tok)
+        if tok == TOWN_TUNE_OFF:
+            current_note = None
+            current_offset_frames = 0
+            out.extend(b"\x00" * step_bytes)
+            continue
+        if tok == TOWN_TUNE_RANDOM:
+            tok = random.choice(TOWN_TUNE_NOTES)
+        if tok == TOWN_TUNE_HOLD:
+            if current_note and current_note in sample_pcm:
+                pcm = sample_pcm[current_note]
+                start = current_offset_frames * frame_size
+                seg = pcm[start:start + step_bytes]
+                out.extend(_pad_pcm_segment(seg, step_bytes, frame_size))
+                current_offset_frames += step_frames
+            else:
+                out.extend(b"\x00" * step_bytes)
+            continue
+        if tok in sample_pcm:
+            current_note = tok
+            current_offset_frames = 0
+            pcm = sample_pcm[tok]
+            seg = pcm[:step_bytes]
+            out.extend(_pad_pcm_segment(seg, step_bytes, frame_size))
+            current_offset_frames += step_frames
+            continue
+        current_note = None
+        current_offset_frames = 0
+        out.extend(b"\x00" * step_bytes)
+
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(nchannels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(framerate)
+        wf.writeframes(bytes(out))
+    return True
+
+def render_town_tune_preview(notes, path, audio_device=None):
+    notes = normalize_town_tune(notes)
+    return render_town_tune_from_game(notes, path) or render_town_tune_from_samples(notes, path)
+
+def _spawn_audio_file(path, audio_device=None):
+    cmd = [MPV, "--no-video", "--quiet", "--no-terminal"]
+    if audio_device:
+        cmd.append(f"--audio-device={audio_device}")
+    cmd.append(path)
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def spawn_town_tune(audio_device=None, notes=None):
     if not TOWN_TUNE_ENABLED:
         return None, None
-    if not shutil.which(FLUIDSYNTH):
-        return None, None
-    if not os.path.exists(SOUNDFONT_PATH):
-        return None, None
-    notes = load_town_tune()
-    tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".mid", delete=False)
+    notes = load_town_tune() if notes is None else normalize_town_tune(notes)
+    tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".wav", delete=False)
     tmp.close()
-    write_town_tune_midi(
-        notes,
-        tmp.name,
-        tempo_bpm=TOWN_TUNE_TEMPO,
-        step_fraction=TOWN_TUNE_STEP_FRACTION,
-        program=TOWN_TUNE_PROGRAM,
-    )
-    cmd = [FLUIDSYNTH, "-ni", "-g", str(TOWN_TUNE_GAIN)]
-    if FLUIDSYNTH_OPTS:
-        cmd += FLUIDSYNTH_OPTS.split()
-    if FLUIDSYNTH_AUDIO:
-        cmd += ["-a", FLUIDSYNTH_AUDIO]
-    elif audio_device and audio_device.startswith("pulse/"):
-        sink = audio_device.split("/", 1)[1]
-        cmd += ["-a", "pulseaudio", "-o", f"audio.pulseaudio.device={sink}"]
-    cmd += [SOUNDFONT_PATH, tmp.name]
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not render_town_tune_preview(notes, tmp.name, audio_device=audio_device):
+            raise RuntimeError("town tune preview render failed")
+        proc = _spawn_audio_file(tmp.name, audio_device=audio_device)
+        return proc, tmp.name
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        return None, None
+
+def spawn_town_tune_note(tok, audio_device=None, notes=None, cursor=None):
+    if not TOWN_TUNE_ENABLED:
+        return None, None
+    tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-note-", suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        if not render_town_tune_note_preview(tok, tmp.name, notes=notes, cursor=cursor):
+            raise RuntimeError("town tune note preview render failed")
+        proc = _spawn_audio_file(tmp.name, audio_device=audio_device)
         return proc, tmp.name
     except Exception:
         try:
@@ -790,44 +1399,38 @@ def spawn_town_tune(audio_device=None):
 def town_tune_cli(action=None):
     notes = load_town_tune()
     if action in ("show", "print"):
+        values = town_tune_tokens_to_values(notes)
         print("Town tune (16 steps):")
         print(" ".join(f"{i+1:02d}:{n}" for i, n in enumerate(notes)))
+        print("Values:")
+        print(" ".join(f"{value:02X}" for value in values))
+        print(f"Packed: 0x{pack_town_tune_values(values):016X}")
+        return 0
+    if action in ("reset", "default"):
+        notes = save_town_tune(DEFAULT_TOWN_TUNE)
+        values = town_tune_tokens_to_values(notes)
+        print(f"Reset to ACGC default town tune: 0x{pack_town_tune_values(values):016X}")
         return 0
     if action in ("play", "preview"):
-        if not shutil.which(FLUIDSYNTH):
-            print("fluidsynth not found in PATH.")
-            return 1
-        if not os.path.exists(SOUNDFONT_PATH):
-            print(f"SoundFont missing: {SOUNDFONT_PATH}")
-            return 1
-        tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".mid", delete=False)
+        tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".wav", delete=False)
         tmp.close()
-        write_town_tune_midi(
-            notes,
-            tmp.name,
-            tempo_bpm=TOWN_TUNE_TEMPO,
-            step_fraction=TOWN_TUNE_STEP_FRACTION,
-            program=TOWN_TUNE_PROGRAM,
-        )
-        cmd = [FLUIDSYNTH, "-ni", "-g", str(TOWN_TUNE_GAIN)]
-        if FLUIDSYNTH_OPTS:
-            cmd += FLUIDSYNTH_OPTS.split()
-        if FLUIDSYNTH_AUDIO:
-            cmd += ["-a", FLUIDSYNTH_AUDIO]
-        cmd += [SOUNDFONT_PATH, tmp.name]
         try:
-            subprocess.run(cmd)
+            if not render_town_tune_preview(notes, tmp.name, audio_device=None):
+                print("town tune game renderer and sample bank are unavailable.")
+                return 1
+            result = subprocess.run([MPV, "--no-video", "--quiet", "--no-terminal", tmp.name],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         finally:
             try:
                 os.unlink(tmp.name)
             except Exception:
                 pass
-        return 0
+        return result.returncode if result is not None else 1
     # Interactive editor
     print("Town tune editor (16 steps).")
     print("Available notes:")
     print("  " + " ".join(TOWN_TUNE_NOTES))
-    print("Special tokens: REST (silence), HOLD (extend previous note)")
+    print("Special tokens: RANDOM (random note), HOLD/Z (extend previous note), OFF (silence)")
     print("Press Enter to keep the current value.")
     updated = []
     for i in range(TOWN_TUNE_STEPS):
@@ -837,11 +1440,11 @@ def town_tune_cli(action=None):
             updated.append(current)
             continue
         tok = _normalize_tune_token(resp)
-        if tok in TOWN_TUNE_NOTES or tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD):
+        if tok in TOWN_TUNE_NOTES or tok in (TOWN_TUNE_RANDOM, TOWN_TUNE_HOLD, TOWN_TUNE_OFF):
             updated.append(tok)
         else:
-            print("  Invalid token; using REST.")
-            updated.append(TOWN_TUNE_REST)
+            print("  Invalid token; using OFF.")
+            updated.append(TOWN_TUNE_OFF)
     save_town_tune(updated)
     print(f"Saved to {TOWN_TUNE_PATH}")
     return 0
@@ -852,11 +1455,7 @@ def collect_catalog():
     if not os.path.isdir(MUSIC_DIR):
         return games, variants
     for hour in range(24):
-        d = hh_folder(hour)
-        if not os.path.isdir(d):
-            continue
-        for name in os.listdir(d):
-            meta = parse_filename(name)
+        for _name, meta, _path in _scan_hour_tracks(hour):
             if not meta:
                 continue
             games.add(meta["game"])
@@ -917,6 +1516,7 @@ def import_files(paths):
             continue
         try:
             shutil.copy2(src, dest_path)
+            invalidate_track_cache(meta["hour"])
             print(f"Imported -> {dest_path}")
         except Exception as e:
             print(f"Failed to import {src}: {e}")
@@ -924,26 +1524,16 @@ def import_files(paths):
     return 1 if errors else 0
 
 def hh_folder(hour: int) -> str:
-    return os.path.join(MUSIC_DIR, f"{hour:02d}")
+    return _hour_track_dir(hour)
 
 def list_tracks_for_hour(hour: int, allowed_games=None, allowed_variants=None):
-    d = hh_folder(hour)
-    if not os.path.isdir(d):
-        return []
     tracks = []
-    for name in os.listdir(d):
-        lower = name.lower()
-        if lower.endswith(".mp3") or lower.endswith(".flac"):
-            if allowed_games:
-                meta = parse_filename(name)
-                if not meta or meta["game"] not in allowed_games:
-                    continue
-            if allowed_variants:
-                meta = parse_filename(name)
-                if not meta or meta["variant"] not in allowed_variants:
-                    continue
-            tracks.append(os.path.join(d, name))
-    tracks.sort()
+    for _name, meta, path in _scan_hour_tracks(hour):
+        if allowed_games and (not meta or meta["game"] not in allowed_games):
+            continue
+        if allowed_variants and (not meta or meta["variant"] not in allowed_variants):
+            continue
+        tracks.append(path)
     return tracks
 
 def pick_weighted(tracks):
@@ -973,66 +1563,745 @@ def fmt_mmss(seconds: float) -> str:
     s = seconds % 60
     return f"{m:02d}:{s:02d}"
 
-def spectrum_color(i, n):
-    if n <= 1:
-        return 81
-    return int(27 + (196 - 27) * (i / (n - 1)))
+VIS_GRADIENT_COLORS = (82, 118, 154, 190, 226, 220, 214, 208, 202, 196)
 
-def spectrum_lines(bars, height=CAVA_HEIGHT, use_color=None, mode="bars", trail_bars=None, peak_bars=None):
+# ── btop-style Unicode box-drawing characters ─────────────────────────────────
+BOX_CHARS = {
+    "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯",
+    "h":  "─", "v":  "│",
+    "htl": "┌", "htr": "┐", "hbl": "└", "hbr": "┘",  # hard-corner fallback
+}
+BOX_TITLE_L  = "┤"   # left  title bracket  ─┤ Title ├─
+BOX_TITLE_R  = "├"   # right title bracket
+
+# ── 101-step pre-computed gradients (btop pattern) ───────────────────────────
+def _make_gradient(c_start, c_end, steps=101):
+    return tuple(int(c_start + (c_end - c_start) * i / max(1, steps - 1))
+                 for i in range(steps))
+
+_GRAD_SPECTRUM  = _make_gradient(27,  196, 101)   # blue → red  (default)
+_GRAD_AC_GREEN  = _make_gradient(22,  156, 101)   # dark-green → yellow-green
+_GRAD_PLAYBACK  = _make_gradient(39,  46,  101)   # teal → bright-green
+_GRAD_VOLUME    = _make_gradient(46,  220, 101)   # green → gold
+_GRAD_HOT       = _make_gradient(196, 226, 101)   # red → yellow (flame hot)
+
+def gradient_at(grad, value_0_100):
+    """Look up a pre-computed gradient at a 0-100 position."""
+    idx = max(0, min(100, int(value_0_100)))
+    return grad[idx]
+
+def gradient_bar(value_pct, width, grad=None, bg_color=235):
+    """Btop-style horizontal meter bar with gradient fill + dim background."""
+    if grad is None:
+        grad = _GRAD_PLAYBACK
+    filled = max(0, min(width, int(round(value_pct / 100.0 * width))))
+    out_parts = []
+    for i in range(filled):
+        col = gradient_at(grad, round(i / max(1, width - 1) * 100))
+        out_parts.append(f"[38;5;{col}m█")
+    if filled < width:
+        out_parts.append(f"[38;5;{bg_color}m" + "░" * (width - filled))
+    out_parts.append("[0m")
+    return "".join(out_parts)
+
+# ── btop Symbols: defined near top of file, before HELP_LINES_BASE ───────────
+
+def superscript_num(n):
+    """Convert a small integer to superscript Unicode digits (btop pattern)."""
+    return "".join(SUPERSCRIPT[int(d)] for d in str(max(0, n)) if d.isdigit())
+
+def hi_key(label):
+    """Btop bold-first-letter shortcut: [n]ext → bold n, dim rest."""
+    if not USE_COLOR or not label:
+        return label
+    return f"\x1b[1;32m{label[0]}\x1b[0;2m{label[1:]}\x1b[0m"
+
+def humanize_seconds(sec):
+    """Btop sec_to_dhms: compact mm:ss or h:mm:ss track duration."""
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+def humanize_bytes(b):
+    """Btop floating_humanizer: compact file-size string (KiB/MiB)."""
+    b = max(0, b)
+    if b < 1024:
+        return f"{b} B"
+    if b < 1024 ** 2:
+        return f"{b/1024:.1f} KiB"
+    if b < 1024 ** 3:
+        return f"{b/1024**2:.1f} MiB"
+    return f"{b/1024**3:.2f} GiB"
+
+
+def spectrum_color(i, n, row_norm=None, game_tag=None):
+    """Return ANSI-256 color for bar i-of-n, optionally height-tinted or game-themed."""
+    t = (i / max(1, n - 1)) if n > 1 else 1.0
+    if game_tag and game_tag != "ALL":
+        # AC-themed: dark-green bass → yellow-green highs
+        return gradient_at(_GRAD_AC_GREEN, int(t * 100))
+    if row_norm is not None:
+        # Height-based color: cool at bottom, warm at top (btop graph style)
+        return gradient_at(_GRAD_SPECTRUM, int(row_norm * 100))
+    return gradient_at(_GRAD_SPECTRUM, int(t * 100))
+
+def frac_block(level, row_bottom, row_top):
+    if level >= row_top:
+        return VIS_BAR_BLOCKS[-1]
+    if level > row_bottom:
+        frac = (level - row_bottom) / max(0.001, row_top - row_bottom)
+        idx = int(frac * (len(VIS_BAR_BLOCKS) - 1))
+        idx = max(0, min(len(VIS_BAR_BLOCKS) - 1, idx))
+        return VIS_BAR_BLOCKS[idx]
+    return " "
+
+def shade_block(level, row_bottom, row_top):
+    if level >= row_top:
+        return VIS_SHADE_BLOCKS[-1]
+    if level > row_bottom:
+        frac = (level - row_bottom) / max(0.001, row_top - row_bottom)
+        idx = int(frac * (len(VIS_SHADE_BLOCKS) - 1) + 0.25)
+        idx = max(1, min(len(VIS_SHADE_BLOCKS) - 1, idx))
+        return VIS_SHADE_BLOCKS[idx]
+    return " "
+
+def peak_cap(level, height):
+    dot_rows = max(1, height * len(VIS_PEAK_GLYPHS))
+    dot_y = int(round((1.0 - max(0.0, min(1.0, level))) * (dot_rows - 1)))
+    row = dot_y // len(VIS_PEAK_GLYPHS)
+    glyph = VIS_PEAK_GLYPHS[dot_y % len(VIS_PEAK_GLYPHS)]
+    return row, glyph
+
+def spectrum_lines(bars, height=CAVA_HEIGHT, use_color=None, mode="bars", trail_bars=None, peak_bars=None, game_tag=None):
     if use_color is None:
         use_color = USE_COLOR
     bars = bars or []
     n = len(bars)
     if n == 0:
         return ["(no spectrum data)"]
-    # Build rows as lists of fragments to avoid O(n^2) string concatenation.
+    if mode not in ("bars", "peaks", "shades", "outline", "spectrum"):
+        mode = "bars"
+
+    def value_at(values, i, fallback):
+        if values is None or i >= len(values):
+            return fallback
+        return max(0.0, min(1.0, values[i]))
+
+    def colorize(ch, i, row_norm):
+        if not use_color or ch == " ":
+            return ch
+        return f"\x1b[38;5;{spectrum_color(i, n, row_norm, game_tag=game_tag)}m{ch}\x1b[0m"
+
     row_fragments = [[] for _ in range(height)]
-    for i, val in enumerate(bars):
-        v = max(0.0, min(1.0, val))
-        color = spectrum_color(i, n) if use_color else None
-        if mode == "spectrum":
-            pv = v
-            if peak_bars is not None:
-                pv = max(0.0, min(1.0, peak_bars[i]))
-            peak = (height - 1) - int(pv * (height - 1) + 0.5)
-            for row in range(height):
-                # Peak + faint fill for depth
-                if row == peak:
-                    ch = "#"
-                elif row > peak:
-                    ch = "."
+
+    for row in range(height):
+        row_bottom = (height - 1 - row) / max(1, height)
+        row_top = (height - row) / max(1, height)
+        row_norm = row_bottom
+        for i, val in enumerate(bars):
+            v = max(0.0, min(1.0, val))
+            if mode == "spectrum":
+                pv = value_at(peak_bars, i, v)
+                tv = value_at(trail_bars, i, v)
+                peak_row = (height - 1) - int(pv * (height - 1) + 0.5)
+                trail_row = (height - 1) - int(tv * (height - 1) + 0.5)
+                if row == peak_row:
+                    ch = "█"
+                elif row >= trail_row:
+                    ch = "·"
                 else:
                     ch = " "
-                if use_color and ch != " ":
-                    row_fragments[row].append(f"[38;5;{color}m{ch}[0m")
+            elif mode == "peaks":
+                pv = value_at(peak_bars, i, v)
+                cap_row, cap_glyph = peak_cap(pv, height)
+                min_gap = max(0.01, 0.5 / max(1, height * len(VIS_PEAK_GLYPHS)))
+                if pv > v + min_gap and row == cap_row:
+                    ch = cap_glyph
                 else:
-                    row_fragments[row].append(ch)
-        else:
-            fill = int(v * height + 0.5)
-            for row in range(height):
-                filled = (height - row) <= fill
-                ch = "#" if filled else " "
-                if use_color:
-                    row_fragments[row].append(f"[38;5;{color}m{ch}[0m")
-                else:
-                    row_fragments[row].append(ch)
+                    ch = frac_block(v, row_bottom, row_top)
+            elif mode == "shades":
+                ch = shade_block(v, row_bottom, row_top)
+            elif mode == "outline":
+                ch = "─" if row_bottom < v <= row_top else " "
+            else:
+                ch = frac_block(v, row_bottom, row_top)
+            row_fragments[row].append(colorize(ch, i, row_norm))
     return ["".join(parts) for parts in row_fragments]
+
+
+# ─── Braille helpers ─────────────────────────────────────────────────────────
+# 4-row × 2-col dot-bit table: _BRAILLE_BIT[row][col] → bitmask
+_BRAILLE_BIT = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
+
+def _scatter_hash(seed, y, x, frame):
+    """Fast deterministic hash for stochastic braille stipple."""
+    h = (seed ^ (y * 2654435761) ^ (x * 2246822519) ^ (frame * 1013904223)) & 0xFFFFFFFF
+    h ^= (h >> 16)
+    h = (h * 0x45d9f3b) & 0xFFFFFFFF
+    h ^= (h >> 16)
+    return (h & 0xFF) / 255.0
+
+
+# ─── Flame visualizer ────────────────────────────────────────────────────────
+def flame_render_lines(bars, height, width, state, use_color=True, game_tag=None):
+    """Doom-fire: spectrum feeds heat at the bottom, propagates upward via braille 4×2 subgrid."""
+    if height <= 0 or width <= 0 or not bars:
+        return [" " * max(1, width)] * max(1, height)
+
+    dot_rows = height * 4
+    dot_cols = width * 2
+    n_bars = len(bars)
+
+    if state["heat"] is None or state["rows"] != dot_rows or state["cols"] != dot_cols:
+        state["heat"] = [0.0] * (dot_rows * dot_cols)
+        state["rows"] = dot_rows
+        state["cols"] = dot_cols
+
+    heat = state["heat"]
+    rng = state["rng"]
+    state["frame"] = state.get("frame", 0) + 1
+    frame = state["frame"]
+
+    # Seed bottom row from interpolated spectrum bars with sparkle
+    last_bar = n_bars - 1
+    for x in range(dot_cols):
+        pos = x / max(1, dot_cols - 1) * last_bar
+        lo = int(pos); hi = min(lo + 1, last_bar)
+        src = bars[lo] * (1.0 - (pos - lo)) + bars[hi] * (pos - lo)
+        rng = (rng * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+        sparkle = ((rng >> 33) % 100) / 100.0 * 0.20
+        # No floor: quiet = near-zero flame, loud = tall flame.
+        # Sparkle scales with signal so silence is nearly dark.
+        heat[x] = min(src + sparkle * (0.25 + src), 1.0)
+
+    # Propagate heat upward: lateral wind jitter + height-dependent decay
+    # Normalise decay to dot_rows so flame height scales consistently at any spectrum height.
+    _decay_scale = 32.0 / max(1, dot_rows)
+    for y in range(dot_rows - 1, 0, -1):
+        decay_base = (0.010 + 0.028 * (y / max(1, dot_rows - 1))) * _decay_scale
+        for x in range(dot_cols):
+            rng = (rng * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+            r = rng >> 33
+            offset = int(r % 3) - 1
+            decay_jitter = ((r >> 2) % 100) / 100.0 * 0.018 * _decay_scale
+            sx = max(0, min(dot_cols - 1, x + offset))
+            heat[y * dot_cols + x] = max(0.0, heat[(y - 1) * dot_cols + sx] - decay_base - decay_jitter)
+
+    state["rng"] = rng
+
+    # Tier colors: hot core = bright chartreuse, body = AC green or default green
+    hot_color = 118
+    body_color = 82 if (game_tag and game_tag != "ALL") else 46
+
+    lines_out = []
+    for row in range(height):
+        row_str = []
+        for col in range(width):
+            braille = 0x2800
+            cell_tier = -1
+            for dr in range(4):
+                for dc in range(2):
+                    hy = dot_rows - 1 - (row * 4 + dr)  # bottom = heat source
+                    hx = col * 2 + dc
+                    h = heat[hy * dot_cols + hx]
+                    if h < 0.10:
+                        continue
+                    if h < 0.25 and _scatter_hash(0, row * 4 + dr, hx, frame) > h * 4:
+                        continue
+                    braille |= _BRAILLE_BIT[dr][dc]
+                    tier = 0 if h >= 0.55 else 1
+                    if tier > cell_tier:
+                        cell_tier = tier
+            ch = chr(braille)
+            if use_color and cell_tier >= 0:
+                color = hot_color if cell_tier == 0 else body_color
+                row_str.append(c256(ch, color))
+            else:
+                row_str.append(ch)
+        lines_out.append("".join(row_str))
+    return lines_out
+
+
+# ─── Braille waveform (oscilloscope) ─────────────────────────────────────────
+def braille_wave_lines(bars, height, width, use_color=True, game_tag=None):
+    """Braille oscilloscope: frequency bars mapped to a spatial waveform curve."""
+    if height <= 0 or width <= 0 or not bars:
+        return [" " * max(1, width)] * max(1, height)
+
+    dot_rows = height * 4
+    dot_cols = width * 2
+    n = len(bars)
+    center = dot_rows / 2.0
+    amplitude = dot_rows * 0.42
+
+    # Interpolate bar amplitudes to dot-column Y positions
+    ypos = []
+    for x in range(dot_cols):
+        pos = x / max(1, dot_cols - 1) * (n - 1)
+        lo = int(pos); hi = min(lo + 1, n - 1)
+        sample = bars[lo] * (1.0 - (pos - lo)) + bars[hi] * (pos - lo)
+        sample = (sample - 0.5) * 2.0  # map 0..1 → -1..+1
+        y = int(center - sample * amplitude + 0.5)
+        ypos.append(max(0, min(dot_rows - 1, y)))
+
+    # Rasterize waveform with line interpolation between adjacent points
+    grid = [False] * (dot_rows * dot_cols)
+    for x in range(dot_cols):
+        y = ypos[x]
+        grid[y * dot_cols + x] = True
+        if x > 0:
+            for fy in range(min(ypos[x - 1], y), max(ypos[x - 1], y) + 1):
+                grid[fy * dot_cols + x] = True
+
+    lines_out = []
+    for row in range(height):
+        row_str = []
+        for col in range(width):
+            braille = 0x2800
+            has_dot = False
+            for dr in range(4):
+                for dc in range(2):
+                    if grid[(row * 4 + dr) * dot_cols + col * 2 + dc]:
+                        braille |= _BRAILLE_BIT[dr][dc]
+                        has_dot = True
+            ch = chr(braille)
+            if use_color and has_dot:
+                color = spectrum_color(col, width, game_tag=game_tag)
+                row_str.append(c256(ch, color))
+            else:
+                row_str.append(ch)
+        lines_out.append("".join(row_str))
+    return lines_out
+
+
+# ─── Braille Lissajous / XY scope ────────────────────────────────────────────
+def braille_scope_lines(bars, height, width, frame, use_color=True, game_tag=None):
+    """Lissajous XY scope: low-freq bands as X axis, high-freq as Y, phase-animated."""
+    if height <= 0 or width <= 0 or not bars:
+        return [" " * max(1, width)] * max(1, height)
+
+    dot_rows = height * 4
+    dot_cols = width * 2
+    n = len(bars)
+    grid = [False] * (dot_rows * dot_cols)
+
+    if n >= 4:
+        mid = n // 2
+        x_bands = bars[:mid]
+        y_bands = bars[mid:]
+        n_pts = min(200, min(len(x_bands), len(y_bands)))
+        phase = math.sin(frame * 0.018) * 0.28
+
+        prev_dx = prev_dy = -1
+        for k in range(n_pts):
+            t = k / max(1, n_pts - 1)
+            xi = t * (len(x_bands) - 1)
+            yi_raw = (t + phase) % 1.0 * (len(y_bands) - 1)
+
+            xlo = int(xi); xhi = min(xlo + 1, len(x_bands) - 1)
+            xv = x_bands[xlo] * (1.0 - (xi - xlo)) + x_bands[xhi] * (xi - xlo)
+
+            ylo = int(yi_raw); yhi = min(ylo + 1, len(y_bands) - 1)
+            yv = y_bands[ylo] * (1.0 - (yi_raw - ylo)) + y_bands[yhi] * (yi_raw - ylo)
+
+            dx = max(0, min(dot_cols - 1, int(xv * (dot_cols - 1) + 0.5)))
+            dy = max(0, min(dot_rows - 1, int((1.0 - yv) * (dot_rows - 1) + 0.5)))
+            grid[dy * dot_cols + dx] = True
+
+            if prev_dx >= 0:
+                ddx, ddy = dx - prev_dx, dy - prev_dy
+                steps = max(abs(ddx), abs(ddy))
+                if 0 < steps < 24:
+                    for s in range(1, steps):
+                        mx = prev_dx + ddx * s // steps
+                        my = prev_dy + ddy * s // steps
+                        if 0 <= mx < dot_cols and 0 <= my < dot_rows:
+                            grid[my * dot_cols + mx] = True
+            prev_dx, prev_dy = dx, dy
+
+    lines_out = []
+    for row in range(height):
+        row_str = []
+        for col in range(width):
+            braille = 0x2800
+            has_dot = False
+            for dr in range(4):
+                for dc in range(2):
+                    if grid[(row * 4 + dr) * dot_cols + col * 2 + dc]:
+                        braille |= _BRAILLE_BIT[dr][dc]
+                        has_dot = True
+            ch = chr(braille)
+            if use_color and has_dot:
+                color = spectrum_color(col, width, game_tag=game_tag)
+                row_str.append(c256(ch, color))
+            else:
+                row_str.append(ch)
+        lines_out.append("".join(row_str))
+    return lines_out
+
+
+def resample_bars(bars, width):
+    """Linear resample spectrum bars to a target column count."""
+    if not bars or width <= 0:
+        return []
+    n = len(bars)
+    if n == width:
+        return [max(0.0, min(1.0, v)) for v in bars]
+    out = []
+    for i in range(width):
+        pos = i / max(1, width - 1) * (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n - 1)
+        v = bars[lo] * (1.0 - (pos - lo)) + bars[hi] * (pos - lo)
+        out.append(max(0.0, min(1.0, v)))
+    return out
+
+
+def butterfly_render_lines(bars, height, width, state, use_color=True, game_tag=None):
+    """Symmetric Rorschach pattern — inspired by cliamp VisButterfly (algorithm only)."""
+    if height <= 0 or width <= 0 or not bars:
+        return [" " * max(1, width)] * max(1, height)
+
+    dot_rows = height * 4
+    dot_cols = width * 2
+    center_x = dot_cols // 2
+    band_count = len(bars)
+    frame = state.get("frame", 0)
+    state["frame"] = frame + 1
+    grid = [False] * (dot_rows * dot_cols)
+
+    for dy in range(dot_rows):
+        band_f = dy / max(1, dot_rows - 1) * (band_count - 1)
+        bi = int(band_f)
+        frac = band_f - bi
+        if bi >= band_count - 1:
+            energy = bars[band_count - 1]
+        else:
+            energy = bars[bi] * (1.0 - frac) + bars[bi + 1] * frac
+
+        t = frame * 0.08 + dy * 0.3
+        wobble = math.sin(t) * 0.15
+        wing_width = int(center_x * (energy + wobble) * 0.9)
+
+        for dx in range(max(0, wing_width)):
+            norm = dx / max(1, wing_width)
+            threshold = (1.0 - norm * norm) * energy
+            if norm > 0.6:
+                threshold *= 0.5 + 0.5 * math.sin(frame * 0.1 + dy * 0.5 + dx * 0.3)
+            if _scatter_hash(bi, dy, dx, frame // 3) < threshold:
+                rx = center_x + dx
+                if rx < dot_cols:
+                    grid[dy * dot_cols + rx] = True
+                lx = center_x - 1 - dx
+                if lx >= 0:
+                    grid[dy * dot_cols + lx] = True
+
+        if energy > 0.05:
+            grid[dy * dot_cols + center_x] = True
+            if center_x > 0:
+                grid[dy * dot_cols + center_x - 1] = True
+
+    lines_out = []
+    for row in range(height):
+        row_str = []
+        for col in range(width):
+            braille = 0x2800
+            has_dot = False
+            for dr in range(4):
+                for dc in range(2):
+                    if grid[(row * 4 + dr) * dot_cols + col * 2 + dc]:
+                        braille |= _BRAILLE_BIT[dr][dc]
+                        has_dot = True
+            ch = chr(braille)
+            if use_color and has_dot:
+                row_norm = row / max(1, height - 1)
+                color = spectrum_color(col, width, row_norm, game_tag=game_tag)
+                row_str.append(c256(ch, color))
+            else:
+                row_str.append(ch)
+        lines_out.append("".join(row_str))
+    return lines_out
+
+
+def led_matrix_lines(bars, height, width, peak_bars=None, use_color=True, game_tag=None):
+    """Winamp-style LED columns with falling peak caps (▄ body, ▀ peak)."""
+    if height <= 0 or width <= 0 or not bars:
+        return [" " * max(1, width)] * max(1, height)
+
+    bar_w, bar_gap = 2, 1
+    n_bars = max(1, (width + bar_gap) // (bar_w + bar_gap))
+    body = resample_bars(bars, n_bars)
+    peak = resample_bars(peak_bars if peak_bars else bars, n_bars)
+    render_w = n_bars * (bar_w + bar_gap) - bar_gap
+    pad = max(0, width - render_w)
+    height_f = float(height)
+
+    lines_out = []
+    for row in range(height):
+        row_bottom = (height - 1 - row) / height_f
+        rfb = height - 1 - row
+        parts = [" "] * pad
+        for b in range(n_bars):
+            lit = int(math.floor(body[b] * height_f + 1e-6))
+            peak_seg = int(math.floor(peak[b] * height_f + 1e-6))
+            peak_seg = min(height - 1, peak_seg)
+            show_peak = peak[b] > body[b] + 0.5 / height_f and peak_seg >= lit
+            if rfb < lit:
+                glyph = "▄"
+            elif show_peak and rfb == peak_seg:
+                glyph = "▀"
+            else:
+                glyph = " "
+            cell = glyph * bar_w
+            if use_color and glyph != " ":
+                parts.append(c256(cell, spectrum_color(b, n_bars, row_bottom, game_tag=game_tag)))
+            else:
+                parts.append(cell)
+            if b < n_bars - 1:
+                parts.append(" " * bar_gap)
+        lines_out.append("".join(parts))
+    return lines_out
+
+
+def matrix_rain_lines(bars, height, width, state, use_color=True, game_tag=None):
+    """Falling character rain — inspired by cliamp VisMatrix (algorithm only)."""
+    if height <= 0 or width <= 0 or not bars:
+        return [" " * max(1, width)] * max(1, height)
+
+    n = len(bars)
+    frame = state.get("frame", 0)
+    state["frame"] = frame + 1
+    chars = MATRIX_RAIN_CHARS
+    n_chars = len(chars)
+
+    lines_out = []
+    for row in range(height):
+        row_parts = []
+        col = 0
+        for b in range(n):
+            energy = bars[b]
+            seed = col * 7919 + 104729
+            if _scatter_hash(b, 0, col, frame // 20) > energy * 1.5 + 0.1:
+                row_parts.append(" ")
+                col += 1
+                continue
+            speed = 2 + int(seed % 3)
+            trail_len = 3 + int((seed // 7) % 3)
+            cycle_len = height + trail_len + 4
+            offset = int((seed // 13) % cycle_len)
+            pos = (frame // speed + offset) % cycle_len
+            dist = pos - row
+            if dist < 0 or dist > trail_len:
+                row_parts.append(" ")
+            else:
+                char_seed = seed ^ (row * 31 + (frame // 4) * 17)
+                ch = chars[char_seed % n_chars]
+                if use_color:
+                    if dist == 0:
+                        color = 255
+                    elif dist <= 2:
+                        color = 118 if (game_tag and game_tag != "ALL") else 46
+                    else:
+                        color = 34 if (game_tag and game_tag != "ALL") else 22
+                    row_parts.append(c256(ch, color))
+                else:
+                    row_parts.append(ch)
+            col += 1
+            if b < n - 1:
+                row_parts.append(" ")
+                col += 1
+        line = "".join(row_parts)
+        if len(line) < width:
+            line += " " * (width - len(line))
+        elif len(line) > width:
+            line = line[:width]
+        lines_out.append(line)
+    return lines_out
+
+
+def heartbeat_render_lines(bars, height, width, state, use_color=True, game_tag=None):
+    """Scrolling ECG trace derived from bass energy (cliamp-style monitor look)."""
+    if height <= 0 or width <= 0:
+        return [" " * max(1, width)] * max(1, height)
+
+    dot_rows = height * 4
+    dot_cols = width * 2
+    buf = state.get("buf")
+    if buf is None or len(buf) != dot_cols:
+        buf = [0.0] * dot_cols
+        state["buf"] = buf
+        state["prev_bass"] = 0.0
+
+    n = len(bars) if bars else 0
+    if n > 0:
+        bass_n = max(1, n // 6)
+        bass = sum(bars[:bass_n]) / bass_n
+        mid_n = max(1, n // 3)
+        mids = sum(bars[bass_n:mid_n]) / max(1, mid_n - bass_n) if mid_n > bass_n else 0.0
+        prev = state.get("prev_bass", bass)
+        spike = max(0.0, bass - prev) * 2.8
+        state["prev_bass"] = bass * 0.7 + prev * 0.3
+        sample = (bass - 0.35) * 1.4 + mids * 0.25 + spike
+        if spike > 0.12:
+            sample += 0.55 * math.sin(state.get("spike_phase", 0.0))
+            state["spike_phase"] = state.get("spike_phase", 0.0) + 1.2
+        else:
+            state["spike_phase"] = 0.0
+        sample = max(-1.0, min(1.0, sample))
+    else:
+        sample = 0.0
+
+    buf.pop(0)
+    buf.append(sample)
+
+    center_y = dot_rows / 2.0
+    amplitude = dot_rows * 0.42
+    ypos = []
+    for x in range(dot_cols):
+        s = buf[x]
+        shaped = s * abs(s)
+        y = int(center_y - shaped * amplitude + 0.5)
+        ypos.append(max(0, min(dot_rows - 1, y)))
+
+    grid = [False] * (dot_rows * dot_cols)
+    base_y = dot_rows // 2
+    for x in range(dot_cols):
+        y = ypos[x]
+        grid[y * dot_cols + x] = True
+        if x > 0:
+            lo, hi = min(y, ypos[x - 1]), max(y, ypos[x - 1])
+            for fy in range(lo, hi + 1):
+                grid[fy * dot_cols + x] = True
+    for x in range(dot_cols):
+        if not grid[base_y * dot_cols + x] and (x // 6) % 2 == 0:
+            grid[base_y * dot_cols + x] = True
+
+    trace_color = 196
+    base_color = 46 if (game_tag and game_tag != "ALL") else 34
+    lines_out = []
+    for row in range(height):
+        row_str = []
+        for col in range(width):
+            braille = 0x2800
+            has_trace = False
+            for dr in range(4):
+                for dc in range(2):
+                    dy = row * 4 + dr
+                    dx = col * 2 + dc
+                    if grid[dy * dot_cols + dx]:
+                        braille |= _BRAILLE_BIT[dr][dc]
+                        if dy != base_y:
+                            has_trace = True
+            ch = chr(braille)
+            if use_color and braille != 0x2800:
+                color = trace_color if has_trace else base_color
+                row_str.append(c256(ch, color))
+            else:
+                row_str.append(ch)
+        lines_out.append("".join(row_str))
+    return lines_out
+
+
+
+def braille_spectrum_lines(bars, height, width, peak_bars=None, use_color=True, game_tag=None):
+    """
+    Btop-style two-value-per-char braille spectrum.
+
+    Each terminal character encodes TWO adjacent frequency bars using the
+    left (dots 1-4) and right (dots 5-8) columns of a Braille cell.  This
+    doubles the number of bars visible in the same terminal width while
+    keeping 4× sub-row resolution per character row — exactly how btop's
+    Graph class packs data into braille_up/braille_down symbols.
+
+    Peak caps are drawn as a single bright dot at the top of each bar pair
+    when peak_bars is provided.
+    """
+    if not bars or height <= 0 or width <= 0:
+        return [" " * max(1, width)] * max(1, height)
+
+    n_pairs = width          # one braille char per pair
+    n_samples = n_pairs * 2  # two bars encoded per char
+    dot_rows = height * 4    # 4 dot-rows per terminal row
+
+    # Interpolate bars to exactly n_samples positions
+    def sample(src, idx):
+        n = len(src)
+        if n == 0:
+            return 0.0
+        pos = idx / max(1, n_samples - 1) * (n - 1)
+        lo = int(pos); hi = min(lo + 1, n - 1)
+        return max(0.0, min(1.0, src[lo] * (1.0 - (pos - lo)) + src[hi] * (pos - lo)))
+
+    bar_fill  = [int(sample(bars,      i) * dot_rows + 0.5) for i in range(n_samples)]
+    peak_fill = [int(sample(peak_bars, i) * dot_rows + 0.5) for i in range(n_samples)] if peak_bars else None
+
+    lines_out = []
+    for row in range(height):
+        row_str = []
+        for col in range(n_pairs):
+            braille = 0x2800
+            peak_dot = [False, False]   # whether the peak cap dot appears in this cell
+
+            for dc in range(2):          # dc=0 → left column, dc=1 → right column
+                bar_idx = col * 2 + dc
+                fill = bar_fill[bar_idx]
+
+                # Peak cap: a single dot one level above the bar body
+                if peak_fill is not None:
+                    pf = peak_fill[bar_idx]
+                    if pf > fill:
+                        # Which dot row does the cap land on inside this cell?
+                        cap_dot_from_bottom = pf - 1          # 0-based from bottom
+                        cap_row_from_top = dot_rows - 1 - cap_dot_from_bottom
+                        cap_dr = cap_row_from_top - row * 4   # local row within cell
+                        if 0 <= cap_dr < 4:
+                            braille |= _BRAILLE_BIT[cap_dr][dc]
+                            peak_dot[dc] = True
+
+                # Bar body: fill dots from the bottom of this cell upward
+                for dr in range(4):
+                    dot_from_bottom = dot_rows - 1 - (row * 4 + dr)
+                    if dot_from_bottom < fill:
+                        braille |= _BRAILLE_BIT[dr][dc]
+
+            ch = chr(braille)
+            if use_color and braille != 0x2800:
+                # Btop-style: color by horizontal frequency position
+                color = spectrum_color(col, n_pairs, game_tag=game_tag)
+                row_str.append(c256(ch, color))
+            else:
+                row_str.append(" " if braille == 0x2800 else ch)
+
+        lines_out.append("".join(row_str))
+    return lines_out
+
 
 def wrap_plain(text, width):
     if width <= 0:
         return [text]
     return textwrap.wrap(text, width=width, break_long_words=True, replace_whitespace=False)
 
-def build_box(lines_plain, lines_color, maxw_override=None):
+def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=None):
+    """
+    Btop-style Unicode box with rounded corners, spinning highlight, and optional
+    centered title injected into the top border (title2 into the bottom border).
+    """
     if maxw_override is not None:
         maxw = maxw_override
     else:
-        maxw = max([len(line) for line in lines_plain] + [0])
+        maxw = max(
+            [plain_visible_len(line) for line in lines_plain]
+            + [visible_len(line) for line in lines_color]
+            + [0]
+        )
     inner_w = maxw + 2
     width = inner_w + 2
     height = len(lines_plain) + 2
     perimeter = (2 * width) + (2 * (height - 2))
-    base_gray = 16
+    base_gray = 238      # slightly lighter than 16 for better contrast
     hilite = 255
 
     def border_color(idx):
@@ -1045,8 +2314,6 @@ def build_box(lines_plain, lines_color, maxw_override=None):
         return base_gray
 
     def border_index(row, col):
-        # Counter-clockwise: left edge (top->bottom), bottom (left->right),
-        # right edge (bottom->top), top (right->left)
         if col == 0 and row <= height - 1:
             return row
         if row == height - 1:
@@ -1055,39 +2322,73 @@ def build_box(lines_plain, lines_color, maxw_override=None):
             return (height - 1) + (width - 1) + (height - 1 - row)
         return (height - 1) + (width - 1) + (height - 1) + (width - 1 - col)
 
-    # Top border
-    top = []
-    for col, ch in enumerate("+" + ("-" * inner_w) + "+"):
-        idx = border_index(0, col)
-        top.append(c256(ch, border_color(idx)))
-    out = ["".join(top)]
+    def bc(ch, idx):
+        return c256(ch, border_color(idx))
 
-    # Middle lines
-    right_start = width
+    # ── Top border with rounded corners ─────────────────────────────────────
+    h_line = BOX_CHARS["h"] * inner_w
+    top_parts = (
+        bc(BOX_CHARS["tl"], border_index(0, 0))
+        + "".join(bc(BOX_CHARS["h"], border_index(0, c)) for c in range(1, width - 1))
+        + bc(BOX_CHARS["tr"], border_index(0, width - 1))
+    )
+    # Inject centered title into top border (btop ┤ Title ├ pattern)
+    if title and USE_COLOR:
+        t_plain = f" {title} "
+        t_vis = plain_visible_len(t_plain)
+        title_block_vis = t_vis + 2
+        if title_block_vis <= inner_w:
+            insert = (inner_w - title_block_vis) // 2 + 1  # offset into border string
+            t_colored = (
+                c256(BOX_TITLE_L, hilite)
+                + f"[1;37m{t_plain}[0m"
+                + c256(BOX_TITLE_R, hilite)
+            )
+            # Rebuild top stripping ansi for position counting
+            top_plain_raw = BOX_CHARS["tl"] + BOX_CHARS["h"] * inner_w + BOX_CHARS["tr"]
+            left_seg  = "".join(bc(ch, border_index(0, c)) for c, ch in enumerate(top_plain_raw[:insert]))
+            right_seg = "".join(bc(ch, border_index(0, c)) for c, ch in enumerate(top_plain_raw[insert + title_block_vis:], start=insert + title_block_vis))
+            top_parts = left_seg + t_colored + right_seg
+
+    out = [top_parts]
+
+    # ── Content rows ─────────────────────────────────────────────────────────
     for row, (plain, line) in enumerate(zip(lines_plain, lines_color)):
-        pad = " " * (maxw - len(plain))
-        left_idx = border_index(row + 1, 0)
-        right_idx = border_index(row + 1, width - 1)
-        left_border = c256("|", border_color(left_idx))
-        right_border = c256("|", border_color(right_idx))
-        if "\x1b[" in line:
-            out.append(left_border + " " + line + pad + " " + right_border)
-        else:
-            out.append(left_border + " " + line + pad + " " + right_border)
+        line = truncate_ansi_visible(line, maxw)
+        pad = " " * max(0, maxw - visible_len(line))
+        left_border  = bc(BOX_CHARS["v"], border_index(row + 1, 0))
+        right_border = bc(BOX_CHARS["v"], border_index(row + 1, width - 1))
+        out.append(left_border + " " + line + pad + " " + right_border)
 
-    # Bottom border
-    bottom = []
-    for col, ch in enumerate("+" + ("-" * inner_w) + "+"):
-        idx = border_index(height - 1, col)
-        bottom.append(c256(ch, border_color(idx)))
-    out.append("".join(bottom))
+    # ── Bottom border with optional title2 ───────────────────────────────────
+    bot_parts = (
+        bc(BOX_CHARS["bl"], border_index(height - 1, 0))
+        + "".join(bc(BOX_CHARS["h"], border_index(height - 1, c)) for c in range(1, width - 1))
+        + bc(BOX_CHARS["br"], border_index(height - 1, width - 1))
+    )
+    if title2 and USE_COLOR:
+        t_plain = f" {title2} "
+        t_vis = plain_visible_len(t_plain)
+        title_block_vis = t_vis + 2
+        if title_block_vis <= inner_w:
+            insert = (inner_w - title_block_vis) // 2 + 1
+            t_colored = (
+                c256(BOX_TITLE_L, hilite)
+                + f"[2;37m{t_plain}[0m"
+                + c256(BOX_TITLE_R, hilite)
+            )
+            bot_plain_raw = BOX_CHARS["bl"] + BOX_CHARS["h"] * inner_w + BOX_CHARS["br"]
+            left_seg  = "".join(bc(ch, border_index(height-1, c)) for c, ch in enumerate(bot_plain_raw[:insert]))
+            right_seg = "".join(bc(ch, border_index(height-1, c)) for c, ch in enumerate(bot_plain_raw[insert + title_block_vis:], start=insert + title_block_vis))
+            bot_parts = left_seg + t_colored + right_seg
+
+    out.append(bot_parts)
     return out, maxw
 
 def pad_box_lines(box_lines, width, target_len):
     if len(box_lines) >= target_len:
         return box_lines
-    pad_line = c256(f"| {' ' * width} |", 16)
-    # insert before bottom border
+    pad_line = (c256(BOX_CHARS["v"], 238) + " " * (width + 2) + c256(BOX_CHARS["v"], 238))
     insert_at = max(1, len(box_lines) - 1)
     while len(box_lines) < target_len:
         box_lines.insert(insert_at, pad_line)
@@ -1102,9 +2403,17 @@ def cava_config_text(bars, input_method=None, input_source=None):
         if input_source:
             input_block += f"source = {input_source}\n"
         input_block += "\n"
+    smoothing_block = ""
+    if CAVA_NOISE_REDUCTION_SET:
+        smoothing_block = f"\n[smoothing]\nnoise_reduction = {CAVA_NOISE_REDUCTION:.2f}\n"
     return (
         "[general]\n"
         f"bars = {bars}\n\n"
+        f"framerate = {CAVA_FRAMERATE}\n"
+        f"autosens = {CAVA_AUTOSENS}\n"
+        f"sensitivity = {CAVA_SENSITIVITY}\n"
+        f"lower_cutoff_freq = {CAVA_LOWER_CUTOFF}\n"
+        f"higher_cutoff_freq = {CAVA_HIGHER_CUTOFF}\n\n"
         + input_block +
         "[output]\n"
         "method = raw\n"
@@ -1113,11 +2422,16 @@ def cava_config_text(bars, input_method=None, input_source=None):
         f"ascii_max_range = {CAVA_MAX}\n"
         "bar_delimiter = 59\n"
         "frame_delimiter = 10\n"
+        f"channels = {CAVA_CHANNELS}\n"
+        + smoothing_block
     )
 
 def calc_cava_bars():
     cols = shutil.get_terminal_size(fallback=(80, 24)).columns
     bars = max(CAVA_MIN_BARS, cols - CAVA_MARGIN)
+    # cava rejects odd bar counts for stereo monitor sources.
+    if bars % 2:
+        bars -= 1
     return bars
 
 
@@ -1224,6 +2538,132 @@ def list_sinks():
             sinks.append(cols[1].strip())
     return [s for s in sinks if s]
 
+def list_loopback_modules(sink_name):
+    if not shutil.which("pactl") or not sink_name:
+        return []
+    try:
+        out = pactl("list", "short", "modules")
+    except Exception:
+        return []
+    needle = f"source={sink_name}.monitor"
+    matches = []
+    for line in out.splitlines():
+        cols = line.split("\t", 2)
+        if len(cols) < 2:
+            continue
+        module_id = cols[0].strip()
+        module_name = cols[1].strip()
+        module_args = cols[2].strip() if len(cols) > 2 else ""
+        if module_name == "module-loopback" and needle in module_args:
+            matches.append(module_id)
+    return matches
+
+def list_null_sink_modules(sink_name):
+    if not shutil.which("pactl") or not sink_name:
+        return []
+    try:
+        out = pactl("list", "short", "modules")
+    except Exception:
+        return []
+    needle = f"sink_name={sink_name}"
+    matches = []
+    for line in out.splitlines():
+        cols = line.split("\t", 2)
+        if len(cols) < 2:
+            continue
+        module_id = cols[0].strip()
+        module_name = cols[1].strip()
+        module_args = cols[2].strip() if len(cols) > 2 else ""
+        if module_name == "module-null-sink" and needle in module_args:
+            matches.append(module_id)
+    return matches
+
+def get_sink_id(sink_name):
+    if not shutil.which("pactl") or not sink_name:
+        return None
+    try:
+        out = pactl("list", "short", "sinks")
+    except Exception:
+        return None
+    for line in out.splitlines():
+        cols = line.split("\t")
+        if len(cols) > 1 and cols[1].strip() == sink_name:
+            try:
+                return int(cols[0].strip())
+            except Exception:
+                return None
+    return None
+
+def sink_has_inputs(sink_id):
+    if sink_id is None or not shutil.which("pactl"):
+        return False
+    try:
+        out = pactl("list", "short", "sink-inputs")
+    except Exception:
+        return False
+    target = str(sink_id)
+    for line in out.splitlines():
+        cols = line.split("\t")
+        if len(cols) > 1 and cols[1].strip() == target:
+            return True
+    return False
+
+def cleanup_stale_socket(path):
+    if not path or not os.path.exists(path):
+        return
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return
+    if not stat.S_ISSOCK(mode):
+        return
+    import socket
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(0.1)
+        sock.connect(path)
+        return
+    except OSError as e:
+        if e.errno not in (errno.ENOENT, errno.ECONNREFUSED, errno.EPERM):
+            return
+    except Exception:
+        pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
+
+def cleanup_legacy_runtime_artifacts():
+    legacy_sink = "acui"
+    sink_id = get_sink_id(legacy_sink)
+    if sink_id is not None and not sink_has_inputs(sink_id):
+        for module_id in list_loopback_modules(legacy_sink):
+            try:
+                pactl("unload-module", module_id)
+            except Exception:
+                pass
+        for module_id in list_null_sink_modules(legacy_sink):
+            try:
+                pactl("unload-module", module_id)
+            except Exception:
+                pass
+    legacy_base = f"/tmp/ac-mpv-{os.getuid()}"
+    cleanup_stale_socket(f"{legacy_base}.a.sock")
+    cleanup_stale_socket(f"{legacy_base}.b.sock")
+    legacy_cava_conf = f"/tmp/ac-cava-{os.getuid()}.conf"
+    try:
+        if os.path.exists(legacy_cava_conf):
+            os.unlink(legacy_cava_conf)
+    except Exception:
+        pass
+
 def reload_loopback(loopback_module_id, sink_name, target_sink):
     if not shutil.which("pactl"):
         return loopback_module_id, None
@@ -1248,10 +2688,11 @@ def reload_loopback(loopback_module_id, sink_name, target_sink):
         new_id = None
     return new_id or loopback_module_id, target_sink
 
-def setup_private_sink(output_sink=None):
+def setup_private_sink(output_sink=None, sink_name=None):
     if not shutil.which("pactl"):
         return None, None, None, None
-    sink_name = "acui"
+    if not sink_name:
+        sink_name = f"acui-{os.getpid()}"
     null_module_id = None
     loopback_module_id = None
     default_sink = get_default_sink()
@@ -1272,6 +2713,13 @@ def setup_private_sink(output_sink=None):
             ).strip()
     except Exception:
         return None, None, None, None
+
+    # Clean up stale loopbacks for this sink so each run owns a single route.
+    for module_id in list_loopback_modules(sink_name):
+        try:
+            pactl("unload-module", module_id)
+        except Exception:
+            pass
 
     if target_sink:
         try:
@@ -1322,6 +2770,62 @@ def detect_cava_input():
         if not source:
             source = "@DEFAULT_MONITOR@"
     return method, source, "auto"
+
+def pulse_monitor_source_for_audio_device(audio_device):
+    if not audio_device:
+        return None
+    device = str(audio_device).strip()
+    if not device:
+        return None
+    lower = device.lower()
+    if lower.startswith("pulse/"):
+        sink = device.split("/", 1)[1].strip()
+        if not sink:
+            return None
+        if sink in ("@default@", "@default_sink@", "@default_sink"):
+            return "@DEFAULT_MONITOR@"
+        if sink.endswith(".monitor"):
+            return sink
+        return f"{sink}.monitor"
+    return None
+
+def build_cava_input_candidates(base_method, base_source, detect_mode, audio_device=None, private_sink=None, output_sink=None):
+    candidates = []
+    seen = set()
+
+    def add(method, source, label):
+        method = (method or "").strip() or None
+        source = (source or "").strip() or None
+        if not method and not source:
+            return
+        key = (method, source)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append({
+            "method": method,
+            "source": source,
+            "label": label,
+        })
+
+    # Always try the currently selected route first.
+    add(base_method, base_source, detect_mode or "configured")
+    if detect_mode == "env":
+        return candidates
+
+    override_source = pulse_monitor_source_for_audio_device(audio_device)
+    if override_source:
+        add("pulse", override_source, "audio-device")
+    if private_sink:
+        add("pulse", f"{private_sink}.monitor", "private-sink")
+    if output_sink:
+        add("pulse", f"{output_sink}.monitor", "output-sink")
+
+    default_sink = get_default_sink()
+    if default_sink:
+        add("pulse", f"{default_sink}.monitor", "default-sink")
+    add("pulse", "@DEFAULT_MONITOR@", "default-monitor")
+    return candidates
 
 class RawMode:
     def __enter__(self):
@@ -1396,6 +2900,248 @@ def mpv_query(ipc_path, prop):
     except Exception:
         return None
 
+def mpv_query_props(ipc_path, props):
+    import socket
+    if not props:
+        return {}
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(0.2)
+        sock.connect(ipc_path)
+        pending = {}
+        for request_id, prop in enumerate(props, 1):
+            pending[request_id] = prop
+            payload = {"command": ["get_property", prop], "request_id": request_id}
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        results = {}
+        buffer = ""
+        deadline = time.monotonic() + 0.25
+        while pending and time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buffer += chunk.decode("utf-8", errors="ignore")
+            lines = buffer.split("\n")
+            buffer = lines.pop()
+            for line in lines:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                request_id = obj.get("request_id")
+                prop = pending.pop(request_id, None)
+                if prop is None:
+                    continue
+                results[prop] = obj.get("data") if obj.get("error") == "success" else None
+        return results
+    except Exception:
+        return {}
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def _clamp_eq_band(value):
+    return max(EQ_BAND_MIN, min(EQ_BAND_MAX, float(value)))
+
+
+def normalize_eq_bands(bands):
+    out = []
+    for i in range(EQ_BAND_COUNT):
+        try:
+            out.append(_clamp_eq_band(bands[i] if i < len(bands) else 0.0))
+        except Exception:
+            out.append(0.0)
+    return out
+
+
+def default_eq_bands():
+    return list(EQ_PRESETS["flat"])
+
+
+def load_eq_bands():
+    path = EQ_CONFIG_PATH
+    try:
+        if os.path.isfile(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("bands"), list):
+                return normalize_eq_bands(data["bands"])
+            if isinstance(data, list):
+                return normalize_eq_bands(data)
+    except Exception:
+        pass
+    return default_eq_bands()
+
+
+def save_eq_bands(bands, preset_name=None):
+    path = EQ_CONFIG_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {"bands": normalize_eq_bands(bands)}
+        if preset_name:
+            payload["preset"] = preset_name
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        return True
+    except Exception:
+        return False
+
+
+def build_mpv_eq_filter(bands):
+    """mpv superequalizer: 1b..10b gains in dB (cliamp-aligned bands)."""
+    parts = []
+    for i, gain in enumerate(normalize_eq_bands(bands)):
+        parts.append(f"{i + 1}b={gain:g}")
+    return "superequalizer=" + ":".join(parts)
+
+
+def apply_mpv_eq(ipc_path, bands=None):
+    if not EQ_ENABLED or not ipc_path:
+        return False
+    try:
+        if not os.path.exists(ipc_path):
+            return False
+    except Exception:
+        return False
+    resolved = normalize_eq_bands(bands if bands is not None else load_eq_bands())
+    if all(b == 0.0 for b in resolved):
+        mpv_command(ipc_path, ["af", "remove", "@acui-eq"])
+        return True
+    af = build_mpv_eq_filter(resolved)
+    mpv_command(ipc_path, ["af", "remove", "@acui-eq"])
+    return mpv_command(ipc_path, ["af", "add", f"@acui-eq:{af}"])
+
+
+def run_eq_editor(audio_device=None, ipc_getter=None):
+    """Full-screen 10-band EQ editor (press E). Live-updates mpv via IPC."""
+    bands = load_eq_bands()
+    preset_names = list(EQ_PRESETS.keys())
+    preset_idx = 0
+    cursor = 0
+    status = None
+    last_lines = None
+
+    def current_ipc():
+        if ipc_getter:
+            try:
+                return ipc_getter()
+            except Exception:
+                return None
+        return None
+
+    def push_eq(preset_name=None):
+        ipc = current_ipc()
+        if ipc:
+            apply_mpv_eq(ipc, bands)
+        save_eq_bands(bands, preset_name=preset_name)
+
+    def build_lines():
+        term_cols, term_rows = shutil.get_terminal_size(fallback=(80, 24))
+        lines = []
+        lines.append(c("10-BAND EQ  (cliamp-style frequencies)", "36"))
+        lines.append(c(f"Preset: {preset_names[preset_idx]}   Band: {EQ_FREQ_LABELS[cursor]} Hz   Gain: {bands[cursor]:+.1f} dB", "33"))
+        lines.append("")
+        row = []
+        for i, label in enumerate(EQ_FREQ_LABELS):
+            gain = bands[i]
+            if i == cursor:
+                cell = c(f"[{label}:{gain:+.0f}]", "1;32")
+            elif gain != 0.0:
+                cell = c(f" {label}:{gain:+.0f} ", "36")
+            else:
+                cell = f" {label}: 0 "
+            row.append(cell)
+        lines.append("".join(row))
+        lines.append("")
+        lines.append(c("←/→ band   ↑/↓ or +/-  ±1 dB   p preset   r flat   s save   ENTER/q done", "33"))
+        if status:
+            lines.append(c(status, "35"))
+        if len(lines) < term_rows:
+            lines.extend([""] * (term_rows - len(lines)))
+        return lines, term_cols, term_rows
+
+    push_eq()
+    hide_cursor()
+    invalidate_render_cache(clear_screen=True)
+    try:
+        while True:
+            lines, term_cols, term_rows = build_lines()
+            if lines != last_lines:
+                render(lines, term_cols, term_rows)
+                last_lines = list(lines)
+            ch = _read_key(sys.stdin.fileno(), timeout=0.05)
+            if not ch:
+                continue
+            if ch in ("\r", "\n", "q", "Q", "ESC"):
+                break
+            if ch in ("LEFT", "h", "H"):
+                cursor = (cursor - 1) % EQ_BAND_COUNT
+                status = None
+                continue
+            if ch in ("RIGHT", "l", "L"):
+                cursor = (cursor + 1) % EQ_BAND_COUNT
+                status = None
+                continue
+            if ch in ("+", "="):
+                bands[cursor] = _clamp_eq_band(bands[cursor] + 1.0)
+                push_eq()
+                status = "updated"
+                last_lines = None
+                continue
+            if ch == "-":
+                bands[cursor] = _clamp_eq_band(bands[cursor] - 1.0)
+                push_eq()
+                status = "updated"
+                last_lines = None
+                continue
+            if ch in ("UP", "k", "K"):
+                bands[cursor] = _clamp_eq_band(bands[cursor] + 1.0)
+                push_eq()
+                status = "updated"
+                last_lines = None
+                continue
+            if ch in ("DOWN", "j", "J"):
+                bands[cursor] = _clamp_eq_band(bands[cursor] - 1.0)
+                push_eq()
+                status = "updated"
+                last_lines = None
+                continue
+            if ch in ("p", "P"):
+                preset_idx = (preset_idx + 1) % len(preset_names)
+                name = preset_names[preset_idx]
+                bands[:] = normalize_eq_bands(EQ_PRESETS[name])
+                push_eq(preset_name=name)
+                status = f"preset: {name}"
+                last_lines = None
+                continue
+            if ch in ("r", "R"):
+                bands[:] = default_eq_bands()
+                preset_idx = 0
+                push_eq(preset_name="flat")
+                status = "reset flat"
+                last_lines = None
+                continue
+            if ch in ("s", "S"):
+                if save_eq_bands(bands, preset_name=preset_names[preset_idx]):
+                    status = f"saved {EQ_CONFIG_PATH}"
+                else:
+                    status = "save failed"
+                last_lines = None
+    finally:
+        save_eq_bands(bands, preset_name=preset_names[preset_idx])
+        show_cursor()
 
 
 def hide_cursor():
@@ -1474,28 +3220,54 @@ def start_hour_chime(audio_device=None):
         return None, None, None
 
 
+# Differential render: only rewrite lines that changed (btop pattern)
+_render_prev_lines: list = []
+
+
+def invalidate_render_cache(clear_screen=False):
+    """Reset line-diff state (resize, full-screen overlays)."""
+    global _render_prev_lines
+    _render_prev_lines = []
+    if clear_screen:
+        sys.stdout.write("\033[2J")
+        sys.stdout.flush()
+
+
 def render(lines, width=None, height=None):
-    # Minimize flicker by reusing the screen and only clearing to end of line.
+    """Differential renderer: only outputs lines that changed since last frame."""
+    global _render_prev_lines
     if width is None or height is None:
         size = shutil.get_terminal_size(fallback=(80, 24))
         width = size.columns
         height = size.lines
-    sys.stdout.write("\033[H")
-    # Ensure we never write more than the screen height
     if len(lines) < height:
         lines = lines + [""] * (height - len(lines))
     elif len(lines) > height:
         lines = lines[:height]
-    for idx, line in enumerate(lines):
-        # Avoid auto-wrap at terminal width (visible chars only)
+
+    # Clip each line to terminal width
+    clipped = []
+    for line in lines:
         vis = len(line) if "\x1b[" not in line else visible_len(line)
         if vis >= width:
             line = truncate_ansi_visible(line, max(0, width - 1))
-        sys.stdout.write(line + "\033[K")
-        if idx < height - 1:
-            sys.stdout.write("\n")
-    sys.stdout.write("\033[J")
-    sys.stdout.flush()
+        clipped.append(line)
+
+    # Extend previous frame buffer to match current height
+    prev = _render_prev_lines
+    if len(prev) != len(clipped):
+        prev = [""] * len(clipped)
+
+    buf = []
+    for idx, (new_line, old_line) in enumerate(zip(clipped, prev)):
+        if new_line != old_line:
+            buf.append(f"\033[{idx + 1};1H{new_line}\033[K")
+
+    if buf:
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+
+    _render_prev_lines = clipped
 
 def _read_key(fd, timeout=0.1):
     r, _, _ = select.select([fd], [], [], timeout)
@@ -1536,41 +3308,216 @@ def _read_key(fd, timeout=0.1):
             return "LEFT"
     return "ESC"
 
-def _render_tune_editor(notes, cursor, status=None):
+def _render_tune_editor(
+    notes,
+    cursor,
+    status=None,
+    confirm_menu_idx=None,
+    anim_frame=0,
+    modal=None,
+    modal_idx=0,
+    modal_scale=1.0,
+    button_flash=None,
+    playback_idx=None,
+    playback_active=False,
+    input_locked=False,
+):
     size = shutil.get_terminal_size(fallback=(80, 24))
     term_cols = size.columns
     term_rows = size.lines
+    notes = normalize_town_tune(notes)
+    if modal is None and confirm_menu_idx is not None:
+        modal = ACGC_MSCORE_MODAL_ERASE
+        modal_idx = confirm_menu_idx
+    if button_flash is None:
+        button_flash = set()
+    elif isinstance(button_flash, str):
+        button_flash = {button_flash}
+    else:
+        button_flash = set(button_flash)
 
-    row_w = 8
-    cell_w = 3
-    gap = 1
-    staff_h = len(TOWN_TUNE_NOTES)
-    total_w = row_w * cell_w + (row_w - 1) * gap
-    pad = max(0, (term_cols - total_w) // 2)
-    pad_s = " " * pad
-    required_rows = staff_h * 2 + 8
+    cell_count = TOWN_TUNE_STEPS
+    board_w = 78
+    pad_s = " " * max(0, (term_cols - board_w) // 2)
+    required_rows = 24
+
+    def token(tok):
+        tok = _coerce_tune_token(tok)
+        if tok == TOWN_TUNE_RANDOM:
+            return "?"
+        if tok == TOWN_TUNE_HOLD:
+            return "Z"
+        if tok == TOWN_TUNE_OFF:
+            return "-"
+        return tok[0]
+
+    def note_value(idx):
+        return TOWN_TUNE_TOKEN_TO_VALUE.get(_coerce_tune_token(notes[idx]), 15)
+
+    def ansi256_from_rgb(rgb):
+        r, g, b = rgb
+        r = max(0, min(5, int(round(r / 255 * 5))))
+        g = max(0, min(5, int(round(g / 255 * 5))))
+        b = max(0, min(5, int(round(b / 255 * 5))))
+        return 16 + 36 * r + 6 * g + b
+
+    def rgb_color_code(rgb, bold=True):
+        suffix = ";1" if bold else ""
+        return f"38;5;{ansi256_from_rgb(rgb)}{suffix}"
+
+    def note_frame_code(value):
+        return rgb_color_code(ACGC_NOTE_UI[value]["env"])
+
+    def note_detail_code(value):
+        return rgb_color_code(ACGC_NOTE_UI[value]["prim"], bold=False)
+
+    def note_glyph_code(selected=False):
+        rgb = ACGC_MSCORE_GLYPH_SELECTED if selected else ACGC_MSCORE_GLYPH_IDLE
+        return rgb_color_code(rgb)
+
+    def paint(text, code):
+        return c(text, code) if USE_COLOR else text
+
+    def green(text):
+        return paint(text, "38;5;46;1")
+
+    def blue(text):
+        return paint(text, "38;5;20;1")
+
+    def orange(text):
+        return paint(text, "38;5;202;1")
+
+    def cream(text):
+        return paint(text, "38;5;230")
+
+    def frog_parts(idx):
+        value = note_value(idx)
+        ui = ACGC_NOTE_UI[value]
+        selected = idx == cursor and not playback_active
+        playing = playback_active and idx == playback_idx
+        pulse = selected and (anim_frame % 18) >= 9
+        frame_code = note_frame_code(value)
+        detail_code = note_detail_code(value)
+        glyph_code = note_glyph_code(selected)
+
+        def frame(text):
+            return paint(text, frame_code)
+
+        def detail(text):
+            return paint(text, detail_code)
+
+        def glyph(text):
+            return " " * visible_len(text) if playing else paint(text, glyph_code)
+
+        mark = ui["label"]
+        eye = "O" if pulse else "o"
+        dot = "O" if pulse else "."
+
+        if ui["frame"] == "random":
+            top = detail(eye) + frame("-") + detail(eye) + frame("-") + detail(eye)
+            body = frame("[") + glyph(f"{mark:^3}") + frame("]")
+        elif ui["frame"] == "rest":
+            top = glyph(" Z Z ")
+            body = frame("(") + detail("---") + frame(")")
+        elif ui["frame"] == "off":
+            top = detail(dot) + frame(" ") + detail(dot) + frame(" ") + detail(dot)
+            body = frame("(") + glyph(f"{mark:^3}") + frame(")")
+        else:
+            top = detail(eye) + frame("   ") + detail(eye)
+            body = frame("(") + glyph(f"{mark:^3}") + frame(")")
+        return top, body
+
+    def staff_line(start):
+        cells = []
+        active_idx = playback_idx if playback_active else cursor
+        for i in range(start, start + 8):
+            cells.append("==O" if i == active_idx else "--o")
+        return orange("o--" + "--".join(cells) + "-->")
+
+    def note_lane(idx):
+        ui = ACGC_NOTE_UI[note_value(idx)]
+        visual_y = ui["ofs_y"]
+        if visual_y >= -16.0:
+            return 0
+        if visual_y >= -23.0:
+            return 2
+        return 4
+
+    def pitched_note_rows(start, indent):
+        pos = ACGC_MSCORE_TERMINAL_SLOT_POS
+        rows = [[] for _ in range(6)]
+        for lane in rows:
+            lane.append(" " * indent)
+        for slot in range(8):
+            idx = start + slot
+            lane_idx = min(note_lane(idx), 4)
+            eyes, body = frog_parts(idx)
+            for lane_no, lane in enumerate(rows):
+                target = indent + pos[slot]
+                current = visible_len("".join(lane))
+                if current < target:
+                    lane.append(" " * (target - current))
+                if lane_no == lane_idx:
+                    lane.append(eyes)
+                elif lane_no == lane_idx + 1:
+                    lane.append(body)
+                else:
+                    lane.append("     ")
+        return ["".join(row).rstrip() for row in rows]
+
+    def paper(line=""):
+        inner_w = board_w - 6
+        visible = visible_len(line)
+        if visible > inner_w:
+            line = truncate_ansi_visible(line, inner_w)
+            visible = visible_len(line)
+        if visible < inner_w:
+            line = line + (" " * (inner_w - visible))
+        return pad_s + green("||") + " " + cream(line) + " " + green("||")
+
+    def button(text, key):
+        code = "38;5;226;1" if key in button_flash else "38;5;46;1"
+        return paint(text, code)
+
+    def modal_line():
+        scale_hint = "" if modal_scale >= 0.95 else " " * max(0, 3 - int(modal_scale * 3))
+        active_choice = rgb_color_code(ACGC_MSCORE_ERASE_CHOICE_ACTIVE)
+        idle_choice = rgb_color_code(ACGC_MSCORE_ERASE_CHOICE_IDLE)
+
+        def choice(label, active):
+            prefix = "> " if active else "  "
+            return paint(prefix + label, active_choice if active else idle_choice)
+
+        if modal == ACGC_MSCORE_MODAL_ERASE:
+            yes = choice("Yes", modal_idx == 0)
+            no = choice("No", modal_idx == 1)
+            return scale_hint + " " * 19 + paint("Are you sure?", "38;5;196;1") + "    " + yes + "    " + no
+        if modal == ACGC_MSCORE_MODAL_END:
+            parts = []
+            for i, option in enumerate(ACGC_MSCORE_END_OPTIONS):
+                parts.append(choice(option, modal_idx == i))
+            return scale_hint + " " * 9 + paint("Is this OK?", "38;5;196;1") + "    " + "    ".join(parts)
+        return ""
 
     def compact():
-        def token(tok):
-            if tok == TOWN_TUNE_REST:
-                return "--"
-            if tok == TOWN_TUNE_HOLD:
-                return "=="
-            return tok
-        def build_row(start_idx):
+        def build_row(start_idx, width):
             row = []
-            for i in range(start_idx, start_idx + row_w):
+            for i in range(start_idx, min(start_idx + width, cell_count)):
                 tok = token(notes[i])
-                cell = f"[{tok:2}]" if i == cursor else f" {tok:2} "
+                cell = f"[{tok:1}]" if i == cursor else f" {tok:1} "
                 row.append(cell)
-            return pad_s + " ".join(row)
+            return " ".join(row)
+
+        row_w = 8 if term_cols >= 42 else 4
+        compact_w = row_w * 5 - 1
+        compact_pad = " " * max(0, (term_cols - compact_w) // 2)
         lines = []
-        lines.append(c("Town Tune Editor (compact)", "36"))
+        lines.append(c("TOWN TUNE", "36"))
         lines.append("")
-        lines.append(build_row(0))
-        lines.append(build_row(8))
+        for start in range(0, cell_count, row_w):
+            lines.append(compact_pad + build_row(start, row_w))
         lines.append("")
-        lines.append(c("Terminal too small for staff view.", "33"))
+        lines.append(c(f"{SYM_ARROW_L}{SYM_ARROW_R} move  {SYM_ARROW_U}{SYM_ARROW_D} change note  {SYM_ENTER} confirm  B back  X play  Y erase", "33"))
         if status:
             lines.append(c(status, "35"))
         if len(lines) < term_rows:
@@ -1579,55 +3526,48 @@ def _render_tune_editor(notes, cursor, status=None):
             lines = lines[:term_rows]
         return lines
 
-    if term_rows < required_rows or term_cols < total_w + 2:
+    if term_rows < required_rows or term_cols < board_w + 2:
         return compact()
 
-    def cell_for(tok):
-        if tok == TOWN_TUNE_REST:
-            return "-- "
-        if tok == TOWN_TUNE_HOLD:
-            return "== "
-        return f"{tok:<3}"
-
-    def cursor_row(start_idx):
-        cells = []
-        for i in range(start_idx, start_idx + row_w):
-            if i == cursor:
-                cells.append("^".center(cell_w))
-            else:
-                cells.append(" " * cell_w)
-        return pad_s + (" " * gap).join(cells)
-
-    def build_staff(start_idx):
-        lines = []
-        # High notes at top
-        for y in range(staff_h):
-            pitch = TOWN_TUNE_NOTES[staff_h - 1 - y]
-            is_staff = (y % 2 == 1)
-            cells = []
-            for i in range(start_idx, start_idx + row_w):
-                tok = notes[i]
-                cell = ("-" * cell_w) if is_staff else (" " * cell_w)
-                if tok == pitch:
-                    cell = cell_for(tok)
-                elif tok in (TOWN_TUNE_REST, TOWN_TUNE_HOLD) and y == staff_h // 2:
-                    cell = cell_for(tok)
-                if i == cursor and tok == pitch:
-                    cell = c(cell, "38;5;226") if USE_COLOR else cell
-                cells.append(cell)
-            lines.append(pad_s + (" " * gap).join(cells))
-        return lines
-
     lines = []
-    lines.append(c("Town Tune Editor (16 steps)", "36"))
+    lines.append(pad_s + " " * 14 + blue("____") + green("  oo  ") + blue("____"))
+    lines.append(pad_s + blue("      /") + green("=" * (board_w - 14)) + blue("\\"))
+    lines.append(pad_s + green("   ." + "=" * (board_w - 8) + "."))
+    if modal is None:
+        lines.append(paper(""))
+    else:
+        lines.append(paper(modal_line()))
+    for note_row in pitched_note_rows(0, ACGC_MSCORE_TERMINAL_FIRST_INDENT):
+        if note_row.strip():
+            lines.append(paper(note_row))
+    lines.append(paper(" " * 4 + staff_line(0)))
+    for note_row in pitched_note_rows(8, ACGC_MSCORE_TERMINAL_SECOND_INDENT):
+        if note_row.strip():
+            lines.append(paper(note_row))
+    lines.append(paper(" " * 12 + staff_line(8)))
+    lines.append(paper(""))
+    lines.append(pad_s + green("   '" + "=" * (board_w - 8) + "'"))
+    ok_active = cursor == ACGC_MSCORE_CURSOR_OK or "OK" in button_flash or "START" in button_flash
+    lines.append(
+        pad_s
+        + button("    (Y) Erase all", "Y")
+        + (" " * 8)
+        + button("(X) Play", "X")
+        + (" " * 8)
+        + button("(R) e-Reader", "R")
+        + (" " * 7)
+        + (paint("(OK)", "38;5;196;1") if ok_active else green("(OK)"))
+    )
+    lines.append(
+        pad_s
+        + " " * 52
+        + (paint("START", "38;5;196;1") if ok_active else paint("START", "38;5;244"))
+    )
     lines.append("")
-    lines.append(cursor_row(0))
-    lines.extend(build_staff(0))
-    lines.append("")
-    lines.append(cursor_row(8))
-    lines.extend(build_staff(8))
-    lines.append("")
-    help_line = "Arrows: move/change pitch  r=rest  h=hold  p=preview  s=save  q=save+quit"
+    if input_locked:
+        help_line = "Playing town tune..."
+    else:
+        help_line = f"{SYM_ARROW_L}{SYM_ARROW_R} move  {SYM_ARROW_U}{SYM_ARROW_D} pitch  {SYM_ENTER} next  X play  Y erase  R e-Reader"
     lines.append(c(help_line, "33"))
     if status:
         lines.append(c(status, "35"))
@@ -1638,22 +3578,53 @@ def _render_tune_editor(notes, cursor, status=None):
         lines = lines[:term_rows]
     return lines
 
+def _town_tune_next_value(tok):
+    value = TOWN_TUNE_TOKEN_TO_VALUE.get(_coerce_tune_token(tok), 15)
+    if value != 13:
+        if value == 15:
+            value = 0
+        else:
+            value += 1
+    return TOWN_TUNE_VALUE_TO_TOKEN[value]
+
+def _town_tune_prev_value(tok):
+    value = TOWN_TUNE_TOKEN_TO_VALUE.get(_coerce_tune_token(tok), 15)
+    if value != 14:
+        if value == 0:
+            value = 15
+        else:
+            value -= 1
+    return TOWN_TUNE_VALUE_TO_TOKEN[value]
+
 def run_tune_editor(audio_device=None):
     notes = load_town_tune()
+    original_notes = list(notes)
     cursor = 0
     status = None
     last_lines = None
     preview_proc = None
     preview_tmp = None
+    preview_kind = None
+    preview_started = 0.0
+    modal = None
+    modal_idx = 0
+    modal_scale = 0.0
+    anim_frame = 0
+    button_flash = None
+    button_flash_until = 0.0
+    auto_play_at = time.monotonic() + ACGC_MSCORE_OPEN_AUTOPLAY_DELAY
+    auto_play_pending = True
 
     def stop_preview():
-        nonlocal preview_proc, preview_tmp
+        nonlocal preview_proc, preview_tmp, preview_kind, preview_started
         if preview_proc and preview_proc.poll() is None:
             try:
                 preview_proc.terminate()
             except Exception:
                 pass
         preview_proc = None
+        preview_kind = None
+        preview_started = 0.0
         if preview_tmp:
             try:
                 os.unlink(preview_tmp)
@@ -1661,57 +3632,238 @@ def run_tune_editor(audio_device=None):
                 pass
             preview_tmp = None
 
+    def clear_finished_preview():
+        nonlocal preview_proc, preview_tmp, preview_kind, preview_started
+        if preview_proc and preview_proc.poll() is not None:
+            preview_proc = None
+            preview_kind = None
+            preview_started = 0.0
+            if preview_tmp:
+                try:
+                    os.unlink(preview_tmp)
+                except Exception:
+                    pass
+                preview_tmp = None
+
+    def full_playback_state(now):
+        if preview_kind != "full" or not preview_proc or preview_proc.poll() is not None:
+            return False, None
+        elapsed = now - preview_started
+        duration = TOWN_TUNE_STEPS * TOWN_TUNE_STEP_SECONDS
+        if elapsed >= duration + 0.10:
+            stop_preview()
+            return False, None
+        idx = int(max(0.0, elapsed) / max(0.001, TOWN_TUNE_STEP_SECONDS))
+        return True, min(TOWN_TUNE_STEPS - 1, idx)
+
+    def set_button_flash(key):
+        nonlocal button_flash, button_flash_until
+        button_flash = key
+        button_flash_until = time.monotonic() + 0.16
+
+    def open_modal(kind, idx=0):
+        nonlocal modal, modal_idx, modal_scale
+        modal = kind
+        modal_idx = idx
+        modal_scale = 0.0
+
+    def close_modal():
+        nonlocal modal, modal_idx, modal_scale
+        modal = None
+        modal_idx = 0
+        modal_scale = 0.0
+
+    def spawn_full_preview(message="Previewing current tune..."):
+        nonlocal preview_proc, preview_tmp, preview_kind, preview_started, status
+        stop_preview()
+        preview_proc, preview_tmp = spawn_town_tune(audio_device, notes=notes)
+        if preview_proc:
+            preview_kind = "full"
+            preview_started = time.monotonic()
+            status = message
+        else:
+            status = "Preview unavailable (game renderer or sample bank missing)."
+
+    def audition_current():
+        nonlocal preview_proc, preview_tmp, preview_kind, preview_started, status
+        stop_preview()
+        if cursor >= ACGC_MSCORE_CURSOR_OK:
+            status = "OK"
+            return
+        value = TOWN_TUNE_TOKEN_TO_VALUE.get(_coerce_tune_token(notes[cursor]), 15)
+        if value in (14, 15):
+            return
+        preview_proc, preview_tmp = spawn_town_tune_note(notes[cursor], audio_device, notes=notes, cursor=cursor)
+        if preview_proc:
+            preview_kind = "note"
+            preview_started = time.monotonic()
+            status = f"Audition: {_coerce_tune_token(notes[cursor])}"
+
     try:
         while True:
-            lines = _render_tune_editor(notes, cursor, status=status)
+            now = time.monotonic()
+            clear_finished_preview()
+            if button_flash and now >= button_flash_until:
+                button_flash = None
+            if modal is not None:
+                modal_step = 0.20 if modal == ACGC_MSCORE_MODAL_END else 0.25
+                modal_scale = min(1.0, modal_scale + modal_step)
+            if auto_play_pending and modal is None and now >= auto_play_at:
+                auto_play_pending = False
+                spawn_full_preview("Previewing current tune...")
+                now = time.monotonic()
+            playback_active, playback_idx = full_playback_state(now)
+
+            lines = _render_tune_editor(
+                notes,
+                cursor,
+                status=status,
+                anim_frame=anim_frame,
+                modal=modal,
+                modal_idx=modal_idx,
+                modal_scale=modal_scale,
+                button_flash={button_flash} if button_flash else set(),
+                playback_idx=playback_idx,
+                playback_active=playback_active,
+                input_locked=playback_active,
+            )
             if lines != last_lines:
                 render(lines)
                 last_lines = list(lines)
             status = None
 
-            key = _read_key(sys.stdin.fileno(), timeout=0.2)
+            key = _read_key(sys.stdin.fileno(), timeout=REFRESH_INTERVAL)
             if not key:
+                anim_frame = (anim_frame + 1) % 18
                 continue
-            if key in ("q", "Q", "ESC"):
-                save_town_tune(notes)
-                stop_preview()
-                return
-            if key in ("s", "S"):
-                save_town_tune(notes)
-                status = f"Saved: {TOWN_TUNE_PATH}"
+
+            if playback_active:
                 continue
-            if key in ("p", "P"):
-                stop_preview()
-                preview_proc, preview_tmp = spawn_town_tune(audio_device)
-                if preview_proc:
-                    status = "Previewing tune..."
-                else:
-                    status = "Preview unavailable (fluidsynth or soundfont missing)."
+
+            if modal == ACGC_MSCORE_MODAL_ERASE:
+                if key in ("q", "Q", "ESC", "b", "B", "n", "N"):
+                    close_modal()
+                    status = "Erase all cancelled."
+                    continue
+                if key in ("UP", "LEFT"):
+                    modal_idx = 0
+                    continue
+                if key in ("DOWN", "RIGHT"):
+                    modal_idx = 1
+                    continue
+                if key in ("\r", "\n", "a", "A", "y", "Y"):
+                    if modal_idx == 0:
+                        notes = [TOWN_TUNE_HOLD] * TOWN_TUNE_STEPS
+                        status = "Erase all: set every slot to Z."
+                    else:
+                        status = "Erase all cancelled."
+                    close_modal()
+                    anim_frame = 0
+                    continue
                 continue
-            if key in ("LEFT",):
-                cursor = (cursor - 1) % TOWN_TUNE_STEPS
+
+            if modal == ACGC_MSCORE_MODAL_END:
+                if key in ("b", "B"):
+                    close_modal()
+                    cursor = 0
+                    anim_frame = 0
+                    status = "Rewrite: returned to editing."
+                    continue
+                if key in ("q", "Q", "ESC"):
+                    close_modal()
+                    status = "Still editing."
+                    continue
+                if key in ("UP", "LEFT"):
+                    modal_idx = max(0, modal_idx - 1)
+                    continue
+                if key in ("DOWN", "RIGHT"):
+                    modal_idx = min(len(ACGC_MSCORE_END_OPTIONS) - 1, modal_idx + 1)
+                    continue
+                if key in ("\r", "\n", "a", "A", "s", "S"):
+                    if modal_idx == 0:
+                        save_town_tune(notes)
+                        stop_preview()
+                        return
+                    if modal_idx == 1:
+                        close_modal()
+                        cursor = 0
+                        anim_frame = 0
+                        status = "Rewrite: returned to editing."
+                        continue
+                    notes = list(original_notes)
+                    save_town_tune(notes)
+                    stop_preview()
+                    return
+                continue
+
+            if key in ("q", "Q", "ESC", "s", "S"):
+                set_button_flash("START")
+                open_modal(ACGC_MSCORE_MODAL_END, 0)
+                continue
+            if key in ("\r", "\n", "a", "A"):
+                if cursor == ACGC_MSCORE_CURSOR_OK:
+                    set_button_flash("START")
+                    open_modal(ACGC_MSCORE_MODAL_END, 0)
+                    continue
+                cursor += 1
+                anim_frame = 0
+                audition_current()
+                continue
+            if key in ("p", "P", "x", "X"):
+                set_button_flash("X")
+                spawn_full_preview()
+                continue
+            if key in ("LEFT", "b", "B"):
+                if cursor > 0:
+                    cursor -= 1
+                    anim_frame = 0
+                    audition_current()
                 continue
             if key in ("RIGHT",):
-                cursor = (cursor + 1) % TOWN_TUNE_STEPS
+                if cursor < ACGC_MSCORE_CURSOR_OK:
+                    cursor += 1
+                    anim_frame = 0
+                    audition_current()
+                continue
+            if key in ("y", "Y"):
+                set_button_flash("Y")
+                open_modal(ACGC_MSCORE_MODAL_ERASE, 0)
+                status = None
                 continue
             if key in ("r", "R"):
-                notes[cursor] = TOWN_TUNE_REST
+                set_button_flash("R")
+                status = "e-Reader/GBA transfer path is not available in terminal mode."
                 continue
-            if key in ("h", "H"):
+            if key in ("o", "O"):
+                if cursor == ACGC_MSCORE_CURSOR_OK:
+                    continue
+                notes[cursor] = TOWN_TUNE_OFF
+                anim_frame = 0
+                audition_current()
+                continue
+            if key in ("z", "Z", "h", "H"):
+                if cursor == ACGC_MSCORE_CURSOR_OK:
+                    continue
                 notes[cursor] = TOWN_TUNE_HOLD
+                anim_frame = 0
+                audition_current()
+                continue
+            if key in ("?", "/"):
+                if cursor == ACGC_MSCORE_CURSOR_OK:
+                    continue
+                notes[cursor] = TOWN_TUNE_RANDOM
+                anim_frame = 0
+                audition_current()
                 continue
             if key in ("UP", "DOWN"):
-                choices = list(TOWN_TUNE_NOTES) + [TOWN_TUNE_REST, TOWN_TUNE_HOLD]
-                cur = notes[cursor]
-                try:
-                    idx = choices.index(cur)
-                except Exception:
-                    idx = 0
+                if cursor == ACGC_MSCORE_CURSOR_OK:
+                    continue
                 if key == "UP":
-                    idx = (idx + 1) % len(choices)
+                    notes[cursor] = _town_tune_next_value(notes[cursor])
                 else:
-                    idx = (idx - 1) % len(choices)
-                notes[cursor] = choices[idx]
+                    notes[cursor] = _town_tune_prev_value(notes[cursor])
+                anim_frame = 0
+                audition_current()
                 continue
     finally:
         stop_preview()
@@ -1719,35 +3871,66 @@ def run_tune_editor(audio_device=None):
 def truncate_plain(s, maxlen):
     if maxlen <= 0:
         return ""
-    if len(s) <= maxlen:
+    if plain_visible_len(s) <= maxlen:
         return s
     if maxlen <= 1:
-        return s[:maxlen]
-    return s[: maxlen - 3] + "..." if maxlen >= 3 else s[:maxlen]
+        out = []
+        width = 0
+        for ch in s:
+            ch_w = char_cell_width(ch)
+            if width + ch_w > maxlen:
+                break
+            out.append(ch)
+            width += ch_w
+        return "".join(out)
+    ellipsis = "..."
+    limit = maxlen - plain_visible_len(ellipsis)
+    out = []
+    width = 0
+    for ch in s:
+        ch_w = char_cell_width(ch)
+        if width + ch_w > limit:
+            break
+        out.append(ch)
+        width += ch_w
+    return "".join(out) + ellipsis
 
 def truncate_ansi_visible(s, maxlen):
+    """
+    Btop uresize() port: truncate to maxlen visible columns while
+    - respecting Unicode codepoint boundaries (not bytes)
+    - counting East-Asian wide chars as 2 columns
+    - closing any open ANSI color sequence at the cut point
+    """
+    import unicodedata
     if maxlen <= 0:
         return ""
     out = []
     visible = 0
     i = 0
+    open_ansi = False
     while i < len(s):
         ch = s[i]
         if ch == "\x1b" and i + 1 < len(s) and s[i + 1] == "[":
-            # copy ANSI escape without counting visible width
             end = i + 2
             while end < len(s) and s[end] != "m":
                 end += 1
             end = min(end + 1, len(s))
-            out.append(s[i:end])
+            seq = s[i:end]
+            out.append(seq)
+            open_ansi = not seq.endswith("[0m")
             i = end
             continue
         if visible >= maxlen:
             break
+        # Count wide chars (CJK, some emoji) as 2 columns — btop "wide" flag
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if visible + w > maxlen:
+            break  # don't write a wide char that would overflow
         out.append(ch)
-        visible += 1
+        visible += w
         i += 1
-    if visible >= maxlen:
+    if open_ansi:
         out.append("\x1b[0m")
     return "".join(out)
 
@@ -1787,6 +3970,7 @@ def build_title_art(text, width):
 
 def main():
     global TITLE_ART_COLORED, TITLE_ART_BASE, TITLE_LOLCAT_PATH, BOX_GRADIENT_PHASE, BOX_BORDER_POS, TITLE_ART_VERSION
+    ui_state = load_ui_state()
     mode, allowed_games, import_paths, tune_action, layout_opts = parse_cli_args(sys.argv)
     if mode == "import":
         sys.exit(import_files(import_paths))
@@ -1805,10 +3989,15 @@ def main():
         print("ac-ui needs to run in a real TTY. Try running it directly in your terminal.")
         sys.exit(1)
 
+    cleanup_legacy_runtime_artifacts()
+
     # IPC socket path
-    ipc_base = f"/tmp/ac-mpv-{os.getuid()}"
+    instance_tag = f"{os.getuid()}-{os.getpid()}"
+    ipc_base = f"/tmp/ac-mpv-{instance_tag}"
     ipc_a = f"{ipc_base}.a.sock"
     ipc_b = f"{ipc_base}.b.sock"
+    cava_conf_path = f"/tmp/ac-cava-{instance_tag}.conf"
+    private_sink_name = f"acui-{os.getpid()}"
     current_ipc = ipc_a
 
     mpv_proc = None
@@ -1879,14 +4068,26 @@ def main():
     last_mute_toggle_ts = 0.0
     last_key = ""
     last_key_ts = 0.0
-    vis_idx = VIS_MODES.index(VIS_MODE)
+    vis_idx = VIS_MODES.index(ui_state["vis_mode"]) if ui_state["vis_mode"] in VIS_MODES else VIS_MODES.index(VIS_MODE)
     smooth_bars = None
     peak_bars = None
     trail_bars = None
+    cap_pos = None    # per-bar peak cap positions for physics-based "peaks" mode
+    cap_vel = None    # per-bar peak cap velocities
+    # btop data_same: cache spectrum lines when smoothed bars haven't changed
+    _vis_line_cache = None
+    _vis_line_cache_key = None
+    flame_state = {"heat": None, "rng": 0xF1A3C0DE0BADCAFE, "frame": 0, "rows": 0, "cols": 0}
+    butterfly_state = {"frame": 0}
+    matrix_state = {"frame": 0}
+    heartbeat_state = {"buf": None, "prev_bass": 0.0, "spike_phase": 0.0}
+    scope_frame = 0
     last_title_anim_ts = 0.0
 
-    muted = False
-    mute_prev_vol = 50
+    muted = ui_state["muted"]
+    mute_prev_vol = ui_state["mute_prev_vol"]
+    vol_delta_flash = None    # (delta, expire_ts) — btop ▲▼ volume indicator
+    state_banner = None       # (text, color, expire_ts) — btop state banner
     fade = None
     transition = None
     background_mode = False
@@ -1909,28 +4110,39 @@ def main():
     stats_stop = None
     last_time_str = None
     last_time_sec = None
+    cava_started_ts = 0.0
+    cava_retry_ts = 0.0
+    cava_last_data_ts = 0.0
+    cava_last_stderr = ""
+    cava_last_label = None
+    playback_started_ts = 0.0
     if STATS_ENABLED:
         stats_q, stats_stop = start_stats_writer()
 
     catalog_games, catalog_variants = collect_catalog()
     games_list = ["ALL"] + sorted(catalog_games)
     variants_list = ["ALL"] + sorted(catalog_variants)
-    game_idx = 0
-    variant_idx = 0
+    game_idx = games_list.index(ui_state["game"]) if ui_state["game"] in games_list else 0
+    variant_idx = variants_list.index(ui_state["variant"]) if ui_state["variant"] in variants_list else 0
     cava_method, cava_source, cava_detect_mode = detect_cava_input()
     private_sink = None
     private_module = None
     loopback_module = None
     audio_device = None
-    output_vol = 75
+    output_vol = ui_state["output_vol"]
     loopback_q = None
     current_output_sink = None
     # Optional explicit mpv audio device (overrides private sink setup)
     if AUDIO_DEVICE_OVERRIDE:
         audio_device = AUDIO_DEVICE_OVERRIDE
+        override_source = pulse_monitor_source_for_audio_device(audio_device)
+        if override_source:
+            cava_method = "pulse"
+            cava_source = override_source
+            cava_detect_mode = "audio-device"
     elif PRIVATE_SINK:
         target_sink = OUTPUT_SINK if OUTPUT_SINK else None
-        private_sink, private_module, loopback_module, _out_sink = setup_private_sink(target_sink)
+        private_sink, private_module, loopback_module, _out_sink = setup_private_sink(target_sink, private_sink_name)
         current_output_sink = _out_sink
         if private_sink:
             cava_method = "pulse"
@@ -1960,6 +4172,17 @@ def main():
             cava_method = "pulse"
             cava_source = f"{OUTPUT_SINK}.monitor"
             cava_detect_mode = "output-sink"
+            current_output_sink = OUTPUT_SINK
+
+    cava_candidates = build_cava_input_candidates(
+        cava_method,
+        cava_source,
+        cava_detect_mode,
+        audio_device=audio_device,
+        private_sink=private_sink,
+        output_sink=current_output_sink,
+    )
+    cava_candidate_idx = 0
 
     def stop_mpv_proc(proc, ipc_path):
         # Try polite quit
@@ -2012,36 +4235,74 @@ def main():
             except Exception:
                 pass
 
+    def current_cava_candidate():
+        if not cava_candidates:
+            return {
+                "method": cava_method,
+                "source": cava_source,
+                "label": cava_detect_mode or "configured",
+            }
+        idx = max(0, min(cava_candidate_idx, len(cava_candidates) - 1))
+        return cava_candidates[idx]
+
+    def advance_cava_candidate():
+        nonlocal cava_candidate_idx
+        if len(cava_candidates) <= 1:
+            return False
+        start_idx = cava_candidate_idx
+        cava_candidate_idx = (cava_candidate_idx + 1) % len(cava_candidates)
+        return cava_candidate_idx != start_idx
+
+    def restart_cava(advance=False):
+        nonlocal cava_retry_ts
+        if advance:
+            advance_cava_candidate()
+        stop_cava()
+        started = start_cava()
+        cava_retry_ts = time.time()
+        return started
+
     def start_cava():
         nonlocal cava_proc, cava_thread, cava_err, cava_ok, cava_bars, cava_bars_count
+        nonlocal cava_started_ts, cava_retry_ts, cava_last_data_ts, cava_last_stderr, cava_last_label
         if cava_proc is not None:
             return True
         if shutil.which("cava") is None:
             cava_err = "cava not installed"
             return False
-        conf_path = f"/tmp/ac-cava-{os.getuid()}.conf"
+        candidate = current_cava_candidate()
+        input_method = candidate.get("method")
+        input_source = candidate.get("source")
+        cava_last_label = candidate.get("label")
+        cava_last_stderr = ""
+        cava_ok = False
+        cava_bars = None
+        cava_err = None
         bars_count = calc_cava_bars()
         cava_bars_count = bars_count
         try:
-            with open(conf_path, "w") as f:
-                f.write(cava_config_text(bars_count, cava_method, cava_source))
+            with open(cava_conf_path, "w") as f:
+                f.write(cava_config_text(bars_count, input_method, input_source))
         except Exception as e:
             cava_err = f"config error: {e}"
             return False
         try:
             cava_proc = subprocess.Popen(
-                ["cava", "-p", conf_path],
+                ["cava", "-p", cava_conf_path],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
             )
         except Exception as e:
             cava_err = f"start error: {e}"
             return False
+        cava_started_ts = time.time()
+        cava_last_data_ts = 0.0
+        cava_retry_ts = 0.0
 
         def reader():
-            nonlocal cava_bars, cava_ok
+            nonlocal cava_bars, cava_ok, cava_last_data_ts
             if cava_proc is None or cava_proc.stdout is None:
                 return
             for line in cava_proc.stdout:
@@ -2065,13 +4326,25 @@ def main():
                 with cava_lock:
                     cava_bars = bars
                     cava_ok = True
+                    cava_last_data_ts = time.time()
 
         cava_thread = threading.Thread(target=reader, daemon=True)
         cava_thread.start()
+
+        def stderr_reader():
+            nonlocal cava_last_stderr
+            if cava_proc is None or cava_proc.stderr is None:
+                return
+            for line in cava_proc.stderr:
+                text = line.strip()
+                if text:
+                    cava_last_stderr = text
+
+        threading.Thread(target=stderr_reader, daemon=True).start()
         return True
 
     def stop_cava():
-        nonlocal cava_proc, cava_bars, cava_ok, cava_err
+        nonlocal cava_proc, cava_bars, cava_ok, cava_err, cava_last_label
         if cava_proc is not None:
             try:
                 cava_proc.terminate()
@@ -2081,9 +4354,10 @@ def main():
         cava_bars = None
         cava_ok = False
         cava_err = None
+        cava_last_label = None
 
     def start_for_hour(hour, crossfade=False):
-        nonlocal mpv_proc, current_track, current_track_hour, current_ipc, fade
+        nonlocal mpv_proc, current_track, current_track_hour, current_ipc, fade, playback_started_ts
         active_games = None if game_idx == 0 else {games_list[game_idx]}
         active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
         tracks = list_tracks_for_hour(hour, active_games, active_variants)
@@ -2111,6 +4385,8 @@ def main():
                 if os.path.exists(next_ipc):
                     break
                 time.sleep(0.02)
+            apply_mpv_eq(next_ipc)
+            apply_mpv_eq(current_ipc)
             fade = {
                 "old_proc": mpv_proc,
                 "old_ipc": current_ipc,
@@ -2131,11 +4407,13 @@ def main():
         current_track_hour = hour
         update_history(track)
         mpv_proc = mpv_start(track, current_ipc, audio_device)
+        playback_started_ts = time.time()
         # Give mpv a moment to create the socket
         for _ in range(30):
             if os.path.exists(current_ipc):
                 break
             time.sleep(0.02)
+        apply_mpv_eq(current_ipc)
         # apply default volume to mpv if not using private sink loopback
         if not (PRIVATE_SINK and loopback_module):
             set_output_volume(output_vol)
@@ -2144,7 +4422,7 @@ def main():
         return True
 
     def start_track_for_hour(hour, volume=None):
-        nonlocal current_track, current_track_hour, current_ipc
+        nonlocal current_track, current_track_hour, current_ipc, playback_started_ts
         active_games = None if game_idx == 0 else {games_list[game_idx]}
         active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
         tracks = list_tracks_for_hour(hour, active_games, active_variants)
@@ -2158,10 +4436,12 @@ def main():
         except Exception:
             pass
         proc = mpv_start(track, next_ipc, audio_device, volume=volume)
+        playback_started_ts = time.time()
         for _ in range(30):
             if os.path.exists(next_ipc):
                 break
             time.sleep(0.02)
+        apply_mpv_eq(next_ipc)
         current_track = track
         current_track_hour = hour
         current_ipc = next_ipc
@@ -2205,13 +4485,50 @@ def main():
         if PRIVATE_SINK and loopback_module:
             if set_loopback_volume(loopback_module, private_sink, v):
                 output_vol = v
+                persist_ui_state()
                 return v
             return None
         # fallback to mpv volume
         v2 = set_volume(v)
         if v2 is not None:
             output_vol = v2
+            persist_ui_state()
         return v2
+
+    def persist_ui_state():
+        try:
+            save_ui_state({
+                "output_vol": int(max(0, min(100, output_vol))),
+                "muted": bool(muted),
+                "mute_prev_vol": int(max(0, min(100, mute_prev_vol if mute_prev_vol is not None else output_vol))),
+                "vis_mode": VIS_MODES[vis_idx],
+                "game": games_list[game_idx] if 0 <= game_idx < len(games_list) else "ALL",
+                "variant": variants_list[variant_idx] if 0 <= variant_idx < len(variants_list) else "ALL",
+            })
+        except Exception:
+            pass
+
+    def adjust_output_volume(delta):
+        nonlocal mute_prev_vol, cached_vol
+        try:
+            delta = int(delta)
+        except Exception:
+            return None
+        if muted:
+            base = mute_prev_vol if mute_prev_vol is not None else output_vol
+            new_vol = int(max(0, min(100, base + delta)))
+            mute_prev_vol = new_vol
+            persist_ui_state()
+            if PRIVATE_SINK and loopback_module:
+                applied = set_output_volume(new_vol)
+                if applied is not None:
+                    cached_vol = applied
+                return applied
+            return new_vol
+        new_vol = set_output_volume(output_vol + delta)
+        if new_vol is not None:
+            cached_vol = new_vol
+        return new_vol
 
     def sync_loopback_state():
         nonlocal last_loopback_ts, last_loopback_vol, last_loopback_muted
@@ -2266,6 +4583,11 @@ def main():
                 os.unlink(chime_temp_path)
             except Exception:
                 pass
+        try:
+            if os.path.exists(cava_conf_path):
+                os.unlink(cava_conf_path)
+        except Exception:
+            pass
         teardown_private_sink(private_module, loopback_module)
         enable_autowrap()
         show_cursor()
@@ -2278,9 +4600,10 @@ def main():
             return cached_tpos, cached_dur, cached_vol
         now = time.time()
         if now - last_query_ts > mpv_query_interval:
-            cached_tpos = mpv_query(current_ipc, "time-pos") if current_track else None
-            cached_dur = mpv_query(current_ipc, "duration") if current_track else None
-            cached_vol = mpv_query(current_ipc, "volume") if current_track else None
+            values = mpv_query_props(current_ipc, ("time-pos", "duration", "volume")) if current_track else {}
+            cached_tpos = values.get("time-pos")
+            cached_dur = values.get("duration")
+            cached_vol = values.get("volume")
             last_query_ts = now
         return cached_tpos, cached_dur, cached_vol
 
@@ -2329,7 +4652,7 @@ def main():
                     BOX_GRADIENT_PHASE = (now * GRADIENT_SPEED) % 1.0
                 if BOX_BORDER_SPIN:
                     BOX_BORDER_POS = int(now * BOX_BORDER_SPEED)
-                if TITLE_ANIMATE and TITLE_ART_BASE and TITLE_LOLCAT_PATH:
+                if TITLE_ANIMATE and TITLE_ART_BASE and TITLE_LOLCAT_PATH and (not background_mode) and (focused or not FOCUS_THROTTLE):
                     interval = 1.0 / max(1.0, TITLE_ANIM_FPS)
                     if now - last_title_anim_ts >= interval:
                         try:
@@ -2370,7 +4693,12 @@ def main():
                 spectrum_use_color = USE_COLOR
                 min_spectrum_rows = 6
                 base_spectrum = 3 if ultra_compact else 4 if tiny_term else 6 if small_term else CAVA_HEIGHT
-                spectrum_height = max(min_spectrum_rows, base_spectrum)
+                min_spectrum_height = max(min_spectrum_rows, base_spectrum)
+
+                # Pinned layout zones; spectrum expands into spare rows after content is built
+                _chrome_rows = 1
+                _footer_rows = 1 if term_rows >= min_spectrum_height + 4 else 0
+                _max_content_rows = max(0, term_rows - _chrome_rows - _footer_rows - min_spectrum_height - 1)
 
                 hour_changed = (last_hour is not None and hour != last_hour)
                 needs_start = (last_hour is None or mpv_proc is None or (mpv_proc and mpv_proc.poll() is not None))
@@ -2388,12 +4716,36 @@ def main():
                     bars_len_cached = None
                     bars_len_cols = term_cols
                     bars_len_count = None
+                    # Invalidate differential render cache so full screen redraws
+                    invalidate_render_cache()
+                    _vis_line_cache = None        # btop data_same: invalidate on resize
+                    _vis_line_cache_key = None
+                    # Also clear terminal to avoid stale content at new dimensions
+                    sys.stdout.write("[2J")
+                    sys.stdout.flush()
 
                 nh = next_hour_epoch(now)
                 remaining = max(0, int(nh - now))
 
                 # Query mpv playback (best-effort, cached)
                 tpos, dur, vol = get_playback()
+
+                # Recover if playback is live but cava never attached to the monitor stream.
+                playback_live = bool(current_track and mpv_proc and mpv_proc.poll() is None)
+                if cava_proc is not None and cava_proc.poll() is not None:
+                    code = cava_proc.poll()
+                    detail = f"cava exited ({code})"
+                    if cava_last_label:
+                        detail += f" via {cava_last_label}"
+                    if cava_last_stderr:
+                        detail += f": {cava_last_stderr}"
+                    cava_err = detail
+                    if playback_live and (not transition) and (not fade) and (now - cava_retry_ts) >= 1.0:
+                        restart_cava(advance=True)
+                elif playback_live and (not transition) and (not fade) and (not cava_ok) and (not cava_err):
+                    retry_anchor = max(cava_started_ts, playback_started_ts)
+                    if retry_anchor and (now - retry_anchor) >= AUDIO_WARMUP_GRACE and (now - cava_retry_ts) >= 3.0:
+                        restart_cava(advance=True)
 
                 # Render UI without full-screen clear to reduce flicker
                 lines = []
@@ -2402,12 +4754,26 @@ def main():
                 if last_time_sec != now_sec:
                     last_time_sec = now_sec
                     last_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now_sec))
-                tline = f"Time: {last_time_str}"
-                # Always show system time at top
-                lines.append(c(tline, "2"))
+                # Time bar: Unicode separator left + subtle gradient time display
+                if USE_COLOR:
+                    sep = c256("─" * 3, 238)
+                    time_color = c256(last_time_str, 245)
+                    playing_indicator = c256("♪", 82) if (current_track and not muted) else c256("♪", 236)
+                    lines.append(f"{sep} {playing_indicator} {time_color}")
+                else:
+                    lines.append(f"─── {last_time_str}")
 
-                # Reserve rows for the visualizer when possible
-                max_info_rows = term_rows - min_spectrum_rows - 1 - 1 - 2  # divider + time + box borders
+                # btop ▲▼ volume delta flash (shown inline next to vol label)
+                _vol_flash_str = ""
+                if vol_delta_flash is not None:
+                    delta_text, delta_expire = vol_delta_flash
+                    if time.monotonic() < delta_expire:
+                        _vol_flash_str = f"  \x1b[1;33m{delta_text}\x1b[0m" if USE_COLOR else f"  {delta_text}"
+                    else:
+                        vol_delta_flash = None
+
+                # Content zone budget (chrome + footer + spectrum already reserved)
+                max_info_rows = max(0, _max_content_rows - 2)  # 2 for box borders
                 compact_info = max_info_rows < 10 or term_cols < 70 or ultra_compact
 
                 info = []
@@ -2433,6 +4799,7 @@ def main():
                         int(display_vol) if display_vol is not None else None,
                         muted,
                         int(remaining),
+                        now_sec,  # ensures pulse dot + gradient bars refresh every second
                     )
                     if info_key != info_cache_key:
                         info = []
@@ -2451,45 +4818,79 @@ def main():
                                 info.extend([c(line, "38;5;77") for line in TITLE_ART])
                                 info_plain.extend([line for line in TITLE_ART])
 
-                        if not compact_info:
-                            controls_plain = CONTROL_TEXT_TINY if tiny_term else CONTROL_TEXT
-                            # Wrap controls to fit the terminal width so the info box doesn't overflow
-                            max_controls_width = max(20, term_cols - 6)
-                            controls_wrapped = wrap_plain(controls_plain, max_controls_width)
-                            for line in controls_wrapped:
-                                add_info_line(line, "33")
-                            add_info_line("", "2")
-
                         fline = f"Filter: Game={games_list[game_idx]}  Variant={variants_list[variant_idx]}"
                         add_info_line(fline, "2")
-                        vline = f"Visualizer: {VIS_MODES[vis_idx]}"
-                        add_info_line(vline, "2")
+                        # Live pulse dot: ● animates between bright/dim on each second
+                        pulse_bright = int(now) % 2 == 0
+                        if USE_COLOR:
+                            pulse_dot = "[1;32m●[0m" if (pulse_bright and not muted) else "[2;32m·[0m"
+                            muted_tag = "  [1;31m◆ MUTED[0m" if muted else ""
+                            vline_color = f"[2mVisualizer:[0m [36m{VIS_MODES[vis_idx]}[0m  {pulse_dot}{muted_tag}"
+                            info_plain.append(truncate_plain(f"Visualizer: {VIS_MODES[vis_idx]}", info_max_width))
+                            info.append(vline_color)
+                        else:
+                            add_info_line(f"Visualizer: {VIS_MODES[vis_idx]}", "2")
                         if showing_chime:
                             label = chime_kind or "hour chime"
                             line1_plain = f"Hour folder: --    Now playing: ({label})"
-                            add_info_line(line1_plain, "36")
+                            if USE_COLOR:
+                                info_plain.append(truncate_plain(line1_plain, info_max_width))
+                                info.append(f"[36mHour folder: --[0m    [1;33mNow playing:[0m ({label})")
+                            else:
+                                add_info_line(line1_plain, "36")
                         elif current_track:
                             display_hour = current_track_hour if current_track_hour is not None else hour
-                            line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {os.path.basename(current_track)}"
-                            add_info_line(line1_plain, "36")
+                            track_name = os.path.basename(current_track)
+                            play_sym = SYM_PAUSE if (muted or background_mode) else SYM_PLAY
+                            line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {track_name}"
+                            if USE_COLOR:
+                                sym_color = "\x1b[2;32m" if muted else "\x1b[1;32m"
+                                info_plain.append(truncate_plain(line1_plain, info_max_width))
+                                info.append(f"{sym_color}{play_sym}\x1b[0m [36m{display_hour:02d}h[0m  [1;33mNow playing:[0m [97m{track_name}[0m{(chr(32)+chr(32)+chr(0x1b)+"[2m"+humanize_seconds(dur)+chr(0x1b)+"[0m") if dur else ""}")
+                            else:
+                                add_info_line(line1_plain, "36")
                             if not compact_info:
-                                line2_plain = f"Playback: {fmt_mmss(tpos or -1)} / {fmt_mmss(dur or -1)}"
-                                add_info_line(line2_plain, "35")
+                                # Gradient playback progress bar (btop meter style)
+                                t_pos_s = tpos or 0.0
+                                t_dur_s = dur or 0.0
+                                bar_w = max(8, min(24, info_max_width - 22))
+                                pct = (t_pos_s / max(1.0, t_dur_s) * 100) if t_dur_s > 0 else 0
+                                # btop conditional: dim the bar when there's no real position data
+                                _pb_grad = _GRAD_PLAYBACK if (t_dur_s > 0 and not muted) else None
+                                pb_bar = gradient_bar(pct, bar_w, _pb_grad) if USE_COLOR else ("[" + "=" * int(pct / 100 * bar_w) + " " * (bar_w - int(pct / 100 * bar_w)) + "]")
+                                line2_plain = f"Playback: {fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}"
+                                line2_color = f"[35m{fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}[0m  {pb_bar}" if USE_COLOR else line2_plain
+                                info_plain.append(truncate_plain(line2_plain, info_max_width))
+                                info.append(line2_color)
                             if (display_vol is not None) and (not compact_info):
-                                vline = f"Volume: {int(display_vol):3d}%"
-                                add_info_line(vline, "33")
+                                # Gradient volume meter
+                                vol_pct = max(0, min(100, int(display_vol)))
+                                vol_bar_w = max(6, min(16, info_max_width - 16))
+                                vol_bar = gradient_bar(vol_pct, vol_bar_w, _GRAD_VOLUME) if USE_COLOR else ""
+                                mute_tag = " [1;31m[MUTED][0m" if muted else ""
+                                vline_plain = f"Volume: {vol_pct:3d}%"
+                                vline_color = (f"[33mVolume:[0m {vol_pct:3d}%  {vol_bar}{mute_tag}{_vol_flash_str}") if USE_COLOR else vline_plain
+                                info_plain.append(truncate_plain(vline_plain, info_max_width))
+                                info.append(vline_color)
                             if not compact_info:
-                                mline = f"Mute: {'ON' if muted else 'OFF'}"
-                                add_info_line(mline, "33")
+                                pass  # mute now shown inline with volume above
                         else:
                             line1_plain = f"Hour folder: {hour:02d}    Now playing: (none found)"
                             add_info_line(line1_plain, "36")
                         if not compact_info:
                             add_info_line("", "2")
-                        ulabel = "Until next hour:"
+                        # Live countdown bar: gradient shrinks as the hour approaches
                         uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
-                        uline = f"{ulabel} {uvalue}"
-                        add_info_line(uline, "95")
+                        uline_plain = f"Until next hour: {uvalue}"
+                        if USE_COLOR:
+                            hr_pct = min(100, int(remaining / 3600 * 100))
+                            cbar_w = max(4, min(16, info_max_width - 22))
+                            cbar = gradient_bar(hr_pct, cbar_w, _GRAD_PLAYBACK)
+                            uline_color = f"[38;5;141mUntil next hour:[0m {uvalue}  {cbar}"
+                            info_plain.append(truncate_plain(uline_plain, info_max_width))
+                            info.append(uline_color)
+                        else:
+                            add_info_line(uline_plain, "95")
 
                         info_cache_key = info_key
                         info_plain_cache = tuple(info_plain)
@@ -2539,7 +4940,7 @@ def main():
                         info_plain = info_plain[:max_info_rows]
                         info = info[:max_info_rows]
                     if info_plain and (not (show_help and compact_info)):
-                        info_w_needed = max([len(line) for line in info_plain] + [0])
+                        info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
                         info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
                         info_box, info_w = build_box(info_plain, info, info_w_cache)
 
@@ -2564,7 +4965,7 @@ def main():
                             c(stats_plain[2], "2"),
                             c(stats_plain[3], "2"),
                         ]
-                        stats_box_cache, stats_w_cache = build_box(stats_plain, stats_color)
+                        stats_box_cache, stats_w_cache = build_box(stats_plain, stats_color, title="Stats")
                         stats_cache_key = stats_key
                     stats_box = stats_box_cache
                     stats_w = stats_w_cache
@@ -2582,7 +4983,7 @@ def main():
                         rows_needed = len(info_box)
                     elif stats_box:
                         rows_needed = len(stats_box)
-                    available = term_rows - min_spectrum_rows - 1 - len(lines)
+                    available = _max_content_rows - (len(lines) - _chrome_rows)
                     if rows_needed > available:
                         # First drop stats if needed
                         stats_box = None
@@ -2594,30 +4995,35 @@ def main():
                         if len(info_plain) > max_rows:
                             info_plain = info_plain[:max_rows]
                             info = info[:max_rows]
-                            info_w_needed = max([len(line) for line in info_plain] + [0])
+                            info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
                             info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
                             info_box, info_w = build_box(info_plain, info, info_w_cache)
 
+                _info_row_w = 0
                 if info_box and stats_box:
                     total_w = (info_w + 4) + (stats_w + 4)
                     if total_w + 3 <= term_cols:
+                        _info_row_w = total_w + 3
                         target_len = max(len(info_box), len(stats_box))
                         info_box = pad_box_lines(info_box, info_w, target_len)
                         stats_box = pad_box_lines(stats_box, stats_w, target_len)
                         for left, right in zip(info_box, stats_box):
                             lines.append(left + "   " + right)
                     else:
+                        _info_row_w = info_w + 4
                         lines.extend(info_box)
                         lines.extend(stats_box)
                 elif info_box:
+                    _info_row_w = info_w + 4
                     lines.extend(info_box)
                 elif stats_box:
+                    _info_row_w = stats_w + 4
                     lines.extend(stats_box)
 
                 # Help overlay panel (skip if space is tight to keep spectrum visible)
                 render_help = show_help and (not ultra_compact)
                 rows_after_info = len(lines)
-                if term_rows - rows_after_info - min_spectrum_rows - 1 <= 0:
+                if _max_content_rows - (rows_after_info - _chrome_rows) <= 0:
                     render_help = False
                 if (not ultra_compact) and render_help:
                     if current_output_sink:
@@ -2635,12 +5041,21 @@ def main():
                         help_lines.append(f"Audio output: {help_sink}")
                         help_lines.append("Focus throttle: AC_UI_FOCUS_THROTTLE=1")
                         help_w = max(len(s) for s in help_lines)
-                        help_border = "+" + ("-" * (help_w + 2)) + "+"
-                        help_box_cache = [c(help_border, "2")]
-                        for s in help_lines:
-                            pad = " " * (help_w - len(s))
-                            help_box_cache.append(c(f"| {s}{pad} |", "2"))
-                        help_box_cache.append(c(help_border, "2"))
+                        # btop bold-first-letter shortcuts in help box
+                        if USE_COLOR:
+                            help_color = []
+                            for s in help_lines:
+                                # Bold the characters inside [] brackets
+                                import re as _re
+                                colored = _re.sub(
+                                    r'\[([^\]]+)\]',
+                                    lambda m: f"[\x1b[1;32m{m.group(1)}\x1b[0;2m]",
+                                    s
+                                )
+                                help_color.append(f"\x1b[2m{colored}\x1b[0m")
+                        else:
+                            help_color = [c(s, "2") for s in help_lines]
+                        help_box_cache, _ = build_box(help_lines, help_color, title="Help")
                         help_cache_key = help_key
                     if help_box_cache:
                         lines.extend(help_box_cache)
@@ -2648,13 +5063,16 @@ def main():
                 # History / up-next panels (responsive)
                 show_history = (not tiny_term) and (not ultra_compact) and (not compact_info)
                 show_up_next = (not (tiny_term or small_term)) and (not ultra_compact) and (not compact_info)
-                rows_budget = term_rows - len(lines) - min_spectrum_rows - 1
+                rows_budget = _max_content_rows - (len(lines) - _chrome_rows)
                 if rows_budget <= 0:
                     show_history = False
                     show_up_next = False
-                panel_max_width = info_max_width
                 if show_history and show_up_next:
-                    panel_max_width = max(10, (term_cols - 10) // 2)
+                    panel_max_width = max(10, (_info_row_w - 11) // 2) if _info_row_w > 11 else max(10, (term_cols - 10) // 2)
+                elif _info_row_w > 4:
+                    panel_max_width = max(10, _info_row_w - 4)
+                else:
+                    panel_max_width = info_max_width
 
                 hist_box = None
                 up_box = None
@@ -2669,8 +5087,18 @@ def main():
                         hist_lines = [hist_title_trunc] + (list(hist_list) if hist_list else ["(none yet)"])
                         hist_lines = [truncate_plain(s, panel_max_width) for s in hist_lines]
                         hist_plain = hist_lines
-                        hist_color = [c(hist_title_trunc, "36")] + [c(s, "2") for s in hist_lines[1:]]
-                        hist_box_cache, hist_w_cache = build_box(hist_plain, hist_color)
+                        # btop scrollbar: dim older entries, brighten most recent
+                        if USE_COLOR and hist_list:
+                            n_h = len(hist_list)
+                            hist_color = [c(hist_title_trunc, "36")]
+                            for hi, hs in enumerate(hist_lines[1:]):
+                                # most recent = bright, oldest = dim (btop alternating-row pattern)
+                                entry_age = n_h - 1 - hi
+                                shade = 240 + min(7, int((1 - entry_age / max(1, n_h - 1)) * 7))
+                                hist_color.append(c256(hs, shade))
+                        else:
+                            hist_color = [c(hist_title_trunc, "36")] + [c(s, "2") for s in hist_lines[1:]]
+                        hist_box_cache, hist_w_cache = build_box(hist_plain, hist_color, title="History")
                         hist_cache_key = hist_key
                     hist_box = hist_box_cache
                     hist_w = hist_w_cache
@@ -2682,19 +5110,26 @@ def main():
                         if next_list:
                             shown = list(next_list[:UP_NEXT_MAX])
                             if len(next_list) > UP_NEXT_MAX:
-                                shown.append(f"... +{len(next_list) - UP_NEXT_MAX} more")
+                                shown.append(f"{SYM_ELLIPSIS} +{len(next_list) - UP_NEXT_MAX} more")
                             header_plain = f"Up next ({min(len(next_list), UP_NEXT_MAX)}/{len(next_list)})"
                             header_plain_trunc = truncate_plain(header_plain, info_max_width)
                             up_plain = [header_plain_trunc] + shown
                             up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
-                            up_color = [c(header_plain_trunc, "36")] + [c(s, "2") for s in up_plain[1:]]
+                            # btop superscript: number each queue entry with ¹²³
+                            if USE_COLOR:
+                                up_color = [c(header_plain_trunc, "36")] + [
+                                    f"\x1b[2m{superscript_num(i+1)}\x1b[0m \x1b[37m{s}\x1b[0m"
+                                    for i, s in enumerate(up_plain[1:])
+                                ]
+                            else:
+                                up_color = [c(header_plain_trunc, "36")] + [c(s, "2") for s in up_plain[1:]]
                         else:
                             up_title = "Up next"
                             up_title_trunc = truncate_plain(up_title, info_max_width)
                             up_plain = [up_title_trunc, "(no candidates)"]
                             up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
                             up_color = [c(up_title_trunc, "36"), c("(no candidates)", "2")]
-                        up_box_cache, up_w_cache = build_box(up_plain, up_color)
+                        up_box_cache, up_w_cache = build_box(up_plain, up_color, title="Up Next")
                         up_cache_key = up_key
                     up_box = up_box_cache
                     up_w = up_w_cache
@@ -2707,7 +5142,7 @@ def main():
                     panel_height = len(hist_box)
                 elif up_box:
                     panel_height = len(up_box)
-                if panel_height and (len(lines) + panel_height + min_spectrum_rows + 1 > term_rows):
+                if panel_height and (len(lines) + panel_height > _chrome_rows + _max_content_rows):
                     hist_box = None
                     up_box = None
 
@@ -2728,15 +5163,29 @@ def main():
                 elif up_box:
                     lines.extend(up_box)
 
-                # If we're tight on height, drop trailing blank lines to preserve visualizer rows
-                while lines and lines[-1].strip() == "" and (len(lines) + min_spectrum_rows + 1 > term_rows):
-                    lines.pop()
-
                 prefix = "  "
-                # Fit spectrum to remaining terminal rows to avoid overlap/flicker
-                rows_used = len(lines)
-                available_rows = max(0, term_rows - rows_used - 1)  # leave room for divider
-                spectrum_height_dyn = min(spectrum_height, max(0, available_rows))
+
+                # btop state banner: full-width flash for mute/unmute/bg-mode events
+                if state_banner is not None:
+                    banner_text, banner_color, banner_expire = state_banner
+                    if time.monotonic() < banner_expire:
+                        pad_w = max(0, term_cols - len(banner_text) - 4)
+                        if USE_COLOR:
+                            lines.append(f"  \x1b[1;38;5;{banner_color}m{banner_text}{'':>{pad_w}}\x1b[0m")
+                        else:
+                            lines.append(f"  {banner_text}")
+                    else:
+                        state_banner = None
+
+                # Spectrum expands to fill space above actual content
+                _natural_len = len(lines)
+                _available_for_spectrum = term_rows - _footer_rows - 1  # subtract footer + divider
+                spectrum_height_dyn = max(min_spectrum_height, _available_for_spectrum - _natural_len)
+                _content_end = term_rows - _footer_rows - 1 - spectrum_height_dyn
+                while len(lines) < _content_end:
+                    lines.append("")
+                if len(lines) > _content_end:
+                    lines = lines[:_content_end]
                 with cava_lock:
                     bars = list(cava_bars) if cava_bars else None
                     ok = cava_ok
@@ -2755,20 +5204,34 @@ def main():
                 else:
                     bars_len = bars_len_cached
                 if spectrum_height_dyn > 0:
+                    _spec_row0 = len(lines)
                     if bars and bars_len is not None and len(bars) > bars_len:
                         bars = bars[:bars_len]
                     if bars:
-                        # Smooth + peak-hold for more dynamic motion
+                        # Asymmetric smoothing (fast attack, slow decay) + physics peak caps
                         if smooth_bars is None or len(smooth_bars) != len(bars):
                             smooth_bars = list(bars)
                             peak_bars = list(bars)
                             trail_bars = list(bars)
+                        if cap_pos is None or len(cap_pos) != len(bars):
+                            cap_pos = list(smooth_bars)
+                            cap_vel = [0.0] * len(smooth_bars)
+                        _dt = REFRESH_INTERVAL
+                        _GRAVITY = 4.5
+                        _LAUNCH_BASE = 0.6
+                        _LAUNCH_GAIN = 1.2
                         smoothed = []
                         new_peaks = []
                         new_trail = []
+                        new_cap_pos = []
+                        new_cap_vel = []
                         for i, b in enumerate(bars):
                             prev = smooth_bars[i]
-                            s = prev * 0.7 + b * 0.3
+                            # Fast attack (50/50), slow decay (85/15)
+                            if b >= prev:
+                                s = prev * 0.50 + b * 0.50
+                            else:
+                                s = prev * 0.85 + b * 0.15
                             smoothed.append(s)
                             peak = peak_bars[i]
                             peak = max(s, peak * 0.92)
@@ -2776,24 +5239,115 @@ def main():
                             trail = trail_bars[i]
                             trail = max(s, trail * 0.85)
                             new_trail.append(trail)
+                            # Physics-based peak cap: launch up on rise, gravity fall
+                            pos = cap_pos[i]
+                            vel = cap_vel[i]
+                            if s >= pos - 0.005:
+                                rise = max(0.0, s - pos)
+                                vel = _LAUNCH_BASE + _LAUNCH_GAIN * rise
+                                pos = s
+                            else:
+                                vel -= _GRAVITY * _dt
+                                pos += vel * _dt
+                                if pos < s:
+                                    pos = s
+                                    vel = 0.0
+                            new_cap_pos.append(max(0.0, min(1.0, pos)))
+                            new_cap_vel.append(vel)
                         smooth_bars = smoothed
                         peak_bars = new_peaks
                         trail_bars = new_trail
+                        cap_pos = new_cap_pos
+                        cap_vel = new_cap_vel
 
                         draw_mode = VIS_MODES[vis_idx]
-                        if draw_mode == "spectrum":
-                            draw_bars = smooth_bars
-                        else:
-                            draw_bars = smooth_bars
+                        game_tag = games_list[game_idx] if games_list else None
 
-                        lines.extend([prefix + ln for ln in spectrum_lines(draw_bars, height=spectrum_height_dyn, use_color=spectrum_use_color, mode=draw_mode, trail_bars=trail_bars, peak_bars=peak_bars)])
+                        if draw_mode == "flame":
+                            vis_lines = flame_render_lines(smooth_bars, spectrum_height_dyn, bars_len, flame_state, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "wave":
+                            vis_lines = braille_wave_lines(smooth_bars, spectrum_height_dyn, bars_len, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "scope":
+                            scope_frame += 1
+                            vis_lines = braille_scope_lines(smooth_bars, spectrum_height_dyn, bars_len, scope_frame, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "butterfly":
+                            vis_lines = butterfly_render_lines(smooth_bars, spectrum_height_dyn, bars_len, butterfly_state, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "led_matrix":
+                            vis_lines = led_matrix_lines(smooth_bars, spectrum_height_dyn, bars_len, peak_bars=cap_pos, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "matrix_rain":
+                            vis_lines = matrix_rain_lines(smooth_bars, spectrum_height_dyn, bars_len, matrix_state, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "heartbeat":
+                            vis_lines = heartbeat_render_lines(smooth_bars, spectrum_height_dyn, bars_len, heartbeat_state, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "braille":
+                            vis_lines = braille_spectrum_lines(smooth_bars, spectrum_height_dyn, bars_len, peak_bars=cap_pos, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        else:
+                            pass_peaks = cap_pos if draw_mode == "peaks" else peak_bars
+                            # btop data_same: static modes reuse cached lines when bars unchanged
+                            _STATIC_VIS = frozenset(("bars", "shades", "outline", "spectrum"))
+                            if draw_mode in _STATIC_VIS:
+                                _cache_key = (
+                                    draw_mode, game_tag,
+                                    spectrum_height_dyn, bars_len,
+                                    tuple(round(b, 2) for b in smooth_bars),
+                                )
+                                if _cache_key == _vis_line_cache_key and _vis_line_cache is not None:
+                                    lines.extend([prefix + ln for ln in _vis_line_cache])
+                                else:
+                                    _vis_lines = spectrum_lines(smooth_bars, height=spectrum_height_dyn, use_color=spectrum_use_color, mode=draw_mode, trail_bars=trail_bars, peak_bars=pass_peaks, game_tag=game_tag)
+                                    _vis_line_cache = _vis_lines
+                                    _vis_line_cache_key = _cache_key
+                                    lines.extend([prefix + ln for ln in _vis_lines])
+                            else:
+                                # peaks has physics caps that always change — never skip
+                                lines.extend([prefix + ln for ln in spectrum_lines(smooth_bars, height=spectrum_height_dyn, use_color=spectrum_use_color, mode=draw_mode, trail_bars=trail_bars, peak_bars=pass_peaks, game_tag=game_tag)])
                     elif cava_err:
                         lines.append(prefix + c(f"({cava_err})", "31"))
                     elif ok:
                         lines.append(prefix + c("(no data)", "33"))
                     else:
-                        lines.append(prefix + c("(waiting for audio...)", "33"))
-                    lines.append(c(prefix + ("-" * bars_len), "34"))
+                        warmup_since = max(cava_started_ts, playback_started_ts)
+                        if warmup_since and (now - warmup_since) < AUDIO_WARMUP_GRACE:
+                            lines.append(prefix)
+                        else:
+                            wait_msg = "(waiting for audio...)"
+                            if cava_last_label:
+                                wait_msg = f"(waiting for audio via {cava_last_label}...)"
+                            lines.append(prefix + c(wait_msg, "33"))
+                    # Pad spectrum zone to its exact reserved height
+                    while len(lines) < _spec_row0 + spectrum_height_dyn:
+                        lines.append("")
+                    # btop ├─ section divider with mode label
+                    _div_label = f" {VIS_MODES[vis_idx]} "
+                    _div_pad = max(0, bars_len - len(_div_label) - 2)
+                    _div_l = _div_pad // 2
+                    _div_r = _div_pad - _div_l
+                    if USE_COLOR and bars_len > len(_div_label) + 4:
+                        _div_line = (
+                            c256(BOX_CHARS["h"] * _div_l, 238)
+                            + c256("├", 240)
+                            + f"\x1b[2;36m{_div_label}\x1b[0m"
+                            + c256("┤", 240)
+                            + c256(BOX_CHARS["h"] * _div_r, 238)
+                        )
+                    else:
+                        _div_line = c256(BOX_CHARS["h"] * bars_len, 238)
+                    lines.append(prefix + _div_line)
+                    # Pinned footer: always-visible controls hint
+                    if _footer_rows:
+                        _footer_plain = CONTROL_TEXT_TINY if tiny_term else CONTROL_TEXT
+                        _footer_trunc = truncate_plain(_footer_plain, term_cols - 1)
+                        if USE_COLOR:
+                            lines.append(f"\x1b[2m{_footer_trunc}\x1b[0m")
+                        else:
+                            lines.append(_footer_trunc)
 
                 # Handle crossfade volumes (non-blocking)
                 if fade:
@@ -2919,19 +5473,27 @@ def main():
                             start_hour_transition(next_hour, simulate=True)
                     if ch.lower() == "g":
                         game_idx = (game_idx + 1) % len(games_list)
+                        persist_ui_state()
                         last_hour = None
                         start_for_hour(hour, crossfade=False)
                         next_candidates_ts = 0.0
                     if ch.lower() == "v":
                         variant_idx = (variant_idx + 1) % len(variants_list)
+                        persist_ui_state()
                         last_hour = None
                         start_for_hour(hour, crossfade=False)
                         next_candidates_ts = 0.0
                     if ch.lower() == "t":
                         vis_idx = (vis_idx + 1) % len(VIS_MODES)
-                    if ch.lower() == "e":
+                        persist_ui_state()
+                    if ch == "T":
                         run_tune_editor(audio_device)
                         last_lines = None
+                        invalidate_render_cache(clear_screen=True)
+                    if ch == "E":
+                        run_eq_editor(audio_device, lambda: current_ipc)
+                        last_lines = None
+                        invalidate_render_cache(clear_screen=True)
                     if ch.lower() == "s":
                         if PRIVATE_SINK and private_sink and shutil.which("pactl"):
                             sinks = list_sinks()
@@ -2952,19 +5514,16 @@ def main():
                                     )
                                     set_loopback_mute(loopback_module, private_sink, muted)
                                 last_loopback_ts = 0.0
-                    if ch == "-" :
-                        if PRIVATE_SINK and loopback_module:
-                            set_output_volume(output_vol - 5)
-                        else:
-                            mpv_command(ipc_path, ["add", "volume", -5])
+                    if ch == "-":
+                        adjust_output_volume(-5)
+                        vol_delta_flash = (f"{SYM_VOL_DN} -5", time.monotonic() + 1.2)
                     if ch == "+" or ch == "=":
-                        if PRIVATE_SINK and loopback_module:
-                            set_output_volume(output_vol + 5)
-                        else:
-                            mpv_command(ipc_path, ["add", "volume", 5])
+                        adjust_output_volume(5)
+                        vol_delta_flash = (f"{SYM_VOL_UP} +5", time.monotonic() + 1.2)
                     if ch == "8":
                         background_mode = not background_mode
                         last_lines = None
+                        state_banner = ("⬛ BACKGROUND MODE ON" if background_mode else "▣  BACKGROUND MODE OFF", 245, time.monotonic() + 1.5)
                     if ch.lower() == "m":
                         # debounce + ignore auto-repeat bursts
                         now_ts = time.time()
@@ -2974,6 +5533,7 @@ def main():
                             continue
                         last_mute_toggle_ts = now_ts
                         if muted:
+                            state_banner = (f"{SYM_MUTE} UNMUTED", 82, time.monotonic() + 1.5)
                             # Unmute: avoid blocking on pactl; sync loopback in main loop
                             if PRIVATE_SINK and loopback_module:
                                 set_output_volume(mute_prev_vol if mute_prev_vol is not None else output_vol)
@@ -2996,8 +5556,10 @@ def main():
                             else:
                                 set_output_volume(get_mute_volume())
                             muted = True
+                            state_banner = (f"{SYM_MUTE} MUTED", 196, time.monotonic() + 1.5)
                             last_loopback_ts = 0.0
                             cached_vol = get_mute_volume()
+                        persist_ui_state()
                         last_key = "m"
                         last_key_ts = now_ts
                         continue
@@ -3007,8 +5569,17 @@ def main():
                         last_key = ch.lower()
                         last_key_ts = time.time()
     finally:
+        try:
+            persist_ui_state()
+        except Exception:
+            pass
         stop_cava()
         stop_mpv()
+        try:
+            if os.path.exists(cava_conf_path):
+                os.unlink(cava_conf_path)
+        except Exception:
+            pass
         teardown_private_sink(private_module, loopback_module)
         enable_autowrap()
         show_cursor()

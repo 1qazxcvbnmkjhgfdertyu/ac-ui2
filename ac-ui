@@ -5786,6 +5786,10 @@ def main():
                         # skip: start another random track in same hour
                         start_for_hour(hour, crossfade=False)
                         next_candidates_ts = 0.0
+                        if current_track:
+                            _nm = parse_filename(os.path.basename(current_track))
+                            _nlabel = f"{_nm['game']}: {_nm['variant']}" if _nm else os.path.basename(current_track)
+                            state_banner = (f"♪ {_nlabel}", gradient_at(_active_tod_grad, 75), time.monotonic() + 1.5)
                     if ch.lower() == "h":
                         # Simulate hour change: fade out -> chime -> fade in
                         next_hour = (hour + 1) % 24

@@ -5083,7 +5083,7 @@ def main():
                                 t_dur_s = dur or 0.0
                                 bar_w = max(8, min(24, info_max_width - 22))
                                 pct = (t_pos_s / max(1.0, t_dur_s) * 100) if t_dur_s > 0 else 0
-                                pb_bar = solid_bar(pct, bar_w, 75) if USE_COLOR else ("[" + "=" * int(pct / 100 * bar_w) + "─" * (bar_w - int(pct / 100 * bar_w)) + "]")
+                                pb_bar = solid_bar(pct, bar_w, gradient_at(_tod_grad, 65)) if USE_COLOR else ("[" + "=" * int(pct / 100 * bar_w) + "─" * (bar_w - int(pct / 100 * bar_w)) + "]")
                                 line2_plain = f"Playback: {fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}"
                                 line2_color = f"[2;36mPlayback:[0m [2;36m{fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}[0m  {pb_bar}" if USE_COLOR else line2_plain
                                 info_plain.append(truncate_plain(line2_plain, info_max_width))
@@ -5092,7 +5092,7 @@ def main():
                                 # Gradient volume meter
                                 vol_pct = max(0, min(100, int(display_vol)))
                                 vol_bar_w = max(6, min(16, info_max_width - 16))
-                                vol_bar = solid_bar(vol_pct, vol_bar_w, 214) if USE_COLOR else ""
+                                vol_bar = solid_bar(vol_pct, vol_bar_w, gradient_at(_tod_grad, 80)) if USE_COLOR else ""
                                 mute_tag = " [1;31m[MUTED][0m" if muted else ""
                                 vline_plain = f"Volume: {vol_pct:3d}%"
                                 vline_color = (f"[2;36mVolume:[0m {vol_pct:3d}%  {vol_bar}{mute_tag}{_vol_flash_str}") if USE_COLOR else vline_plain
@@ -5111,7 +5111,7 @@ def main():
                         if USE_COLOR:
                             hr_pct = min(100, int(remaining / 3600 * 100))
                             cbar_w = max(4, min(16, info_max_width - 22))
-                            cbar = solid_bar(hr_pct, cbar_w, 141)
+                            cbar = solid_bar(hr_pct, cbar_w, gradient_at(_tod_grad, 50))
                             uline_color = f"[2;36mUntil next hour:[0m {uvalue}  {cbar}"
                             info_plain.append(truncate_plain(uline_plain, info_max_width))
                             info.append(uline_color)

@@ -888,7 +888,7 @@ def build_layout_preview(term_cols, term_rows):
         if info_plain and (not (compact_info)):
             info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
             info_w_cache = min(info_max_width, info_w_needed)
-            info_box, info_w = build_box(info_plain, info, info_w_cache)
+            info_box, info_w = build_box(info_plain, info, info_w_cache, title="Now Playing")
 
     stats_box = None
     stats_w = 0
@@ -935,7 +935,7 @@ def build_layout_preview(term_cols, term_rows):
                 info = info[:max_rows]
                 info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
                 info_w_cache = min(info_max_width, info_w_needed)
-                info_box, info_w = build_box(info_plain, info, info_w_cache)
+                info_box, info_w = build_box(info_plain, info, info_w_cache, title="Now Playing")
 
     _info_row_w = 0
     if info_box and stats_box:
@@ -1585,6 +1585,46 @@ _GRAD_PLAYBACK  = _make_gradient(39,  46,  101)   # teal → bright-green
 _GRAD_VOLUME    = _make_gradient(46,  220, 101)   # green → gold
 _GRAD_HOT       = _make_gradient(196, 226, 101)   # red → yellow (flame hot)
 
+# Time-of-day gradient pairs: (start_color, end_color) for each hour 0-23.
+# Each pair tints the visualizer and all progress bars to feel like that time.
+_TOD_GRAD_PAIRS = [
+    (17,  93),   #  0 midnight:     deep blue → violet
+    (17,  93),   #  1
+    (17,  57),   #  2 late night:   deep blue → indigo
+    (17,  57),   #  3
+    (57,  99),   #  4 pre-dawn:     indigo → medium purple
+    (130, 170),  #  5 dawn:         burnt orange → soft magenta
+    (166, 220),  #  6 sunrise:      orange → gold
+    (178, 226),  #  7 morning:      gold → bright yellow
+    (154, 220),  #  8 late morning: yellow-green → gold
+    (46,  154),  #  9 mid-morning:  bright green → lime
+    (51,   39),  # 10 approaching noon: cyan → sky
+    (39,   51),  # 11 late morning: sky → cyan
+    (33,   51),  # 12 noon:         bright blue → cyan
+    (27,   39),  # 13 early afternoon: blue → teal
+    (27,   39),  # 14 afternoon:    blue → teal
+    (27,   99),  # 15 late afternoon: blue → purple
+    (27,   99),  # 16 pre-evening:  blue → purple
+    (208, 220),  # 17 golden hour:  orange → gold
+    (196, 208),  # 18 evening:      red → orange
+    (160, 208),  # 19 dusk:         dark red → orange
+    (93,  196),  # 20 early night:  violet → red
+    (93,  129),  # 21 night:        violet → magenta
+    (57,   93),  # 22 late night:   indigo → violet
+    (17,   57),  # 23 pre-midnight: deep blue → indigo
+]
+_tod_grad_cache: dict = {}
+
+def _grad_for_hour(h: int) -> tuple:
+    """Return (or build) the 101-step time-of-day gradient for hour h."""
+    h = int(h) % 24
+    if h not in _tod_grad_cache:
+        s, e = _TOD_GRAD_PAIRS[h]
+        _tod_grad_cache[h] = _make_gradient(s, e, 101)
+    return _tod_grad_cache[h]
+
+_active_tod_grad = _GRAD_SPECTRUM  # updated each render frame via _grad_for_hour()
+
 def gradient_at(grad, value_0_100):
     """Look up a pre-computed gradient at a 0-100 position."""
     idx = max(0, min(100, int(value_0_100)))
@@ -1603,6 +1643,17 @@ def gradient_bar(value_pct, width, grad=None, bg_color=235):
         out_parts.append(f"[38;5;{bg_color}m" + "░" * (width - filled))
     out_parts.append("[0m")
     return "".join(out_parts)
+
+def solid_bar(value_pct, width, fill_color, track_color=238):
+    """Solid-color progress bar with a visible dash track showing the full bar extent."""
+    filled = max(0, min(width, int(round(value_pct / 100.0 * width))))
+    parts = []
+    if filled > 0:
+        parts.append(f"[38;5;{fill_color}m" + "█" * filled)
+    if filled < width:
+        parts.append(f"[38;5;{track_color}m" + "─" * (width - filled))
+    parts.append("[0m")
+    return "".join(parts)
 
 # ── btop Symbols: defined near top of file, before HELP_LINES_BASE ───────────
 
@@ -1644,9 +1695,9 @@ def spectrum_color(i, n, row_norm=None, game_tag=None):
         # AC-themed: dark-green bass → yellow-green highs
         return gradient_at(_GRAD_AC_GREEN, int(t * 100))
     if row_norm is not None:
-        # Height-based color: cool at bottom, warm at top (btop graph style)
-        return gradient_at(_GRAD_SPECTRUM, int(row_norm * 100))
-    return gradient_at(_GRAD_SPECTRUM, int(t * 100))
+        # Height-based color: use time-of-day gradient (warm at top, cool at bottom)
+        return gradient_at(_active_tod_grad, int(row_norm * 100))
+    return gradient_at(_active_tod_grad, int(t * 100))
 
 def frac_block(level, row_bottom, row_top):
     if level >= row_top:
@@ -1792,9 +1843,13 @@ def flame_render_lines(bars, height, width, state, use_color=True, game_tag=None
 
     state["rng"] = rng
 
-    # Tier colors: hot core = bright chartreuse, body = AC green or default green
-    hot_color = 118
-    body_color = 82 if (game_tag and game_tag != "ALL") else 46
+    # Tier colors: hot core and body follow time-of-day gradient for non-AC modes.
+    if game_tag and game_tag != "ALL":
+        hot_color = 118
+        body_color = 82
+    else:
+        hot_color = gradient_at(_active_tod_grad, 95)
+        body_color = gradient_at(_active_tod_grad, 35)
 
     lines_out = []
     for row in range(height):
@@ -2103,9 +2158,9 @@ def matrix_rain_lines(bars, height, width, state, use_color=True, game_tag=None)
                     if dist == 0:
                         color = 255
                     elif dist <= 2:
-                        color = 118 if (game_tag and game_tag != "ALL") else 46
+                        color = 118 if (game_tag and game_tag != "ALL") else gradient_at(_active_tod_grad, 70)
                     else:
-                        color = 34 if (game_tag and game_tag != "ALL") else 22
+                        color = 34 if (game_tag and game_tag != "ALL") else gradient_at(_active_tod_grad, 20)
                     row_parts.append(c256(ch, color))
                 else:
                     row_parts.append(ch)
@@ -2179,8 +2234,12 @@ def heartbeat_render_lines(bars, height, width, state, use_color=True, game_tag=
         if not grid[base_y * dot_cols + x] and (x // 6) % 2 == 0:
             grid[base_y * dot_cols + x] = True
 
-    trace_color = 196
-    base_color = 46 if (game_tag and game_tag != "ALL") else 34
+    if game_tag and game_tag != "ALL":
+        trace_color = 196
+        base_color = 46
+    else:
+        trace_color = gradient_at(_active_tod_grad, 90)
+        base_color = gradient_at(_active_tod_grad, 20)
     lines_out = []
     for row in range(height):
         row_str = []
@@ -3050,24 +3109,124 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
     def build_lines():
         term_cols, term_rows = shutil.get_terminal_size(fallback=(80, 24))
         lines = []
-        lines.append(c("10-BAND EQ  (cliamp-style frequencies)", "36"))
-        lines.append(c(f"Preset: {preset_names[preset_idx]}   Band: {EQ_FREQ_LABELS[cursor]} Hz   Gain: {bands[cursor]:+.1f} dB", "33"))
-        lines.append("")
-        row = []
-        for i, label in enumerate(EQ_FREQ_LABELS):
-            gain = bands[i]
-            if i == cursor:
-                cell = c(f"[{label}:{gain:+.0f}]", "1;32")
-            elif gain != 0.0:
-                cell = c(f" {label}:{gain:+.0f} ", "36")
+
+        # ── Header ──────────────────────────────────────────────────────────
+        if USE_COLOR:
+            _hi = gradient_at(_active_tod_grad, 85)
+            _lo = gradient_at(_active_tod_grad, 55)
+            lines.append(f"\x1b[1;38;5;{_hi}m 10-BAND EQ\x1b[0m  \x1b[2;36mfrequencies: cliamp-style\x1b[0m")
+            lines.append(
+                f"\x1b[2;36mPreset:\x1b[0m \x1b[38;5;{_lo}m{preset_names[preset_idx]}\x1b[0m"
+                f"   \x1b[2;36mBand:\x1b[0m \x1b[38;5;{_hi}m{EQ_FREQ_LABELS[cursor]} Hz\x1b[0m"
+                f"   \x1b[2;36mGain:\x1b[0m \x1b[1;38;5;{_hi}m{bands[cursor]:+.1f} dB\x1b[0m"
+            )
+        else:
+            lines.append("10-BAND EQ  (cliamp-style frequencies)")
+            lines.append(f"Preset: {preset_names[preset_idx]}   Band: {EQ_FREQ_LABELS[cursor]} Hz   Gain: {bands[cursor]:+.1f} dB")
+
+        # ── Vertical bar graph ───────────────────────────────────────────────
+        # Compute bar area: odd number of rows so center is a full row.
+        overhead = 5  # header(2) + freq-labels(1) + controls(1) + status(1)
+        available = max(5, term_rows - overhead)
+        half_rows = max(2, min(12, (available - 1) // 2))
+        bar_rows = half_rows * 2 + 1   # center row + equal halves
+        center_r = half_rows            # index of the 0-dB row
+
+        # Band column width: label up to 3 chars + 1 space = 4 each, plus 1 leading label col
+        LABEL_W = 4   # "+12 " / "  0 " / "-12 "
+        BAND_W  = 4   # " ██ "
+
+        for r in range(bar_rows):
+            dist = center_r - r   # positive = above 0 dB, negative = below
+            db_at_row = dist * (EQ_BAND_MAX / half_rows)
+
+            # Left-side dB scale
+            if r == 0:
+                db_label = f"+{int(EQ_BAND_MAX):2d} "
+            elif r == center_r:
+                db_label = "  0 "
+            elif r == bar_rows - 1:
+                db_label = f"{int(EQ_BAND_MIN):3d} "
             else:
-                cell = f" {label}: 0 "
-            row.append(cell)
-        lines.append("".join(row))
-        lines.append("")
-        lines.append(c("←/→ band   ↑/↓ or +/-  ±1 dB   p preset   r flat   s save   ENTER/q done", "33"))
+                db_label = "    "
+
+            row_parts = [c256(db_label, gradient_at(_active_tod_grad, 30)) if USE_COLOR else db_label]
+
+            for i, gain in enumerate(bands):
+                selected = (i == cursor)
+                # Is this row inside the gain bar?
+                if dist > 0:
+                    filled = gain >= 0 and db_at_row <= gain
+                elif dist < 0:
+                    filled = gain < 0 and db_at_row >= gain
+                else:
+                    filled = False
+
+                if r == center_r:
+                    # Center dashed line
+                    if USE_COLOR:
+                        if selected:
+                            row_parts.append(f"\x1b[1;38;5;{gradient_at(_active_tod_grad, 90)}m ━━ \x1b[0m")
+                        else:
+                            row_parts.append(f"\x1b[38;5;{gradient_at(_active_tod_grad, 25)}m ╌╌ \x1b[0m")
+                    else:
+                        row_parts.append(" -- " if not selected else " == ")
+                elif filled:
+                    if USE_COLOR:
+                        if selected:
+                            col = gradient_at(_active_tod_grad, 95)
+                            row_parts.append(f"\x1b[1;38;5;{col}m ██ \x1b[0m")
+                        else:
+                            col = gradient_at(_active_tod_grad, 65)
+                            row_parts.append(f"\x1b[38;5;{col}m ▓▓ \x1b[0m")
+                    else:
+                        row_parts.append(" ## ")
+                else:
+                    if USE_COLOR and selected:
+                        row_parts.append(f"\x1b[38;5;{gradient_at(_active_tod_grad, 22)}m ░░ \x1b[0m")
+                    else:
+                        row_parts.append("    ")
+
+            lines.append("".join(row_parts))
+
+        # ── Frequency labels ─────────────────────────────────────────────────
+        freq_row = " " * LABEL_W
+        for i, label in enumerate(EQ_FREQ_LABELS):
+            cell = f"{label:^{BAND_W}}"
+            if USE_COLOR:
+                if i == cursor:
+                    freq_row += f"\x1b[1;38;5;{gradient_at(_active_tod_grad, 90)}m{cell}\x1b[0m"
+                else:
+                    freq_row += c256(cell, gradient_at(_active_tod_grad, 45))
+            else:
+                freq_row += f"[{label}]" if i == cursor else cell
+        lines.append(freq_row)
+
+        # Gain value row under frequency labels
+        gain_row = " " * LABEL_W
+        for i, gain in enumerate(bands):
+            cell = f"{gain:+.0f}".center(BAND_W)
+            if USE_COLOR:
+                if i == cursor:
+                    gain_row += f"\x1b[1;38;5;{gradient_at(_active_tod_grad, 85)}m{cell}\x1b[0m"
+                elif gain != 0.0:
+                    gain_row += c256(cell, gradient_at(_active_tod_grad, 55))
+                else:
+                    gain_row += c256(cell, gradient_at(_active_tod_grad, 28))
+            else:
+                gain_row += cell
+        lines.append(gain_row)
+
+        # ── Controls ─────────────────────────────────────────────────────────
+        ctrl = "←/→ band   ↑/↓ or +/-  ±1 dB   p preset   r flat   s save   ENTER/q done"
+        if USE_COLOR:
+            _cc = gradient_at(_active_tod_grad, 60)
+            lines.append(c256(ctrl, _cc))
+        else:
+            lines.append(ctrl)
         if status:
-            lines.append(c(status, "35"))
+            lines.append(c(status, "35") if USE_COLOR else status)
+
         if len(lines) < term_rows:
             lines.extend([""] * (term_rows - len(lines)))
         return lines, term_cols, term_rows
@@ -4697,7 +4856,7 @@ def main():
 
                 # Pinned layout zones; spectrum expands into spare rows after content is built
                 _chrome_rows = 1
-                _footer_rows = 1 if term_rows >= min_spectrum_height + 4 else 0
+                _footer_rows = (2 if USE_COLOR else 1) if term_rows >= min_spectrum_height + 5 else 0
                 _max_content_rows = max(0, term_rows - _chrome_rows - _footer_rows - min_spectrum_height - 1)
 
                 hour_changed = (last_hour is not None and hour != last_hour)
@@ -4750,25 +4909,35 @@ def main():
                 # Render UI without full-screen clear to reduce flicker
                 lines = []
 
+                # Update time-of-day gradient once per frame (used by all bars + visualizer).
+                global _active_tod_grad
+                _active_tod_grad = _grad_for_hour(hour)
+
                 now_sec = int(now)
                 if last_time_sec != now_sec:
                     last_time_sec = now_sec
                     last_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now_sec))
-                # Time bar: Unicode separator left + subtle gradient time display
+                # Full-width header bar: time + playing indicator left, ├ ac-ui ┤ right.
                 if USE_COLOR:
-                    sep = c256("─" * 3, 238)
-                    time_color = c256(last_time_str, 245)
-                    playing_indicator = c256("♪", 82) if (current_track and not muted) else c256("♪", 236)
-                    lines.append(f"{sep} {playing_indicator} {time_color}")
+                    _tod_hi = gradient_at(_active_tod_grad, 95)
+                    playing_indicator = c256("♪", _tod_hi) if (current_track and not muted) else c256("♪", 236)
+                    _hdr_left_plain = f"─── ♪ {last_time_str} "
+                    _hdr_left = (c256("─" * 3, 238) + " " + playing_indicator + " "
+                                 + c256(last_time_str, 245) + " ")
+                    _hdr_right_plain = "┤ ac-ui ├"
+                    _hdr_pad = max(0, term_cols - len(_hdr_left_plain) - len(_hdr_right_plain))
+                    _hdr_right = (c256("┤", 240) + f"[1;38;5;{gradient_at(_active_tod_grad, 95)}m ac-ui [0m" + c256("├", 240))
+                    lines.append(_hdr_left + c256("─" * _hdr_pad, 238) + _hdr_right)
                 else:
-                    lines.append(f"─── {last_time_str}")
+                    lines.append(f"─── ♪ {last_time_str}")
 
                 # btop ▲▼ volume delta flash (shown inline next to vol label)
                 _vol_flash_str = ""
                 if vol_delta_flash is not None:
                     delta_text, delta_expire = vol_delta_flash
                     if time.monotonic() < delta_expire:
-                        _vol_flash_str = f"  \x1b[1;33m{delta_text}\x1b[0m" if USE_COLOR else f"  {delta_text}"
+                        _tod_flash_col = gradient_at(_active_tod_grad, 95)
+                        _vol_flash_str = f"  \x1b[1;38;5;{_tod_flash_col}m{delta_text}\x1b[0m" if USE_COLOR else f"  {delta_text}"
                     else:
                         vol_delta_flash = None
 
@@ -4779,6 +4948,7 @@ def main():
                 info = []
                 info_plain = []
                 if not ultra_compact:
+                    _tod_grad = _active_tod_grad
                     display_vol = output_vol if (PRIVATE_SINK and loopback_module) else (int(vol) if vol is not None else None)
                     info_key = (
                         term_cols,
@@ -4815,17 +4985,30 @@ def main():
                                 info.extend([line for line in TITLE_ART])
                                 info_plain.extend([strip_ansi(line) for line in TITLE_ART])
                             else:
-                                info.extend([c(line, "38;5;77") for line in TITLE_ART])
+                                _art_col = gradient_at(_tod_grad, 70)
+                                info.extend([c256(line, _art_col) for line in TITLE_ART])
                                 info_plain.extend([line for line in TITLE_ART])
 
                         fline = f"Filter: Game={games_list[game_idx]}  Variant={variants_list[variant_idx]}"
-                        add_info_line(fline, "2")
+                        if USE_COLOR:
+                            _flt_col = gradient_at(_tod_grad, 65)
+                            fline_color = (
+                                f"[2mFilter: Game=[0m"
+                                f"[38;5;{_flt_col}m{games_list[game_idx]}[0m"
+                                f"[2m  Variant=[0m"
+                                f"[38;5;{_flt_col}m{variants_list[variant_idx]}[0m"
+                            )
+                            info_plain.append(truncate_plain(fline, info_max_width))
+                            info.append(fline_color)
+                        else:
+                            add_info_line(fline, "2")
                         # Live pulse dot: ● animates between bright/dim on each second
                         pulse_bright = int(now) % 2 == 0
                         if USE_COLOR:
-                            pulse_dot = "[1;32m●[0m" if (pulse_bright and not muted) else "[2;32m·[0m"
+                            _pd_col = gradient_at(_tod_grad, 90)
+                            pulse_dot = f"[1;38;5;{_pd_col}m●[0m" if (pulse_bright and not muted) else f"[2;38;5;{_pd_col}m·[0m"
                             muted_tag = "  [1;31m◆ MUTED[0m" if muted else ""
-                            vline_color = f"[2mVisualizer:[0m [36m{VIS_MODES[vis_idx]}[0m  {pulse_dot}{muted_tag}"
+                            vline_color = f"[2mVisualizer:[0m [2;36m{VIS_MODES[vis_idx]}[0m  {pulse_dot}{muted_tag}"
                             info_plain.append(truncate_plain(f"Visualizer: {VIS_MODES[vis_idx]}", info_max_width))
                             info.append(vline_color)
                         else:
@@ -4835,7 +5018,8 @@ def main():
                             line1_plain = f"Hour folder: --    Now playing: ({label})"
                             if USE_COLOR:
                                 info_plain.append(truncate_plain(line1_plain, info_max_width))
-                                info.append(f"[36mHour folder: --[0m    [1;33mNow playing:[0m ({label})")
+                                _hr_col = gradient_at(_tod_grad, 80)
+                                info.append(f"[38;5;{_hr_col}mHour folder: --[0m    [2;36mNow playing:[0m ({label})")
                             else:
                                 add_info_line(line1_plain, "36")
                         elif current_track:
@@ -4844,9 +5028,10 @@ def main():
                             play_sym = SYM_PAUSE if (muted or background_mode) else SYM_PLAY
                             line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {track_name}"
                             if USE_COLOR:
-                                sym_color = "\x1b[2;32m" if muted else "\x1b[1;32m"
+                                _sym_hi = gradient_at(_tod_grad, 90)
+                                sym_color = "\x1b[2;32m" if muted else f"\x1b[1;38;5;{_sym_hi}m"
                                 info_plain.append(truncate_plain(line1_plain, info_max_width))
-                                info.append(f"{sym_color}{play_sym}\x1b[0m [36m{display_hour:02d}h[0m  [1;33mNow playing:[0m [97m{track_name}[0m{(chr(32)+chr(32)+chr(0x1b)+"[2m"+humanize_seconds(dur)+chr(0x1b)+"[0m") if dur else ""}")
+                                info.append(f"{sym_color}{play_sym}\x1b[0m [38;5;{_sym_hi}m{display_hour:02d}h[0m  [2;36mNow playing:[0m [97m{track_name}[0m{(chr(32)+chr(32)+chr(0x1b)+"[2m"+humanize_seconds(dur)+chr(0x1b)+"[0m") if dur else ""}")
                             else:
                                 add_info_line(line1_plain, "36")
                             if not compact_info:
@@ -4855,21 +5040,19 @@ def main():
                                 t_dur_s = dur or 0.0
                                 bar_w = max(8, min(24, info_max_width - 22))
                                 pct = (t_pos_s / max(1.0, t_dur_s) * 100) if t_dur_s > 0 else 0
-                                # btop conditional: dim the bar when there's no real position data
-                                _pb_grad = _GRAD_PLAYBACK if (t_dur_s > 0 and not muted) else None
-                                pb_bar = gradient_bar(pct, bar_w, _pb_grad) if USE_COLOR else ("[" + "=" * int(pct / 100 * bar_w) + " " * (bar_w - int(pct / 100 * bar_w)) + "]")
+                                pb_bar = solid_bar(pct, bar_w, 75) if USE_COLOR else ("[" + "=" * int(pct / 100 * bar_w) + "─" * (bar_w - int(pct / 100 * bar_w)) + "]")
                                 line2_plain = f"Playback: {fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}"
-                                line2_color = f"[35m{fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}[0m  {pb_bar}" if USE_COLOR else line2_plain
+                                line2_color = f"[2;36mPlayback:[0m [2;36m{fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}[0m  {pb_bar}" if USE_COLOR else line2_plain
                                 info_plain.append(truncate_plain(line2_plain, info_max_width))
                                 info.append(line2_color)
                             if (display_vol is not None) and (not compact_info):
                                 # Gradient volume meter
                                 vol_pct = max(0, min(100, int(display_vol)))
                                 vol_bar_w = max(6, min(16, info_max_width - 16))
-                                vol_bar = gradient_bar(vol_pct, vol_bar_w, _GRAD_VOLUME) if USE_COLOR else ""
+                                vol_bar = solid_bar(vol_pct, vol_bar_w, 214) if USE_COLOR else ""
                                 mute_tag = " [1;31m[MUTED][0m" if muted else ""
                                 vline_plain = f"Volume: {vol_pct:3d}%"
-                                vline_color = (f"[33mVolume:[0m {vol_pct:3d}%  {vol_bar}{mute_tag}{_vol_flash_str}") if USE_COLOR else vline_plain
+                                vline_color = (f"[2;36mVolume:[0m {vol_pct:3d}%  {vol_bar}{mute_tag}{_vol_flash_str}") if USE_COLOR else vline_plain
                                 info_plain.append(truncate_plain(vline_plain, info_max_width))
                                 info.append(vline_color)
                             if not compact_info:
@@ -4885,8 +5068,8 @@ def main():
                         if USE_COLOR:
                             hr_pct = min(100, int(remaining / 3600 * 100))
                             cbar_w = max(4, min(16, info_max_width - 22))
-                            cbar = gradient_bar(hr_pct, cbar_w, _GRAD_PLAYBACK)
-                            uline_color = f"[38;5;141mUntil next hour:[0m {uvalue}  {cbar}"
+                            cbar = solid_bar(hr_pct, cbar_w, 141)
+                            uline_color = f"[2;36mUntil next hour:[0m {uvalue}  {cbar}"
                             info_plain.append(truncate_plain(uline_plain, info_max_width))
                             info.append(uline_color)
                         else:
@@ -4942,7 +5125,7 @@ def main():
                     if info_plain and (not (show_help and compact_info)):
                         info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
                         info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
-                        info_box, info_w = build_box(info_plain, info, info_w_cache)
+                        info_box, info_w = build_box(info_plain, info, info_w_cache, title="Now Playing")
 
                 stats_box = None
                 stats_w = 0
@@ -4951,20 +5134,87 @@ def main():
                     hb = stats_data.get("hour_buckets", [0] * 24)
                     top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
                     top_fmt = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none)"
-                    stats_key = (total_sec, int(session_listen), top_fmt)
+                    stats_key = (total_sec, int(session_listen), top_fmt, hour)
                     if stats_key != stats_cache_key:
+                        # Derived stats from hour_buckets
+                        hb_total = sum(hb)
+                        hb_max = max(hb) if hb_total > 0 else 1
+                        peak_h, peak_v = (top[0][0], top[0][1]) if top and top[0][1] > 0 else (0, 0)
+                        peak_pct = int(peak_v / max(1, hb_total) * 100)
+                        active_count = sum(1 for v in hb if v > 0)
+                        top3_total = sum(v for _, v in top[:3] if v > 0)
+                        top3_pct = int(top3_total / max(1, hb_total) * 100)
+                        avg_per_h = format_seconds(int(hb_total / max(1, active_count))) if active_count > 0 else "--"
+
+                        # 24-bar histogram using Unicode block elements (9 levels)
+                        _HIST_BLOCKS = " ▁▂▃▄▅▆▇█"
+                        bar_chars = [_HIST_BLOCKS[max(0, min(8, round(hb[h] / hb_max * 8)))] for h in range(24)]
+                        hist_plain = "".join(bar_chars)
+
+                        # Current-hour position marker
+                        cur_h = hour % 24
+                        marker_plain = " " * cur_h + "▴" + " " * (23 - cur_h)
+
+                        # Axis labels aligned to bar positions
+                        axis_chars = [" "] * 24
+                        for pos, label in [(0, "0h"), (6, "6h"), (12, "12h"), (18, "18h")]:
+                            for i, ch in enumerate(label):
+                                if pos + i < 24:
+                                    axis_chars[pos + i] = ch
+                        axis_plain = "".join(axis_chars)
+
                         stats_plain = [
                             "Stats",
                             f"Total: {format_seconds(total_sec)}",
                             f"Session: {format_seconds(session_listen)}",
                             f"Top hours: {top_fmt}",
+                            f"Peak: {peak_h:02d}:00 ({peak_pct}%)   Active: {active_count}/24h",
+                            f"Top-3: {top3_pct}%   Avg/active h: {avg_per_h}",
+                            hist_plain,
+                            marker_plain,
+                            axis_plain,
                         ]
-                        stats_color = [
-                            c(stats_plain[0], "36"),
-                            c(stats_plain[1], "2"),
-                            c(stats_plain[2], "2"),
-                            c(stats_plain[3], "2"),
-                        ]
+                        if USE_COLOR:
+                            _s_total_pct = min(100, int(total_sec / 360000 * 100))
+                            _s_sess_pct  = min(100, int(session_listen / 28800 * 100))
+                            _s_total_bar = gradient_bar(_s_total_pct, 8, _active_tod_grad)
+                            _s_sess_bar  = gradient_bar(_s_sess_pct,  8, _active_tod_grad)
+
+                            # Each histogram bar colored by its own hour's TOD gradient
+                            hist_parts = []
+                            for h_idx, ch in enumerate(bar_chars):
+                                if ch == " ":
+                                    hist_parts.append(" ")
+                                else:
+                                    brightness = 100 if h_idx == cur_h else 70
+                                    col = gradient_at(_grad_for_hour(h_idx), brightness)
+                                    bold = "[1;" if h_idx == cur_h else "["
+                                    hist_parts.append(f"{bold}38;5;{col}m{ch}[0m")
+                            hist_colored = "".join(hist_parts)
+
+                            _mc = gradient_at(_active_tod_grad, 95)
+                            marker_colored = (" " * cur_h
+                                             + f"[1;38;5;{_mc}m▴[0m"
+                                             + " " * (23 - cur_h))
+                            axis_colored = c256(axis_plain, gradient_at(_active_tod_grad, 35))
+
+                            _tc = gradient_at(_active_tod_grad, 70)
+                            _pc = gradient_at(_active_tod_grad, 80)
+                            _cc = gradient_at(_active_tod_grad, 55)
+                            stats_color = [
+                                c(stats_plain[0], "36"),
+                                f"[2;36mTotal:[0m  [2m{format_seconds(total_sec)}[0m  {_s_total_bar}",
+                                f"[2;36mSession:[0m [2m{format_seconds(session_listen)}[0m  {_s_sess_bar}",
+                                f"[2;36mTop hours:[0m [38;5;{_tc}m{top_fmt}[0m",
+                                f"[2;36mPeak:[0m [38;5;{_pc}m{peak_h:02d}:00 ({peak_pct}%)[0m   [2;36mActive:[0m [2m{active_count}/24h[0m",
+                                f"[2;36mTop-3:[0m [38;5;{_cc}m{top3_pct}%[0m   [2;36mAvg/active h:[0m [2m{avg_per_h}[0m",
+                                hist_colored,
+                                marker_colored,
+                                axis_colored,
+                            ]
+                        else:
+                            stats_color = [c(s, "2") for s in stats_plain]
+                            stats_color[0] = c(stats_plain[0], "36")
                         stats_box_cache, stats_w_cache = build_box(stats_plain, stats_color, title="Stats")
                         stats_cache_key = stats_key
                     stats_box = stats_box_cache
@@ -4997,7 +5247,7 @@ def main():
                             info = info[:max_rows]
                             info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
                             info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
-                            info_box, info_w = build_box(info_plain, info, info_w_cache)
+                            info_box, info_w = build_box(info_plain, info, info_w_cache, title="Now Playing")
 
                 _info_row_w = 0
                 if info_box and stats_box:
@@ -5035,21 +5285,18 @@ def main():
                             help_sink_cache = get_default_sink() or "(unknown)"
                             help_sink_cache_ts = now
                         help_sink = help_sink_cache
-                    help_key = (help_sink,)
+                    help_key = (help_sink, hour)
                     if help_key != help_cache_key:
                         help_lines = list(HELP_LINES_BASE)
                         help_lines.append(f"Audio output: {help_sink}")
                         help_lines.append("Focus throttle: AC_UI_FOCUS_THROTTLE=1")
-                        help_w = max(len(s) for s in help_lines)
-                        # btop bold-first-letter shortcuts in help box
                         if USE_COLOR:
+                            _hk_col = gradient_at(_active_tod_grad, 80)
                             help_color = []
                             for s in help_lines:
-                                # Bold the characters inside [] brackets
-                                import re as _re
-                                colored = _re.sub(
+                                colored = re.sub(
                                     r'\[([^\]]+)\]',
-                                    lambda m: f"[\x1b[1;32m{m.group(1)}\x1b[0;2m]",
+                                    lambda m, _c=_hk_col: f"[\x1b[1;38;5;{_c}m{m.group(1)}\x1b[0;2m]",
                                     s
                                 )
                                 help_color.append(f"\x1b[2m{colored}\x1b[0m")
@@ -5118,7 +5365,7 @@ def main():
                             # btop superscript: number each queue entry with ¹²³
                             if USE_COLOR:
                                 up_color = [c(header_plain_trunc, "36")] + [
-                                    f"\x1b[2m{superscript_num(i+1)}\x1b[0m \x1b[37m{s}\x1b[0m"
+                                    f"\x1b[2m{superscript_num(i+1)}\x1b[0m {c256(s, max(237, 247 - i * 2))}"
                                     for i, s in enumerate(up_plain[1:])
                                 ]
                             else:
@@ -5333,19 +5580,28 @@ def main():
                         _div_line = (
                             c256(BOX_CHARS["h"] * _div_l, 238)
                             + c256("├", 240)
-                            + f"\x1b[2;36m{_div_label}\x1b[0m"
+                            + c256(_div_label, gradient_at(_active_tod_grad, 80))
                             + c256("┤", 240)
                             + c256(BOX_CHARS["h"] * _div_r, 238)
                         )
                     else:
                         _div_line = c256(BOX_CHARS["h"] * bars_len, 238)
                     lines.append(prefix + _div_line)
-                    # Pinned footer: always-visible controls hint
+                    # Pinned footer: thin TOD-colored separator + always-visible controls hint
                     if _footer_rows:
                         _footer_plain = CONTROL_TEXT_TINY if tiny_term else CONTROL_TEXT
                         _footer_trunc = truncate_plain(_footer_plain, term_cols - 1)
                         if USE_COLOR:
-                            lines.append(f"\x1b[2m{_footer_trunc}\x1b[0m")
+                            _sep_col = gradient_at(_active_tod_grad, 30)
+                            _footer_sep = c256("─" * (term_cols - 1), _sep_col)
+                            lines.append(_footer_sep)
+                            _tod_key_col = gradient_at(_active_tod_grad, 85)
+                            _footer_colored = re.sub(
+                                r'\[([^\]]+)\]',
+                                lambda m: f"[0;38;5;{_tod_key_col}m[{m.group(1)}][0;2m",
+                                _footer_trunc
+                            )
+                            lines.append(f"[2m{_footer_colored}[0m")
                         else:
                             lines.append(_footer_trunc)
 

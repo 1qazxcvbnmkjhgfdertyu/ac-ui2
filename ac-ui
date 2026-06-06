@@ -5327,21 +5327,28 @@ def main():
                 up_w = 0
                 if show_history:
                     hist_list = tuple(history)[-HISTORY_MAX:]
-                    hist_key = (hist_list, panel_max_width, info_max_width)
+                    hist_key = (hist_list, panel_max_width, info_max_width, hour)
                     if hist_key != hist_cache_key:
                         hist_title = "Recently played"
                         hist_title_trunc = truncate_plain(hist_title, info_max_width)
-                        hist_lines = [hist_title_trunc] + (list(hist_list) if hist_list else ["(none yet)"])
+                        def _fmt_hist(name):
+                            meta = parse_filename(name)
+                            if meta:
+                                return f"{meta['game']}: {meta['variant']}"
+                            return name
+                        hist_entries = [_fmt_hist(s) for s in hist_list] if hist_list else ["(none yet)"]
+                        hist_lines = [hist_title_trunc] + hist_entries
                         hist_lines = [truncate_plain(s, panel_max_width) for s in hist_lines]
                         hist_plain = hist_lines
-                        # btop scrollbar: dim older entries, brighten most recent
+                        # Dim older entries, brighten most recent with TOD gradient
                         if USE_COLOR and hist_list:
                             n_h = len(hist_list)
-                            hist_color = [c(hist_title_trunc, "36")]
+                            _hh_hi = gradient_at(_active_tod_grad, 70)
+                            _hh_lo = gradient_at(_active_tod_grad, 35)
+                            hist_color = [c256(hist_title_trunc, _hh_hi)]
                             for hi, hs in enumerate(hist_lines[1:]):
-                                # most recent = bright, oldest = dim (btop alternating-row pattern)
-                                entry_age = n_h - 1 - hi
-                                shade = 240 + min(7, int((1 - entry_age / max(1, n_h - 1)) * 7))
+                                age_frac = (n_h - 1 - hi) / max(1, n_h - 1)
+                                shade = gradient_at(_active_tod_grad, int(35 + (1 - age_frac) * 35))
                                 hist_color.append(c256(hs, shade))
                         else:
                             hist_color = [c(hist_title_trunc, "36")] + [c(s, "2") for s in hist_lines[1:]]
@@ -5355,7 +5362,13 @@ def main():
                     up_key = (next_list, panel_max_width, info_max_width, UP_NEXT_MAX)
                     if up_key != up_cache_key:
                         if next_list:
-                            shown = list(next_list[:UP_NEXT_MAX])
+                            def _fmt_candidate(name):
+                                meta = parse_filename(name)
+                                if meta:
+                                    return f"{meta['game']}: {meta['variant']}"
+                                return name
+                            shown_raw = list(next_list[:UP_NEXT_MAX])
+                            shown = [_fmt_candidate(s) for s in shown_raw]
                             if len(next_list) > UP_NEXT_MAX:
                                 shown.append(f"{SYM_ELLIPSIS} +{len(next_list) - UP_NEXT_MAX} more")
                             header_plain = f"Up next ({min(len(next_list), UP_NEXT_MAX)}/{len(next_list)})"
@@ -5364,8 +5377,10 @@ def main():
                             up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
                             # btop superscript: number each queue entry with ¹²³
                             if USE_COLOR:
-                                up_color = [c(header_plain_trunc, "36")] + [
-                                    f"\x1b[2m{superscript_num(i+1)}\x1b[0m {c256(s, max(237, 247 - i * 2))}"
+                                _uc_hi = gradient_at(_active_tod_grad, 70)
+                                _uc_lo = gradient_at(_active_tod_grad, 40)
+                                up_color = [c256(header_plain_trunc, _uc_hi)] + [
+                                    f"\x1b[2m{superscript_num(i+1)}\x1b[0m {c256(s, _uc_lo if i >= 1 else _uc_hi)}"
                                     for i, s in enumerate(up_plain[1:])
                                 ]
                             else:
@@ -5416,7 +5431,7 @@ def main():
                 if state_banner is not None:
                     banner_text, banner_color, banner_expire = state_banner
                     if time.monotonic() < banner_expire:
-                        pad_w = max(0, term_cols - len(banner_text) - 4)
+                        pad_w = max(0, term_cols - plain_visible_len(banner_text) - 4)
                         if USE_COLOR:
                             lines.append(f"  \x1b[1;38;5;{banner_color}m{banner_text}{'':>{pad_w}}\x1b[0m")
                         else:
@@ -5733,15 +5748,18 @@ def main():
                         last_hour = None
                         start_for_hour(hour, crossfade=False)
                         next_candidates_ts = 0.0
+                        state_banner = (f"Game: {games_list[game_idx]}", gradient_at(_active_tod_grad, 75), time.monotonic() + 1.5)
                     if ch.lower() == "v":
                         variant_idx = (variant_idx + 1) % len(variants_list)
                         persist_ui_state()
                         last_hour = None
                         start_for_hour(hour, crossfade=False)
                         next_candidates_ts = 0.0
+                        state_banner = (f"Variant: {variants_list[variant_idx]}", gradient_at(_active_tod_grad, 75), time.monotonic() + 1.5)
                     if ch.lower() == "t":
                         vis_idx = (vis_idx + 1) % len(VIS_MODES)
                         persist_ui_state()
+                        state_banner = (f"Vis: {VIS_MODES[vis_idx]}", gradient_at(_active_tod_grad, 65), time.monotonic() + 1.2)
                     if ch == "T":
                         run_tune_editor(audio_device)
                         last_lines = None
@@ -5770,6 +5788,8 @@ def main():
                                     )
                                     set_loopback_mute(loopback_module, private_sink, muted)
                                 last_loopback_ts = 0.0
+                                _sink_label = truncate_plain(next_sink, 40)
+                                state_banner = (f"→ Output: {_sink_label}", gradient_at(_active_tod_grad, 80), time.monotonic() + 2.0)
                     if ch == "-":
                         adjust_output_volume(-5)
                         vol_delta_flash = (f"{SYM_VOL_DN} -5", time.monotonic() + 1.2)

@@ -4961,9 +4961,15 @@ def main():
                     _hdr_left_plain = f"─── ♪ {last_time_str} "
                     _hdr_left = (c256("─" * 3, 238) + " " + playing_indicator + " "
                                  + c256(last_time_str, 245) + " ")
-                    _hdr_right_plain = "┤ ac-ui ├"
+                    # In ultra-compact mode show current track; otherwise show app name
+                    if ultra_compact and current_track:
+                        _hdr_tag = parse_filename(os.path.basename(current_track))
+                        _hdr_inner = f" {_hdr_tag['game']}: {_hdr_tag['variant']} " if _hdr_tag else f" {os.path.basename(current_track)} "
+                    else:
+                        _hdr_inner = " ac-ui "
+                    _hdr_right_plain = f"┤{_hdr_inner}├"
                     _hdr_pad = max(0, term_cols - len(_hdr_left_plain) - len(_hdr_right_plain))
-                    _hdr_right = (c256("┤", 240) + f"[1;38;5;{gradient_at(_active_tod_grad, 95)}m ac-ui [0m" + c256("├", 240))
+                    _hdr_right = (c256("┤", 240) + f"\x1b[1;38;5;{gradient_at(_active_tod_grad, 95)}m{_hdr_inner}\x1b[0m" + c256("├", 240))
                     lines.append(_hdr_left + c256("─" * _hdr_pad, 238) + _hdr_right)
                 else:
                     lines.append(f"─── ♪ {last_time_str}")

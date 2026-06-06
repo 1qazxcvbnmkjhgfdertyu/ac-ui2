@@ -840,7 +840,8 @@ def build_layout_preview(term_cols, term_rows):
     if not ultra_compact:
         if (not compact_info):
             title = ["AC-UI"]
-            info.extend([c(line, "38;5;77") for line in title])
+            _art_col = gradient_at(_active_tod_grad, 70)
+            info.extend([c256(line, _art_col) for line in title])
             info_plain.extend([line for line in title])
 
         fline = "Filter: Game=ALL  Variant=ALL"
@@ -852,7 +853,9 @@ def build_layout_preview(term_cols, term_rows):
             line1_plain = f"Hour folder: --    Now playing: ({label})"
             add_info_line(line1_plain, "36")
         elif current_track:
-            line1_plain = f"Hour folder: {current_track_hour:02d}    Now playing: {os.path.basename(current_track)}"
+            _track_meta = parse_filename(os.path.basename(current_track))
+            _display = f"{_track_meta['game']}: {_track_meta['variant']}" if _track_meta else os.path.basename(current_track)
+            line1_plain = f"Hour folder: {current_track_hour:02d}    Now playing: {_display}"
             add_info_line(line1_plain, "36")
             if not compact_info:
                 line2_plain = "Playback: 00:16 / 02:19"
@@ -1654,12 +1657,6 @@ def solid_bar(value_pct, width, fill_color, track_color=238):
 def superscript_num(n):
     """Convert a small integer to superscript Unicode digits (btop pattern)."""
     return "".join(SUPERSCRIPT[int(d)] for d in str(max(0, n)) if d.isdigit())
-
-def hi_key(label):
-    """Btop bold-first-letter shortcut: [n]ext → bold n, dim rest."""
-    if not USE_COLOR or not label:
-        return label
-    return f"\x1b[1;32m{label[0]}\x1b[0;2m{label[1:]}\x1b[0m"
 
 def humanize_seconds(sec):
     """Btop sec_to_dhms: compact mm:ss or h:mm:ss track duration."""

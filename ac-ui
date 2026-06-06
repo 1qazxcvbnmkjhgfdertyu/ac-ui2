@@ -251,13 +251,13 @@ SYM_VOL_DN   = "▼"
 SYM_NOTE     = "♪"
 SYM_ELLIPSIS = "…"
 SUPERSCRIPT  = ("⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹")
-CONTROL_TEXT = "Controls: [n]ext  [T]une  [E]Q  [t]vis  [m]ute  [q]uit  [s]ink  [?]help  [+/-]vol  [PgUp/Dn]vol±10  [g]ame  [v]ariant"
-CONTROL_TEXT_TINY = "n next  T tune  E eq  t vis  m mute  q quit  s sink  ? help  +/- vol  PgUp/Dn ±10"
+CONTROL_TEXT = "Controls: [n]ext  [T]une  [E]Q  [t/R]vis  [m]ute  [q]uit  [s]ink  [?]help  [+/-]vol  [PgUp/Dn]vol±10  [g]ame  [v]ariant"
+CONTROL_TEXT_TINY = "n next  T tune  E eq  t/R vis  m mute  q quit  s sink  ? help  +/- vol"
 HELP_LINES_BASE = [
     "Help",
     f"{SYM_ARROW_R} [n]ext track   [m]ute   [T]own tune   [q]uit",
     f"[g] cycle game   [v] cycle variant   [8] background mode",
-    f"[h] simulate hour   [t] vis mode   [E] EQ   [s] audio output",
+    f"[h] simulate hour   [t] vis next   [R] vis random   [E] EQ   [s] sink",
     f"[+/-] volume ±5   [PgUp/Dn] volume ±10   [?] toggle help",
     f"[{SYM_ARROW_U}{SYM_ARROW_D}] tune editor nav",
 ]
@@ -266,7 +266,6 @@ CHIME_DIR = os.path.join(MUSIC_DIR, "chimes")
 DEFAULT_HOUR_CHIME_NAME = "acgc-town-tune-default.wav"
 DEFAULT_HOUR_CHIME = os.path.join(CHIME_DIR, DEFAULT_HOUR_CHIME_NAME)
 LEGACY_HOUR_CHIME = os.path.join(CHIME_DIR, "wild-world-town-tune.wav")
-SOURCE_HOUR_CHIME = "/home/jfitz/Documents/Animal Crossing ) [x1FWild World： Town Tune (Defaultu0jiqLfo].wav"
 
 # Town tune (16-step) + FluidSynth support.
 # Canonical values mirror ACGC:
@@ -414,13 +413,6 @@ UI_STATE_PATH = os.path.expanduser(
 
 HOUR_CHIME_PATH = os.path.expanduser(os.environ.get("AC_UI_HOUR_CHIME", DEFAULT_HOUR_CHIME))
 if os.environ.get("AC_UI_HOUR_CHIME") is None:
-    # Auto-import the legacy default chime into the app folder if present.
-    if not os.path.exists(LEGACY_HOUR_CHIME) and os.path.exists(SOURCE_HOUR_CHIME):
-        try:
-            os.makedirs(CHIME_DIR, exist_ok=True)
-            shutil.copy2(SOURCE_HOUR_CHIME, LEGACY_HOUR_CHIME)
-        except Exception:
-            pass
     HOUR_CHIME_PATH = next(
         (path for path in (DEFAULT_HOUR_CHIME, LEGACY_HOUR_CHIME) if os.path.exists(path)),
         DEFAULT_HOUR_CHIME,
@@ -5813,6 +5805,10 @@ def main():
                         state_banner = (f"Variant: {variants_list[variant_idx]}", gradient_at(_active_tod_grad, 75), time.monotonic() + 1.5)
                     if ch.lower() == "t":
                         vis_idx = (vis_idx + 1) % len(VIS_MODES)
+                        persist_ui_state()
+                        state_banner = (f"Vis: {VIS_MODES[vis_idx]}", gradient_at(_active_tod_grad, 65), time.monotonic() + 1.2)
+                    if ch == "R":
+                        vis_idx = random.randrange(len(VIS_MODES))
                         persist_ui_state()
                         state_banner = (f"Vis: {VIS_MODES[vis_idx]}", gradient_at(_active_tod_grad, 65), time.monotonic() + 1.2)
                     if ch == "T":

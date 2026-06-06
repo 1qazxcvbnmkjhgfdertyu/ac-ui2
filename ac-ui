@@ -251,14 +251,15 @@ SYM_VOL_DN   = "▼"
 SYM_NOTE     = "♪"
 SYM_ELLIPSIS = "…"
 SUPERSCRIPT  = ("⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹")
-CONTROL_TEXT = "Controls: [n]ext  [T]une  [E]Q  [t]vis  [m]ute  [q]uit  [s]ink  [?]help  [+/-]vol  [g]ame  [v]ariant"
-CONTROL_TEXT_TINY = "n next  T tune  E eq  t vis  m mute  q quit  s sink  ? help  +/- vol"
+CONTROL_TEXT = "Controls: [n]ext  [T]une  [E]Q  [t]vis  [m]ute  [q]uit  [s]ink  [?]help  [+/-]vol  [PgUp/Dn]vol±10  [g]ame  [v]ariant"
+CONTROL_TEXT_TINY = "n next  T tune  E eq  t vis  m mute  q quit  s sink  ? help  +/- vol  PgUp/Dn ±10"
 HELP_LINES_BASE = [
     "Help",
     f"{SYM_ARROW_R} [n]ext track   [m]ute   [T]own tune   [q]uit",
     f"[g] cycle game   [v] cycle variant   [8] background mode",
     f"[h] simulate hour   [t] vis mode   [E] EQ   [s] audio output",
-    f"[+/-] volume   [{SYM_ARROW_U}{SYM_ARROW_D}] tune editor nav   [?] toggle help",
+    f"[+/-] volume ±5   [PgUp/Dn] volume ±10   [?] toggle help",
+    f"[{SYM_ARROW_U}{SYM_ARROW_D}] tune editor nav",
 ]
 
 CHIME_DIR = os.path.join(MUSIC_DIR, "chimes")
@@ -3218,7 +3219,7 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
         lines.append(gain_row)
 
         # ── Controls ─────────────────────────────────────────────────────────
-        ctrl = "←/→ band   ↑/↓ or +/-  ±1 dB   p preset   r flat   s save   ENTER/q done"
+        ctrl = "←/→ band   ↑/↓ or +/-  ±1 dB   PgUp/Dn ±3 dB   p preset   r flat   s save   q done"
         if USE_COLOR:
             _cc = gradient_at(_active_tod_grad, 60)
             lines.append(c256(ctrl, _cc))
@@ -3275,6 +3276,18 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
                 bands[cursor] = _clamp_eq_band(bands[cursor] - 1.0)
                 push_eq()
                 status = "updated"
+                last_lines = None
+                continue
+            if ch == "PAGEUP":
+                bands[cursor] = _clamp_eq_band(bands[cursor] + 3.0)
+                push_eq()
+                status = f"+3 dB"
+                last_lines = None
+                continue
+            if ch == "PAGEDOWN":
+                bands[cursor] = _clamp_eq_band(bands[cursor] - 3.0)
+                push_eq()
+                status = f"-3 dB"
                 last_lines = None
                 continue
             if ch in ("p", "P"):
@@ -3438,20 +3451,19 @@ def _read_key(fd, timeout=0.1):
         return None
     if ch != "\x1b":
         return ch
-    # Read escape sequence (arrows)
+    # Read up to 4 bytes of escape sequence
     seq = ""
-    r, _, _ = select.select([fd], [], [], 0.01)
-    if r:
+    for _ in range(4):
+        r, _, _ = select.select([fd], [], [], 0.01)
+        if not r:
+            break
         try:
             seq += os.read(fd, 1).decode("utf-8", errors="ignore")
         except Exception:
-            pass
-    r, _, _ = select.select([fd], [], [], 0.01)
-    if r:
-        try:
-            seq += os.read(fd, 1).decode("utf-8", errors="ignore")
-        except Exception:
-            pass
+            break
+        # CSI sequences end with a letter or ~
+        if seq and seq[-1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~":
+            break
     if seq == "[I":
         return "FOCUS_IN"
     if seq == "[O":
@@ -3465,6 +3477,10 @@ def _read_key(fd, timeout=0.1):
             return "RIGHT"
         if seq.endswith("D"):
             return "LEFT"
+        if seq in ("[5~", "[I"):   # Page Up / xterm shift-tab
+            return "PAGEUP"
+        if seq in ("[6~", "[G"):   # Page Down
+            return "PAGEDOWN"
     return "ESC"
 
 def _render_tune_editor(
@@ -5796,6 +5812,12 @@ def main():
                     if ch == "+" or ch == "=":
                         adjust_output_volume(5)
                         vol_delta_flash = (f"{SYM_VOL_UP} +5", time.monotonic() + 1.2)
+                    if ch == "PAGEUP":
+                        adjust_output_volume(10)
+                        vol_delta_flash = (f"{SYM_VOL_UP} +10", time.monotonic() + 1.2)
+                    if ch == "PAGEDOWN":
+                        adjust_output_volume(-10)
+                        vol_delta_flash = (f"{SYM_VOL_DN} -10", time.monotonic() + 1.2)
                     if ch == "8":
                         background_mode = not background_mode
                         last_lines = None

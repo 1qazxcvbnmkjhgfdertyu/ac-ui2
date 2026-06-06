@@ -4561,7 +4561,7 @@ def main():
         cava_err = None
         cava_last_label = None
 
-    def start_for_hour(hour, crossfade=False):
+    def start_for_hour(hour, crossfade=False, fade_dur=None):
         nonlocal mpv_proc, current_track, current_track_hour, current_ipc, fade, playback_started_ts
         active_games = None if game_idx == 0 else {games_list[game_idx]}
         active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
@@ -4576,7 +4576,8 @@ def main():
             stop_mpv_proc(fade.get("old_proc"), fade.get("old_ipc"))
             fade = None
 
-        if crossfade and CROSSFADE_SECONDS > 0 and mpv_proc and mpv_proc.poll() is None:
+        _fade_dur = fade_dur if fade_dur is not None else CROSSFADE_SECONDS
+        if crossfade and _fade_dur > 0 and mpv_proc and mpv_proc.poll() is None:
             next_ipc = ipc_b if current_ipc == ipc_a else ipc_a
             # clear any stale socket
             try:
@@ -4598,7 +4599,7 @@ def main():
                 "new_proc": new_proc,
                 "new_ipc": next_ipc,
                 "start_ts": time.time(),
-                "dur": CROSSFADE_SECONDS,
+                "dur": _fade_dur,
             }
             current_track = track
             current_track_hour = hour
@@ -5783,8 +5784,8 @@ def main():
                     if ch.lower() == "q":
                         handle_exit()
                     if ch.lower() == "n":
-                        # skip: start another random track in same hour
-                        start_for_hour(hour, crossfade=False)
+                        # skip: crossfade to another random track in same hour
+                        start_for_hour(hour, crossfade=True, fade_dur=1.0)
                         next_candidates_ts = 0.0
                         if current_track:
                             _nm = parse_filename(os.path.basename(current_track))

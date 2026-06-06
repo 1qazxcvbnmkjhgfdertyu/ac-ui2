@@ -442,11 +442,23 @@ def parse_cli_args(argv):
         arg = argv[i]
         if arg in ("-h", "--help"):
             print("Usage:")
-            print("  ac-ui [--games GCN,WW]")
+            print("  ac-ui [--games GCN,WW] [--vis MODE]")
             print("  ac-ui import <files...>")
             print("  ac-ui tune [show|play|reset]")
             print("  ac-ui stats")
             print("  ac-ui layout-sweep")
+            print()
+            print("Keys (in-app):")
+            print("  n  next track    m  mute     T  town tune   E  EQ editor")
+            print("  g  cycle game    v  variant   t  vis next   R  vis random")
+            print("  h  simulate hour change       s  audio sink")
+            print("  +/-  volume ±5   PgUp/Dn volume ±10")
+            print("  8  background mode   ?  help   q  quit")
+            print()
+            print(f"Vis modes: {', '.join(VIS_MODES)}")
+            print()
+            print("Env vars: AC_UI_MUSIC_DIR, AC_UI_VIS, AC_UI_REFRESH,")
+            print("          AC_UI_CAVA_SOURCE, AC_UI_EQ_PATH, AC_UI_STATS")
             sys.exit(0)
         if arg == "import":
             mode = "import"

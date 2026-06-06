@@ -1,2 +1,25 @@
 __pycache__/
 *.pyc
+
+# Local reverse-engineering/decomp reference material; never publish.
+acgc-reference/
+
+# Local media/assets/runtime data.
+music/
+chimes/
+acgc_engine/
+town_tune_samples/
+layout_sweep/
+*.iso
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.aif
+*.aiff
+*.sf2
+stats.json
+stats.csv
+state.json

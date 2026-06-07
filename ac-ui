@@ -2,8 +2,8 @@
 import os, sys, time, random, subprocess, json, select, termios, tty, signal, threading, shutil, re, queue, textwrap, tempfile, struct, math, errno, stat, wave, unicodedata
 from collections import deque
 
-MUSIC_DIR = os.path.expanduser("~/.local/share/ac-terminal-radio/music")
-MPV = "mpv"
+MUSIC_DIR = os.path.expanduser(os.environ.get("AC_UI_MUSIC_DIR", "~/.local/share/ac-terminal-radio/music"))
+MPV = (os.environ.get("AC_UI_MPV", "mpv") or "mpv").strip() or "mpv"
 
 # Weighting: piano gets +77% relative weight => 1.77x.
 # We'll implement by adding 1 extra "ticket" for piano (simple and close to your earlier request).
@@ -59,6 +59,56 @@ def env_bool01(name, default):
         return 1 if default else 0
     return 0 if raw.strip().lower() in ("0", "false", "no", "off") else 1
 
+def coerce_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "default"):
+            return default
+        if text in ("0", "false", "no", "off", "n"):
+            return False
+        if text in ("1", "true", "yes", "on", "y"):
+            return True
+    return bool(value)
+
+def _resolve_command_path(command):
+    text = os.path.expanduser(str(command or "").strip())
+    if not text:
+        return ""
+    if os.path.isabs(text) or os.sep in text:
+        return text if os.path.isfile(text) and os.access(text, os.X_OK) else ""
+    return shutil.which(text) or ""
+
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+def _atomic_write_text(path, text, encoding="utf-8"):
+    _ensure_parent_dir(path)
+    tmp_dir = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".ac-ui-", suffix=".tmp", dir=tmp_dir)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+def _atomic_write_json(path, payload, *, indent=2):
+    _atomic_write_text(path, json.dumps(payload, indent=indent) + "\n")
+
 PRIVATE_SINK = os.environ.get("AC_UI_PRIVATE_SINK", "1").lower() in ("1", "true", "yes")
 OUTPUT_SINK = os.environ.get("AC_UI_OUTPUT_SINK", "").strip()
 if OUTPUT_SINK.lower() in ("default", "@default@", "@default_sink@"):
@@ -102,13 +152,6 @@ def plain_visible_len(s):
 def visible_len(s):
     return plain_visible_len(strip_ansi(s))
 
-def drop_first_visible(s):
-    if not s:
-        return s
-    if not USE_COLOR:
-        return s[1:]
-    # remove the first colorized char (e.g., \x1b[38;5;245m+\x1b[0m)
-    return re.sub(r"^\x1b\[[0-9;]*m.\x1b\[0m", "", s, count=1)
 
 TITLE_ART = []
 TITLE_ART_COLORED = False
@@ -165,10 +208,13 @@ VIS_MODE_ALIASES = {
     "hires": "braille",
     "2x": "braille",
 }
-VIS_MODE = os.environ.get("AC_UI_VIS", "bars").strip().lower()
-VIS_MODE = VIS_MODE_ALIASES.get(VIS_MODE, VIS_MODE)
-if VIS_MODE not in VIS_MODES:
-    VIS_MODE = "bars"
+
+def normalize_vis_mode(value, default="bars"):
+    mode = str(value or "").strip().lower()
+    mode = VIS_MODE_ALIASES.get(mode, mode)
+    return mode if mode in VIS_MODES else default
+
+VIS_MODE = normalize_vis_mode(os.environ.get("AC_UI_VIS", "bars"), default="bars")
 VIS_BAR_BLOCKS = (" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
 VIS_SHADE_BLOCKS = (" ", "░", "▒", "▓", "█")
 VIS_PEAK_GLYPHS = ("⎺", "⎻", "⎼", "⎽")
@@ -254,11 +300,21 @@ SYM_VOL_DN   = "▼"
 SYM_NOTE     = "♪"
 SYM_ELLIPSIS = "…"
 SUPERSCRIPT  = ("⁰", "¹", "²", "³", "⁴", "⁵", "⁶", "⁷", "⁸", "⁹")
-CONTROL_TEXT = "Controls: [n]ext  [T]une  [E]Q  [t/R]vis  [m]ute  [q]uit  [s]ink  [?]help  [+/-]vol  [PgUp/Dn]vol±10  [g]ame  [v]ariant"
-CONTROL_TEXT_TINY = "n next  T tune  E eq  t/R vis  m mute  q quit  s sink  ? help  +/- vol"
+CONTROL_GROUPS_FULL = (
+    "[n]ext", "[T]une", "[E]Q", "[t/R]vis", "[m/space]mute", "[q]uit",
+    "[s]ink", "[?]help", "[+/-]vol", "[PgUp/Dn]vol±10", "[g]ame", "[v]ariant",
+)
+CONTROL_GROUPS_COMPACT = (
+    "[n]ext", "[T]une", "[E]Q", "[t/R]vis", "[m]ute", "[q]uit",
+    "[s]ink", "[?]help", "[+/-]vol", "[g]ame", "[v]ariant",
+)
+CONTROL_GROUPS_CORE = (
+    "[n]ext", "[T]une", "[E]Q", "[m]ute", "[q]uit", "[+/-]vol", "[g]ame", "[v]ariant",
+)
+CONTROL_GROUPS_MINI = ("[n]ext", "[m]ute", "[q]uit", "[+/-]vol")
 HELP_LINES_BASE = [
     "Help",
-    f"{SYM_ARROW_R} [n]ext track   [m]ute   [T]own tune   [q]uit",
+    f"{SYM_ARROW_R} [n]ext track   [m]/[space] mute   [T]own tune   [q]uit",
     f"[g] cycle game   [v] cycle variant   [8] background mode",
     f"[h] simulate hour   [t] vis next   [R] vis random   [E] EQ   [s] sink",
     f"[+/-] volume ±5   [PgUp/Dn] volume ±10   [?] toggle help",
@@ -434,6 +490,7 @@ TRACK_LIST_CACHE = {}
 def parse_cli_args(argv):
     mode = "run"
     games = None
+    vis_mode = None
     import_paths = []
     tune_action = None
     layout_opts = None
@@ -449,7 +506,7 @@ def parse_cli_args(argv):
             print("  ac-ui layout-sweep")
             print()
             print("Keys (in-app):")
-            print("  n  next track    m  mute     T  town tune   E  EQ editor")
+            print("  n  next track    m/space  mute   T  town tune   E  EQ editor")
             print("  g  cycle game    v  variant   t  vis next   R  vis random")
             print("  h  simulate hour change       s  audio sink")
             print("  +/-  volume ±5   PgUp/Dn volume ±10")
@@ -457,7 +514,7 @@ def parse_cli_args(argv):
             print()
             print(f"Vis modes: {', '.join(VIS_MODES)}")
             print()
-            print("Env vars: AC_UI_MUSIC_DIR, AC_UI_VIS, AC_UI_REFRESH,")
+            print("Env vars: AC_UI_MUSIC_DIR, AC_UI_MPV, AC_UI_VIS, AC_UI_REFRESH,")
             print("          AC_UI_CAVA_SOURCE, AC_UI_EQ_PATH, AC_UI_STATS")
             sys.exit(0)
         if arg == "import":
@@ -491,10 +548,17 @@ def parse_cli_args(argv):
         elif arg == "--games" and i + 1 < len(argv):
             games = argv[i + 1]
             i += 1
+        elif arg.startswith("--vis="):
+            vis_mode = arg.split("=", 1)[1]
+        elif arg == "--vis" and i + 1 < len(argv):
+            vis_mode = argv[i + 1]
+            i += 1
         i += 1
     if games:
         games = {g.strip().upper() for g in games.split(",") if g.strip()}
-    return mode, games, import_paths, tune_action, layout_opts
+    if vis_mode is not None:
+        vis_mode = normalize_vis_mode(vis_mode, default=VIS_MODE)
+    return mode, games, vis_mode, import_paths, tune_action, layout_opts
 
 def parse_filename(name):
     m = FILENAME_RE.match(name)
@@ -527,11 +591,18 @@ def _scan_hour_tracks(hour):
     if cached and cached["sig"] == sig:
         return cached["entries"]
     entries = []
-    for name in os.listdir(d):
+    try:
+        names = os.listdir(d)
+    except OSError:
+        TRACK_LIST_CACHE.pop(hour, None)
+        return ()
+    for name in names:
         lower = name.lower()
         if not (lower.endswith(".mp3") or lower.endswith(".flac")):
             continue
         meta = parse_filename(name)
+        if meta is None:
+            continue
         entries.append((name, meta, os.path.join(d, name)))
     entries.sort(key=lambda item: item[0])
     entries = tuple(entries)
@@ -655,17 +726,14 @@ def load_town_tune():
 def save_town_tune(notes):
     notes = normalize_town_tune(notes)
     values = town_tune_tokens_to_values(notes)
-    os.makedirs(os.path.dirname(TOWN_TUNE_PATH), exist_ok=True)
-    with open(TOWN_TUNE_PATH, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "notes": notes,
-                "values": values,
-                "packed": f"0x{pack_town_tune_values(values):016X}",
-            },
-            f,
-            indent=2,
-        )
+    _atomic_write_json(
+        TOWN_TUNE_PATH,
+        {
+            "notes": notes,
+            "values": values,
+            "packed": f"0x{pack_town_tune_values(values):016X}",
+        },
+    )
     return notes
 
 def load_stats():
@@ -687,12 +755,28 @@ def load_stats():
     hb = data.get("hour_buckets")
     if not isinstance(hb, list) or len(hb) != 24:
         data["hour_buckets"] = [0] * 24
+    else:
+        norm = []
+        for value in hb[:24]:
+            try:
+                norm.append(max(0, int(value)))
+            except Exception:
+                norm.append(0)
+        data["hour_buckets"] = norm
+    try:
+        data["total_listen_seconds"] = max(0, int(data.get("total_listen_seconds", 0)))
+    except Exception:
+        data["total_listen_seconds"] = 0
+    try:
+        data["sessions"] = max(0, int(data.get("sessions", 0)))
+    except Exception:
+        data["sessions"] = 0
+    if not isinstance(data.get("last_session"), dict):
+        data["last_session"] = None
     return data
 
 def save_stats(data):
-    os.makedirs(STATS_DIR, exist_ok=True)
-    with open(STATS_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(STATS_JSON, data)
 
 def load_ui_state():
     data = {
@@ -712,31 +796,33 @@ def load_ui_state():
     except Exception:
         pass
     try:
-        data["output_vol"] = int(max(0, min(100, data.get("output_vol", 75))))
+        data["output_vol"] = max(0, min(100, int(data.get("output_vol", 75))))
     except Exception:
         data["output_vol"] = 75
-    data["muted"] = bool(data.get("muted", False))
+    data["muted"] = coerce_bool(data.get("muted", False), False)
     try:
-        data["mute_prev_vol"] = int(max(0, min(100, data.get("mute_prev_vol", data["output_vol"]))))
+        data["mute_prev_vol"] = max(0, min(100, int(data.get("mute_prev_vol", data["output_vol"]))))
     except Exception:
         data["mute_prev_vol"] = data["output_vol"]
-    if data.get("vis_mode") not in VIS_MODES:
-        data["vis_mode"] = VIS_MODE
-    if not isinstance(data.get("game"), str):
+    data["vis_mode"] = normalize_vis_mode(data.get("vis_mode"), default=VIS_MODE)
+    if isinstance(data.get("game"), str) and data["game"].strip():
+        data["game"] = data["game"].strip().upper()
+    else:
         data["game"] = "ALL"
-    if not isinstance(data.get("variant"), str):
+    if isinstance(data.get("variant"), str) and data["variant"].strip():
+        variant = data["variant"].strip().lower()
+        data["variant"] = "ALL" if variant == "all" else variant
+    else:
         data["variant"] = "ALL"
     return data
 
 def save_ui_state(data):
-    os.makedirs(os.path.dirname(UI_STATE_PATH), exist_ok=True)
-    with open(UI_STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(UI_STATE_PATH, data)
 
 def append_stats_csv(row):
     os.makedirs(STATS_DIR, exist_ok=True)
     new_file = not os.path.exists(STATS_CSV)
-    with open(STATS_CSV, "a", encoding="utf-8") as f:
+    with open(STATS_CSV, "a", encoding="utf-8", newline="") as f:
         if new_file:
             f.write("session_start,session_end,listen_seconds,top_hours\n")
         f.write(row + "\n")
@@ -824,18 +910,15 @@ def build_layout_preview(term_cols, term_rows):
     session_listen = 16
 
     # Layout sizing (mirror main loop logic)
-    layout_mode = "normal"
-    if term_cols < 58 or term_rows < 18:
-        layout_mode = "tiny"
-    elif term_cols < 78 or term_rows < 22:
-        layout_mode = "small"
-
+    layout_mode = layout_mode_for_size(term_cols, term_rows)
     tiny_term = layout_mode == "tiny"
     small_term = layout_mode in ("tiny", "small")
     ultra_compact = term_rows < 10
     info_max_width = max(10, term_cols - 5)
-    min_spectrum_rows = 6
-    base_spectrum = 3 if ultra_compact else 4 if tiny_term else 6 if small_term else CAVA_HEIGHT
+    footer_lines, footer_sep = build_footer_controls(term_cols, term_rows, tiny_term=tiny_term, ultra_compact=ultra_compact)
+    footer_rows = len(footer_lines) + (1 if footer_sep else 0)
+    min_spectrum_rows = layout_min_spectrum_rows(term_rows, layout_mode)
+    base_spectrum = layout_base_spectrum_rows(layout_mode, ultra_compact)
     spectrum_height = max(min_spectrum_rows, base_spectrum)
 
     lines = []
@@ -849,10 +932,16 @@ def build_layout_preview(term_cols, term_rows):
     tline = f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
     lines.append(c(tline, "2"))
 
-    max_info_rows = term_rows - min_spectrum_rows - 1 - 1 - 2
+    max_info_rows = term_rows - min_spectrum_rows - footer_rows - 1 - 2
     compact_info = max_info_rows < 10 or term_cols < 70 or ultra_compact
 
-    if not ultra_compact:
+    if ultra_compact:
+        summary = truncate_plain(
+            build_ultra_compact_summary("ALL", "ALL", VIS_MODES[vis_idx], remaining, output_vol, muted, showing_chime, chime_kind),
+            max(10, term_cols - 2),
+        )
+        lines.append(c(summary, "2"))
+    else:
         if (not compact_info):
             title = ["AC-UI"]
             _art_col = gradient_at(_active_tod_grad, 70)
@@ -897,7 +986,7 @@ def build_layout_preview(term_cols, term_rows):
         elif len(info_plain) > max_info_rows:
             info_plain = info_plain[:max_info_rows]
             info = info[:max_info_rows]
-        if info_plain and (not (compact_info)):
+        if info_plain:
             info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
             info_w_cache = min(info_max_width, info_w_needed)
             info_box, info_w = build_box(info_plain, info, info_w_cache, title="Now Playing")
@@ -935,7 +1024,7 @@ def build_layout_preview(term_cols, term_rows):
             rows_needed = len(info_box)
         elif stats_box:
             rows_needed = len(stats_box)
-        available = term_rows - min_spectrum_rows - 1 - len(lines)
+        available = term_rows - min_spectrum_rows - footer_rows - 1 - len(lines)
         if rows_needed > available:
             stats_box = None
             side_by_side = False
@@ -1019,7 +1108,7 @@ def build_layout_preview(term_cols, term_rows):
         panel_height = len(up_box)
     else:
         panel_height = 0
-    if panel_height and (len(lines) + panel_height + min_spectrum_rows + 1 > term_rows):
+    if panel_height and (len(lines) + panel_height + min_spectrum_rows + footer_rows + 1 > term_rows):
         hist_box = None
         up_box = None
 
@@ -1039,19 +1128,29 @@ def build_layout_preview(term_cols, term_rows):
     elif up_box:
         lines.extend(up_box)
 
-    while lines and lines[-1].strip() == "" and (len(lines) + min_spectrum_rows + 1 > term_rows):
+    while lines and lines[-1].strip() == "" and (len(lines) + min_spectrum_rows + footer_rows + 1 > term_rows):
         lines.pop()
 
     prefix = "  "
     rows_used = len(lines)
-    available_rows = max(0, term_rows - rows_used - 1)
+    available_rows = max(0, term_rows - rows_used - 1 - footer_rows)
     spectrum_height_dyn = min(spectrum_height, max(0, available_rows))
     bars_len = max(10, term_cols - len(prefix) - CAVA_MARGIN)
     mock_bars = [((i % 7) + 1) / 8 for i in range(max(CAVA_MIN_BARS, bars_len))]
     if spectrum_height_dyn > 0:
         bars = mock_bars[:bars_len]
         lines.extend([prefix + ln for ln in spectrum_lines(bars, height=spectrum_height_dyn, use_color=False, mode="bars")])
-        lines.append(prefix + ("-" * bars_len))
+        _div_label = f" {VIS_MODES[vis_idx]} "
+        _div_pad = max(0, bars_len - plain_visible_len(_div_label) - 2)
+        _div_l = _div_pad // 2
+        _div_r = _div_pad - _div_l
+        lines.append(prefix + ("-" * _div_l) + _div_label + ("-" * _div_r))
+    if footer_sep and len(lines) < term_rows:
+        lines.append("-" * max(1, term_cols - 1))
+    for footer_line in footer_lines:
+        if len(lines) >= term_rows:
+            break
+        lines.append(truncate_plain(footer_line, max(1, term_cols - 1)))
 
     if len(lines) < term_rows:
         lines.extend([""] * (term_rows - len(lines)))
@@ -1061,12 +1160,16 @@ def build_layout_preview(term_cols, term_rows):
 
 def layout_sweep_cli(opts=None):
     opts = opts or {}
-    min_rows = _int_opt(opts, "min_rows", 10)
-    max_rows = _int_opt(opts, "max_rows", 40)
-    min_cols = _int_opt(opts, "min_cols", 60)
-    max_cols = _int_opt(opts, "max_cols", 190)
-    step_rows = _int_opt(opts, "step_rows", 1)
-    step_cols = _int_opt(opts, "step_cols", 1)
+    min_rows = max(1, _int_opt(opts, "min_rows", 10))
+    max_rows = max(1, _int_opt(opts, "max_rows", 40))
+    min_cols = max(1, _int_opt(opts, "min_cols", 60))
+    max_cols = max(1, _int_opt(opts, "max_cols", 190))
+    step_rows = max(1, _int_opt(opts, "step_rows", 1))
+    step_cols = max(1, _int_opt(opts, "step_cols", 1))
+    if min_rows > max_rows:
+        min_rows, max_rows = max_rows, min_rows
+    if min_cols > max_cols:
+        min_cols, max_cols = max_cols, min_cols
     out_dir = os.path.expanduser(_str_opt(opts, "out", "~/.local/share/ac-terminal-radio/layout_sweep"))
     os.makedirs(out_dir, exist_ok=True)
     count = 0
@@ -1201,7 +1304,8 @@ def _pad_pcm_segment(segment, wanted_bytes, frame_size):
 def _run_acgc_audio_dump(args, path, timeout):
     if not ACGC_TOWN_TUNE_RENDER:
         return False
-    if not ACGC_TOWN_TUNE_DUMPER or not os.path.exists(ACGC_TOWN_TUNE_DUMPER):
+    dumper = _resolve_command_path(ACGC_TOWN_TUNE_DUMPER)
+    if not dumper:
         return False
 
     asset_root = ACGC_TOWN_TUNE_ASSET_ROOT
@@ -1222,10 +1326,10 @@ def _run_acgc_audio_dump(args, path, timeout):
     env.setdefault("SDL_VIDEODRIVER", "dummy")
     if use_assets:
         env.pop("ACGC_DISC_PATH", None)
-        cmd = [ACGC_TOWN_TUNE_DUMPER] + list(args)
+        cmd = [dumper] + list(args)
         cwd = asset_root
     else:
-        cmd = [ACGC_TOWN_TUNE_DUMPER, "--disc", ACGC_TOWN_TUNE_DISC] + list(args)
+        cmd = [dumper, "--disc", ACGC_TOWN_TUNE_DISC] + list(args)
         cwd = None
     try:
         result = subprocess.run(
@@ -1269,8 +1373,8 @@ def _resolve_town_tune_audition_note(tok, notes=None, cursor=None):
         return random.choice(TOWN_TUNE_NOTES)
     if tok != TOWN_TUNE_HOLD or not notes or cursor is None:
         return None
-    for offset in range(1, TOWN_TUNE_STEPS + 1):
-        prev = _coerce_tune_token(notes[(cursor - offset) % TOWN_TUNE_STEPS])
+    for prev_idx in range(int(cursor) - 1, -1, -1):
+        prev = _coerce_tune_token(notes[prev_idx])
         if prev in TOWN_TUNE_NOTES:
             return prev
         if prev == TOWN_TUNE_RANDOM:
@@ -1373,6 +1477,17 @@ def _spawn_audio_file(path, audio_device=None):
     cmd.append(path)
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def _wait_for_ipc_socket(ipc_path, timeout=0.75):
+    deadline = time.monotonic() + max(0.05, timeout)
+    while time.monotonic() < deadline:
+        try:
+            if ipc_path and os.path.exists(ipc_path):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.02)
+    return False
+
 def spawn_town_tune(audio_device=None, notes=None):
     if not TOWN_TUNE_ENABLED:
         return None, None
@@ -1424,6 +1539,9 @@ def town_tune_cli(action=None):
         print(f"Reset to ACGC default town tune: 0x{pack_town_tune_values(values):016X}")
         return 0
     if action in ("play", "preview"):
+        if not _resolve_command_path(MPV):
+            print(f"Required player not found: {MPV}")
+            return 1
         tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".wav", delete=False)
         tmp.close()
         try:
@@ -1461,7 +1579,7 @@ def town_tune_cli(action=None):
     print(f"Saved to {TOWN_TUNE_PATH}")
     return 0
 
-def collect_catalog():
+def collect_catalog(allowed_games=None, allowed_variants=None):
     games = set()
     variants = set()
     if not os.path.isdir(MUSIC_DIR):
@@ -1469,6 +1587,10 @@ def collect_catalog():
     for hour in range(24):
         for _name, meta, _path in _scan_hour_tracks(hour):
             if not meta:
+                continue
+            if allowed_games and meta["game"] not in allowed_games:
+                continue
+            if allowed_variants and meta["variant"] not in allowed_variants:
                 continue
             games.add(meta["game"])
             variants.add(meta["variant"])
@@ -1548,9 +1670,13 @@ def list_tracks_for_hour(hour: int, allowed_games=None, allowed_variants=None):
         tracks.append(path)
     return tracks
 
-def pick_weighted(tracks):
+def pick_weighted(tracks, exclude=None):
     if not tracks:
         return None
+    if exclude:
+        filtered = [track for track in tracks if track != exclude]
+        if filtered:
+            tracks = filtered
     pool = []
     for t in tracks:
         pool.append(t)
@@ -2132,7 +2258,10 @@ def matrix_rain_lines(bars, height, width, state, use_color=True, game_tag=None)
     if height <= 0 or width <= 0 or not bars:
         return [" " * max(1, width)] * max(1, height)
 
-    n = len(bars)
+    # Each column occupies 2 terminal cells (char + gap), so resample to width//2 streams.
+    # This ensures the rendered output fills exactly `width` columns.
+    n_cols = max(1, (width + 1) // 2)
+    sampled = resample_bars(bars, n_cols)
     frame = state.get("frame", 0)
     state["frame"] = frame + 1
     chars = MATRIX_RAIN_CHARS
@@ -2142,43 +2271,42 @@ def matrix_rain_lines(bars, height, width, state, use_color=True, game_tag=None)
     for row in range(height):
         row_parts = []
         col = 0
-        for b in range(n):
-            energy = bars[b]
-            seed = col * 7919 + 104729
-            if _scatter_hash(b, 0, col, frame // 20) > energy * 1.5 + 0.1:
+        for b in range(n_cols):
+            energy = sampled[b]
+            seed = b * 7919 + 104729
+            if _scatter_hash(b, 0, b, frame // 20) > energy * 1.5 + 0.1:
                 row_parts.append(" ")
                 col += 1
-                continue
-            speed = 2 + int(seed % 3)
-            trail_len = 3 + int((seed // 7) % 3)
-            cycle_len = height + trail_len + 4
-            offset = int((seed // 13) % cycle_len)
-            pos = (frame // speed + offset) % cycle_len
-            dist = pos - row
-            if dist < 0 or dist > trail_len:
-                row_parts.append(" ")
             else:
-                char_seed = seed ^ (row * 31 + (frame // 4) * 17)
-                ch = chars[char_seed % n_chars]
-                if use_color:
-                    if dist == 0:
-                        color = 255
-                    elif dist <= 2:
-                        color = 118 if (game_tag and game_tag != "ALL") else gradient_at(_active_tod_grad, 70)
-                    else:
-                        color = 34 if (game_tag and game_tag != "ALL") else gradient_at(_active_tod_grad, 20)
-                    row_parts.append(c256(ch, color))
+                speed = 2 + int(seed % 3)
+                trail_len = 3 + int((seed // 7) % 3)
+                cycle_len = height + trail_len + 4
+                offset = int((seed // 13) % cycle_len)
+                pos = (frame // speed + offset) % cycle_len
+                dist = pos - row
+                if dist < 0 or dist > trail_len:
+                    row_parts.append(" ")
                 else:
-                    row_parts.append(ch)
-            col += 1
-            if b < n - 1:
+                    char_seed = seed ^ (row * 31 + (frame // 4) * 17)
+                    ch = chars[char_seed % n_chars]
+                    if use_color:
+                        if dist == 0:
+                            color = 255
+                        elif dist <= 2:
+                            color = 118 if (game_tag and game_tag != "ALL") else gradient_at(_active_tod_grad, 70)
+                        else:
+                            color = 34 if (game_tag and game_tag != "ALL") else gradient_at(_active_tod_grad, 20)
+                        row_parts.append(c256(ch, color))
+                    else:
+                        row_parts.append(ch)
+                col += 1
+            if b < n_cols - 1:
                 row_parts.append(" ")
                 col += 1
+        # col now tracks visible width accurately; pad to fill any remainder
         line = "".join(row_parts)
-        if len(line) < width:
-            line += " " * (width - len(line))
-        elif len(line) > width:
-            line = line[:width]
+        if col < width:
+            line += " " * (width - col)
         lines_out.append(line)
     return lines_out
 
@@ -2349,6 +2477,160 @@ def wrap_plain(text, width):
         return [text]
     return textwrap.wrap(text, width=width, break_long_words=True, replace_whitespace=False)
 
+def layout_mode_for_size(term_cols, term_rows):
+    if term_cols < 58 or term_rows < 18:
+        return "tiny"
+    if term_cols < 78 or term_rows < 22:
+        return "small"
+    return "normal"
+
+def layout_min_spectrum_rows(term_rows, layout_mode):
+    if term_rows < 5:
+        return 1
+    if term_rows < 10:
+        return 3
+    if term_rows < 14:
+        return 4
+    if layout_mode == "tiny":
+        return 4
+    if layout_mode == "small":
+        return 5
+    return 6
+
+def layout_base_spectrum_rows(layout_mode, ultra_compact):
+    if ultra_compact:
+        return 3
+    if layout_mode == "tiny":
+        return 4
+    if layout_mode == "small":
+        return 5
+    return CAVA_HEIGHT
+
+def wrap_grouped_items(groups, width, prefix="", gap="  ", max_lines=2, indent=None):
+    if width <= 0 or not groups:
+        return []
+    if indent is None:
+        indent = " " * plain_visible_len(prefix)
+    lines = []
+    current_prefix = prefix
+    current_items = []
+    current_len = plain_visible_len(current_prefix)
+    gap_len = plain_visible_len(gap)
+
+    for group in groups:
+        group_len = plain_visible_len(group)
+        if group_len > width:
+            return None
+        next_len = current_len + (gap_len if current_items else 0) + group_len
+        if current_items and next_len > width:
+            lines.append(current_prefix + gap.join(current_items))
+            if len(lines) >= max_lines:
+                return None
+            current_prefix = indent
+            current_items = [group]
+            current_len = plain_visible_len(current_prefix) + group_len
+            if current_len > width:
+                return None
+        else:
+            current_items.append(group)
+            current_len = next_len
+    if current_items:
+        lines.append(current_prefix + gap.join(current_items))
+    return lines if len(lines) <= max_lines else None
+
+def build_footer_controls(term_cols, term_rows, tiny_term=False, ultra_compact=False):
+    width = max(1, term_cols - 1)
+    if ultra_compact or term_rows < 8 or width < 18:
+        return [], False
+    max_lines = 1 if term_rows < 16 else 2
+    show_separator = USE_COLOR and term_rows >= 18
+    candidates = []
+    if tiny_term or term_cols < 80:
+        candidates.extend([
+            ("Controls: ", CONTROL_GROUPS_COMPACT),
+            ("Controls: ", CONTROL_GROUPS_CORE),
+            ("", CONTROL_GROUPS_COMPACT),
+            ("", CONTROL_GROUPS_CORE),
+            ("Controls: ", CONTROL_GROUPS_MINI),
+            ("", CONTROL_GROUPS_MINI),
+        ])
+    else:
+        candidates.extend([
+            ("Controls: ", CONTROL_GROUPS_FULL),
+            ("Controls: ", CONTROL_GROUPS_COMPACT),
+            ("Controls: ", CONTROL_GROUPS_CORE),
+            ("", CONTROL_GROUPS_COMPACT),
+            ("", CONTROL_GROUPS_CORE),
+            ("Controls: ", CONTROL_GROUPS_MINI),
+        ])
+    for prefix, groups in candidates:
+        lines = wrap_grouped_items(groups, width, prefix=prefix, max_lines=max_lines)
+        if lines:
+            return lines, show_separator
+    fallback = truncate_plain("n next  q quit  +/- vol", width)
+    return ([fallback] if fallback else []), False
+
+def colorize_hint_keys(text, key_color, base_code="2", bold=True):
+    if not USE_COLOR:
+        return text
+    key_seq = f"\x1b[1;38;5;{key_color}m" if bold else f"\x1b[38;5;{key_color}m"
+    base_seq = f"\x1b[{base_code}m" if base_code else ""
+    colored = re.sub(
+        r"\[([^\]]+)\]",
+        lambda m: f"{key_seq}[{m.group(1)}]\x1b[0m{base_seq}",
+        text,
+    )
+    return f"{base_seq}{colored}\x1b[0m"
+
+def format_filter_summary(game_label, variant_label):
+    if game_label == "ALL" and variant_label == "ALL":
+        return "ALL"
+    if variant_label == "ALL":
+        return game_label
+    if game_label == "ALL":
+        return variant_label
+    return f"{game_label}/{variant_label}"
+
+def build_ultra_compact_summary(game_label, variant_label, vis_mode, remaining, display_vol=None, muted=False, showing_chime=False, chime_kind=None):
+    lead = (chime_kind or "hour chime") if showing_chime else format_filter_summary(game_label, variant_label)
+    parts = [lead, vis_mode, f"{remaining//60:02d}:{remaining%60:02d}"]
+    if display_vol is not None:
+        vol_text = f"{int(display_vol)}%"
+        if muted:
+            vol_text += " muted"
+        parts.append(vol_text)
+    elif muted:
+        parts.append("muted")
+    return "  ".join(parts)
+
+def format_visualizer_status(detail=None, label=None, waiting=False, max_width=None):
+    source = str(label or "").strip() or None
+    if waiting:
+        summary = f"waiting for {source} audio" if source else "waiting for audio"
+    else:
+        raw = str(detail or "").strip()
+        lower = raw.lower()
+        via_match = re.search(r"\bvia ([^:]+)", raw, flags=re.IGNORECASE)
+        if via_match and not source:
+            source = via_match.group(1).strip()
+        if lower == "cava not installed":
+            summary = "visualizer unavailable: cava missing"
+        elif lower.startswith("config error:"):
+            summary = "visualizer config error"
+        elif lower.startswith("start error:"):
+            summary = "visualizer start error"
+        elif "audio thread exited unexpectedly" in lower:
+            summary = "visualizer lost audio"
+        elif lower.startswith("cava exited"):
+            code_match = re.search(r"cava exited \(([^)]+)\)", raw, flags=re.IGNORECASE)
+            summary = f"visualizer exited ({code_match.group(1)})" if code_match else "visualizer exited"
+        else:
+            summary = raw or "visualizer idle"
+        if source and source not in summary:
+            summary += f" via {source}"
+    rendered = f"({summary})"
+    return truncate_plain(rendered, max_width) if max_width is not None else rendered
+
 def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=None):
     """
     Btop-style Unicode box with rounded corners, spinning highlight, and optional
@@ -2398,18 +2680,21 @@ def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=N
         + bc(BOX_CHARS["tr"], border_index(0, width - 1))
     )
     # Inject centered title into top border (btop ┤ Title ├ pattern)
-    if title and USE_COLOR:
+    if title:
         t_plain = f" {title} "
         t_vis = plain_visible_len(t_plain)
         title_block_vis = t_vis + 2
         if title_block_vis <= inner_w:
             insert = (inner_w - title_block_vis) // 2 + 1  # offset into border string
             _t_col = gradient_at(_active_tod_grad, 90)
-            t_colored = (
-                c256(BOX_TITLE_L, hilite)
-                + f"\x1b[1;38;5;{_t_col}m{t_plain}\x1b[0m"
-                + c256(BOX_TITLE_R, hilite)
-            )
+            if USE_COLOR:
+                t_colored = (
+                    c256(BOX_TITLE_L, hilite)
+                    + f"\x1b[1;38;5;{_t_col}m{t_plain}\x1b[0m"
+                    + c256(BOX_TITLE_R, hilite)
+                )
+            else:
+                t_colored = BOX_TITLE_L + t_plain + BOX_TITLE_R
             # Rebuild top stripping ansi for position counting
             top_plain_raw = BOX_CHARS["tl"] + BOX_CHARS["h"] * inner_w + BOX_CHARS["tr"]
             left_seg  = "".join(bc(ch, border_index(0, c)) for c, ch in enumerate(top_plain_raw[:insert]))
@@ -2432,18 +2717,21 @@ def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=N
         + "".join(bc(BOX_CHARS["h"], border_index(height - 1, c)) for c in range(1, width - 1))
         + bc(BOX_CHARS["br"], border_index(height - 1, width - 1))
     )
-    if title2 and USE_COLOR:
+    if title2:
         t_plain = f" {title2} "
         t_vis = plain_visible_len(t_plain)
         title_block_vis = t_vis + 2
         if title_block_vis <= inner_w:
             insert = (inner_w - title_block_vis) // 2 + 1
             _t2_col = gradient_at(_active_tod_grad, 65)
-            t_colored = (
-                c256(BOX_TITLE_L, hilite)
-                + f"\x1b[2;38;5;{_t2_col}m{t_plain}\x1b[0m"
-                + c256(BOX_TITLE_R, hilite)
-            )
+            if USE_COLOR:
+                t_colored = (
+                    c256(BOX_TITLE_L, hilite)
+                    + f"\x1b[2;38;5;{_t2_col}m{t_plain}\x1b[0m"
+                    + c256(BOX_TITLE_R, hilite)
+                )
+            else:
+                t_colored = BOX_TITLE_L + t_plain + BOX_TITLE_R
             bot_plain_raw = BOX_CHARS["bl"] + BOX_CHARS["h"] * inner_w + BOX_CHARS["br"]
             left_seg  = "".join(bc(ch, border_index(height-1, c)) for c, ch in enumerate(bot_plain_raw[:insert]))
             right_seg = "".join(bc(ch, border_index(height-1, c)) for c, ch in enumerate(bot_plain_raw[insert + title_block_vis:], start=insert + title_block_vis))
@@ -2496,8 +2784,7 @@ def cava_config_text(bars, input_method=None, input_source=None):
 def calc_cava_bars():
     cols = shutil.get_terminal_size(fallback=(80, 24)).columns
     bars = max(CAVA_MIN_BARS, cols - CAVA_MARGIN)
-    # cava rejects odd bar counts for stereo monitor sources.
-    if bars % 2:
+    if CAVA_CHANNELS == "stereo" and bars % 2:
         bars -= 1
     return bars
 
@@ -2753,7 +3040,9 @@ def reload_loopback(loopback_module_id, sink_name, target_sink):
         ).strip()
     except Exception:
         new_id = None
-    return new_id or loopback_module_id, target_sink
+    if not new_id:
+        return None, None
+    return new_id, target_sink
 
 def setup_private_sink(output_sink=None, sink_name=None):
     if not shutil.which("pactl"):
@@ -2823,7 +3112,7 @@ def detect_cava_input():
     # Prefer PulseAudio compat when pactl is available (works with PipeWire too)
     method = "pulse" if shutil.which("pactl") else None
     source = None
-    if method and shutil.which("pactl"):
+    if method:
         try:
             out = subprocess.check_output(["pactl", "info"], text=True)
             for line in out.splitlines():
@@ -2919,17 +3208,6 @@ def mpv_start(track, ipc_path, audio_device=None, volume=None):
         cmd.append(f"--volume={int(max(0, min(100, volume)))}")
     cmd.append(track)
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def mpv_ipc(ipc_path, command_dict):
-    # Send JSON command to mpv IPC; return response dict (or None)
-    try:
-        with open(ipc_path, "w") as f:
-            f.write(json.dumps(command_dict) + "\n")
-        # mpv replies on the same socket only if you use a real unix socket bidirectional.
-        # Writing-only is enough for "set_property"/"quit". For querying, we open as read/write via socket.
-        return None
-    except Exception:
-        return None
 
 def mpv_command(ipc_path, command):
     # Send a command via unix socket (best-effort)
@@ -3040,27 +3318,24 @@ def load_eq_bands():
     path = EQ_CONFIG_PATH
     try:
         if os.path.isfile(path):
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and isinstance(data.get("bands"), list):
-                return normalize_eq_bands(data["bands"])
+                return normalize_eq_bands(data["bands"]), data.get("preset")
             if isinstance(data, list):
-                return normalize_eq_bands(data)
+                return normalize_eq_bands(data), None
     except Exception:
         pass
-    return default_eq_bands()
+    return default_eq_bands(), "flat"
 
 
 def save_eq_bands(bands, preset_name=None):
     path = EQ_CONFIG_PATH
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {"bands": normalize_eq_bands(bands)}
         if preset_name:
             payload["preset"] = preset_name
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(path, payload)
         return True
     except Exception:
         return False
@@ -3082,7 +3357,7 @@ def apply_mpv_eq(ipc_path, bands=None):
             return False
     except Exception:
         return False
-    resolved = normalize_eq_bands(bands if bands is not None else load_eq_bands())
+    resolved = normalize_eq_bands(bands if bands is not None else load_eq_bands()[0])
     if all(b == 0.0 for b in resolved):
         mpv_command(ipc_path, ["af", "remove", "@acui-eq"])
         return True
@@ -3093,9 +3368,13 @@ def apply_mpv_eq(ipc_path, bands=None):
 
 def run_eq_editor(audio_device=None, ipc_getter=None):
     """Full-screen 10-band EQ editor (press E). Live-updates mpv via IPC."""
-    bands = load_eq_bands()
+    bands, saved_preset = load_eq_bands()
     preset_names = list(EQ_PRESETS.keys())
-    preset_idx = 0
+    # Restore the preset cursor to wherever the user last saved
+    if saved_preset and saved_preset in preset_names:
+        preset_idx = preset_names.index(saved_preset)
+    else:
+        preset_idx = 0
     cursor = 0
     status = None
     last_lines = None
@@ -3125,19 +3404,41 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
             lines = []
             lines.append(c("10-BAND EQ", "36"))
             lines.append(c(f"Preset: {preset_names[preset_idx]}   Band: {EQ_FREQ_LABELS[cursor]} Hz   Gain: {bands[cursor]:+.1f} dB", "33"))
-            lines.append("")
-            row = []
+            token_groups = []
             for i, label in enumerate(EQ_FREQ_LABELS):
                 gain = bands[i]
                 if i == cursor:
-                    row.append(c(f"[{label}:{gain:+.0f}]", "1;32"))
-                elif gain != 0.0:
-                    row.append(c(f" {label}:{gain:+.0f} ", "36"))
+                    token_groups.append(f"[{label}:{gain:+.0f}]")
                 else:
-                    row.append(f" {label}: 0 ")
-            lines.append("".join(row))
-            lines.append("")
-            lines.append(c("←/→ band   ↑/↓ or +/-  ±1 dB   p preset   r flat   s save   q done", "33"))
+                    token_groups.append(f"{label}:{gain:+.0f}")
+            token_lines = wrap_grouped_items(token_groups, max(12, term_cols - 2), max_lines=max(2, term_rows))
+            if token_lines:
+                if term_rows >= 10:
+                    lines.append("")
+                lines.extend([c(token_line, "36") for token_line in token_lines])
+            control_width = max(12, term_cols - 1)
+            control_lines = None
+            for groups in (
+                (
+                    "[←/→]band", "[↑/↓]±1dB", "[PgUp/Dn]±3dB",
+                    "[p]reset", "[r]flat", "[s]ave", "[q]done",
+                ),
+                ("[←/→]band", "[+/-]gain", "[p]preset", "[r]flat", "[s]ave", "[q]done"),
+                ("[←/→]band", "[+/-]gain", "[q]done"),
+            ):
+                control_lines = wrap_grouped_items(
+                    groups,
+                    control_width,
+                    max_lines=(2 if term_rows >= 9 else 1),
+                )
+                if control_lines:
+                    break
+            if not control_lines:
+                control_lines = [truncate_plain("←/→ band  +/- gain  q done", control_width)]
+            if term_rows >= 10:
+                lines.append("")
+            for ctrl_line in control_lines:
+                lines.append(colorize_hint_keys(ctrl_line, gradient_at(_active_tod_grad, 80), base_code="33"))
             if status:
                 lines.append(c(status, "35"))
             if len(lines) < term_rows:
@@ -3162,7 +3463,7 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
 
         # ── Vertical bar graph ───────────────────────────────────────────────
         # Compute bar area: odd number of rows so center is a full row.
-        overhead = 5  # header(2) + freq-labels(1) + controls(1) + status(1)
+        overhead = 6  # header(2) + freq-labels(1) + gain-row(1) + controls(1) + status(1)
         available = max(5, term_rows - overhead)
         half_rows = max(2, min(12, (available - 1) // 2))
         bar_rows = half_rows * 2 + 1   # center row + equal halves
@@ -3253,7 +3554,10 @@ def run_eq_editor(audio_device=None, ipc_getter=None):
         lines.append(gain_row)
 
         # ── Controls ─────────────────────────────────────────────────────────
-        ctrl = "←/→ band   ↑/↓ or +/-  ±1 dB   PgUp/Dn ±3 dB   p preset   r flat   s save   q done"
+        ctrl_full = "←/→ band   ↑/↓ or +/-  ±1 dB   PgUp/Dn ±3 dB   p preset   r flat   s save   q done"
+        ctrl_short = "←/→ band  +/- ±1 dB  PgUp/Dn ±3 dB  p preset  s save  q done"
+        ctrl = ctrl_full if plain_visible_len(ctrl_full) <= term_cols - 1 else ctrl_short
+        ctrl = truncate_plain(ctrl, term_cols - 1)
         if USE_COLOR:
             _cc = gradient_at(_active_tod_grad, 60)
             lines.append(c256(ctrl, _cc))
@@ -3454,7 +3758,7 @@ def render(lines, width=None, height=None):
     # Clip each line to terminal width
     clipped = []
     for line in lines:
-        vis = len(line) if "\x1b[" not in line else visible_len(line)
+        vis = len(line) if "\x1b[" not in line and line.isascii() else visible_len(line)
         if vis >= width:
             line = truncate_ansi_visible(line, max(0, width - 1))
         clipped.append(line)
@@ -3476,7 +3780,10 @@ def render(lines, width=None, height=None):
     _render_prev_lines = clipped
 
 def _read_key(fd, timeout=0.1):
-    r, _, _ = select.select([fd], [], [], timeout)
+    try:
+        r, _, _ = select.select([fd], [], [], timeout)
+    except (InterruptedError, OSError, ValueError):
+        return None
     if not r:
         return None
     try:
@@ -3485,10 +3792,13 @@ def _read_key(fd, timeout=0.1):
         return None
     if ch != "\x1b":
         return ch
-    # Read up to 4 bytes of escape sequence
+    # Read a short escape sequence payload.
     seq = ""
-    for _ in range(4):
-        r, _, _ = select.select([fd], [], [], 0.01)
+    for _ in range(8):
+        try:
+            r, _, _ = select.select([fd], [], [], 0.01)
+        except (InterruptedError, OSError, ValueError):
+            break
         if not r:
             break
         try:
@@ -3717,16 +4027,58 @@ def _render_tune_editor(
                 row.append(cell)
             return " ".join(row)
 
-        row_w = 8 if term_cols >= 42 else 4
-        compact_w = row_w * 5 - 1
-        compact_pad = " " * max(0, (term_cols - compact_w) // 2)
         lines = []
         lines.append(c("TOWN TUNE", "36"))
-        lines.append("")
+        if modal == ACGC_MSCORE_MODAL_ERASE:
+            prompt = f"Erase all? {'Yes' if modal_idx == 0 else 'No'}"
+        elif modal == ACGC_MSCORE_MODAL_END:
+            prompt = f"Finish: {ACGC_MSCORE_END_OPTIONS[modal_idx]}"
+        elif cursor >= ACGC_MSCORE_CURSOR_OK:
+            prompt = "Cursor: OK"
+        else:
+            prompt = f"Slot {cursor + 1:02d}/16   Note: {_coerce_tune_token(notes[cursor])}"
+        lines.append(c(truncate_plain(prompt, max(10, term_cols - 1)), "33"))
+        if term_rows >= 10:
+            lines.append("")
+        row_w = max(2, min(8, max(2, (term_cols + 1) // 4)))
         for start in range(0, cell_count, row_w):
-            lines.append(compact_pad + build_row(start, row_w))
-        lines.append("")
-        lines.append(c(f"{SYM_ARROW_L}{SYM_ARROW_R} move  {SYM_ARROW_U}{SYM_ARROW_D} change note  {SYM_ENTER} confirm  B back  X play  Y erase", "33"))
+            row_text = build_row(start, row_w)
+            compact_pad = " " * max(0, (term_cols - plain_visible_len(row_text)) // 2)
+            lines.append(compact_pad + row_text)
+        control_width = max(12, term_cols - 1)
+        control_candidates = [
+            ("[←/→]move", "[↑/↓]note", "[Enter]next", "[X]play", "[Y]erase", "[B]back"),
+            ("[←/→]move", "[↑/↓]note", "[X]play", "[Y]erase", "[B]back"),
+            ("[←/→]move", "[↑/↓]note", "[X]play", "[B]back"),
+        ]
+        if term_cols >= 32:
+            control_candidates.insert(0, control_candidates[0] + ("[R]e-Reader",))
+        extra_groups = ("[O]off", "[Z/H]hold", "[?]random")
+        control_lines = None
+        for groups in control_candidates:
+            control_lines = wrap_grouped_items(
+                groups,
+                control_width,
+                max_lines=(2 if term_rows >= 10 else 1),
+            )
+            if control_lines:
+                break
+        if not control_lines:
+            control_lines = [truncate_plain("←/→ move  ↑/↓ note  X play  B back", control_width)]
+        extra_lines = wrap_grouped_items(
+            extra_groups,
+            control_width,
+            max_lines=1,
+        ) if term_rows >= 12 else []
+        if term_rows >= 10:
+            lines.append("")
+        if input_locked:
+            lines.append(c("Playing town tune...", "33"))
+        else:
+            for ctrl_line in control_lines:
+                lines.append(colorize_hint_keys(ctrl_line, gradient_at(_active_tod_grad, 80), base_code="33"))
+            for extra_line in (extra_lines or []):
+                lines.append(colorize_hint_keys(extra_line, gradient_at(_active_tod_grad, 65), base_code="33", bold=False))
         if status:
             lines.append(c(status, "35"))
         if len(lines) < term_rows:
@@ -4082,7 +4434,10 @@ def truncate_plain(s, maxlen):
         return ""
     if plain_visible_len(s) <= maxlen:
         return s
-    if maxlen <= 1:
+    ellipsis = "..."
+    ell_w = plain_visible_len(ellipsis)
+    if maxlen <= ell_w:
+        # No room for ellipsis — hard truncate
         out = []
         width = 0
         for ch in s:
@@ -4092,8 +4447,7 @@ def truncate_plain(s, maxlen):
             out.append(ch)
             width += ch_w
         return "".join(out)
-    ellipsis = "..."
-    limit = maxlen - plain_visible_len(ellipsis)
+    limit = maxlen - ell_w
     out = []
     width = 0
     for ch in s:
@@ -4180,7 +4534,7 @@ def build_title_art(text, width):
 def main():
     global TITLE_ART_COLORED, TITLE_ART_BASE, TITLE_LOLCAT_PATH, BOX_GRADIENT_PHASE, BOX_BORDER_POS, TITLE_ART_VERSION
     ui_state = load_ui_state()
-    mode, allowed_games, import_paths, tune_action, layout_opts = parse_cli_args(sys.argv)
+    mode, allowed_games, cli_vis_mode, import_paths, tune_action, layout_opts = parse_cli_args(sys.argv)
     if mode == "import":
         sys.exit(import_files(import_paths))
     if mode == "tune":
@@ -4189,6 +4543,11 @@ def main():
         sys.exit(stats_cli())
     if mode == "layout-sweep":
         sys.exit(layout_sweep_cli(layout_opts))
+    if cli_vis_mode:
+        ui_state["vis_mode"] = cli_vis_mode
+    if not _resolve_command_path(MPV):
+        print(f"Missing required player: {MPV}")
+        sys.exit(1)
     # basic checks
     if not os.path.isdir(MUSIC_DIR):
         print(f"Missing music dir: {MUSIC_DIR}")
@@ -4224,11 +4583,15 @@ def main():
     last_resize_ts = 0.0
     last_term_cols = None
     last_term_rows = None
+    footer_control_lines = []
+    footer_has_separator = False
     layout_mode = "normal"
     info_w_cache = 0
     info_cache_key = None
     info_plain_cache = ()
     info_color_cache = ()
+    info_box_cache = None
+    info_box_cache_key = None
     stats_cache_key = None
     stats_box_cache = None
     stats_w_cache = 0
@@ -4328,11 +4691,31 @@ def main():
     if STATS_ENABLED:
         stats_q, stats_stop = start_stats_writer()
 
-    catalog_games, catalog_variants = collect_catalog()
-    games_list = ["ALL"] + sorted(catalog_games)
+    base_allowed_games = set(allowed_games) if allowed_games else None
+    catalog_games, catalog_variants = collect_catalog(base_allowed_games)
+    games_list = ["ALL"] + sorted(base_allowed_games or catalog_games)
     variants_list = ["ALL"] + sorted(catalog_variants)
     game_idx = games_list.index(ui_state["game"]) if ui_state["game"] in games_list else 0
     variant_idx = variants_list.index(ui_state["variant"]) if ui_state["variant"] in variants_list else 0
+
+    def current_active_games():
+        if game_idx == 0:
+            return set(base_allowed_games) if base_allowed_games else None
+        return {games_list[game_idx]}
+
+    def current_game_label():
+        if game_idx != 0:
+            return games_list[game_idx]
+        if not base_allowed_games:
+            return "ALL"
+        labels = sorted(base_allowed_games)
+        joined = ",".join(labels)
+        if len(joined) <= 18:
+            return joined
+        if len(labels) == 1:
+            return labels[0]
+        return f"{len(labels)} games"
+
     cava_method, cava_source, cava_detect_mode = detect_cava_input()
     private_sink = None
     private_module = None
@@ -4397,7 +4780,7 @@ def main():
         # Try polite quit
         if ipc_path and os.path.exists(ipc_path):
             try:
-                mpv_ipc(ipc_path, {"command": ["quit"]})
+                mpv_command(ipc_path, ["quit"])
             except Exception:
                 pass
         if proc and proc.poll() is None:
@@ -4407,9 +4790,11 @@ def main():
             except Exception:
                 try:
                     proc.kill()
+                    proc.wait(timeout=0.5)
                 except Exception:
                     pass
         # remove stale socket
+        cleanup_stale_socket(ipc_path)
         try:
             if ipc_path and os.path.exists(ipc_path):
                 os.remove(ipc_path)
@@ -4417,7 +4802,7 @@ def main():
             pass
 
     def stop_mpv():
-        nonlocal mpv_proc, fade, transition, chime_proc, showing_chime
+        nonlocal mpv_proc, fade, transition, chime_proc, showing_chime, chime_kind, chime_temp_path
         if fade:
             stop_mpv_proc(fade.get("old_proc"), fade.get("old_ipc"))
             fade = None
@@ -4434,6 +4819,13 @@ def main():
                 pass
         chime_proc = None
         showing_chime = False
+        chime_kind = None
+        if chime_temp_path:
+            try:
+                os.unlink(chime_temp_path)
+            except Exception:
+                pass
+            chime_temp_path = None
         stop_mpv_proc(mpv_proc, current_ipc)
         mpv_proc = None
         # clean up any other stale socket
@@ -4559,18 +4951,27 @@ def main():
                 cava_proc.terminate()
             except Exception:
                 pass
+            try:
+                cava_proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    cava_proc.kill()
+                    cava_proc.wait(timeout=0.5)
+                except Exception:
+                    pass
             cava_proc = None
-        cava_bars = None
-        cava_ok = False
+        with cava_lock:
+            cava_bars = None
+            cava_ok = False
         cava_err = None
         cava_last_label = None
 
     def start_for_hour(hour, crossfade=False, fade_dur=None):
         nonlocal mpv_proc, current_track, current_track_hour, current_ipc, fade, playback_started_ts
-        active_games = None if game_idx == 0 else {games_list[game_idx]}
+        active_games = current_active_games()
         active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
         tracks = list_tracks_for_hour(hour, active_games, active_variants)
-        track = pick_weighted(tracks)
+        track = pick_weighted(tracks, exclude=current_track if crossfade else None)
         if not track:
             current_track = None
             current_track_hour = None
@@ -4589,12 +4990,13 @@ def main():
                     os.remove(next_ipc)
             except Exception:
                 pass
-            new_proc = mpv_start(track, next_ipc, audio_device, volume=0)
-            # wait for socket
-            for _ in range(30):
-                if os.path.exists(next_ipc):
-                    break
-                time.sleep(0.02)
+            try:
+                new_proc = mpv_start(track, next_ipc, audio_device, volume=0)
+            except Exception:
+                return False
+            if not _wait_for_ipc_socket(next_ipc):
+                stop_mpv_proc(new_proc, next_ipc)
+                return False
             apply_mpv_eq(next_ipc)
             apply_mpv_eq(current_ipc)
             fade = {
@@ -4610,19 +5012,27 @@ def main():
             update_history(track)
             mpv_proc = new_proc
             current_ipc = next_ipc
+            playback_started_ts = time.time()
             return True
 
         stop_mpv()
         current_track = track
         current_track_hour = hour
         update_history(track)
-        mpv_proc = mpv_start(track, current_ipc, audio_device)
+        try:
+            mpv_proc = mpv_start(track, current_ipc, audio_device)
+        except Exception:
+            mpv_proc = None
+            current_track = None
+            current_track_hour = None
+            return False
         playback_started_ts = time.time()
-        # Give mpv a moment to create the socket
-        for _ in range(30):
-            if os.path.exists(current_ipc):
-                break
-            time.sleep(0.02)
+        if not _wait_for_ipc_socket(current_ipc):
+            stop_mpv_proc(mpv_proc, current_ipc)
+            mpv_proc = None
+            current_track = None
+            current_track_hour = None
+            return False
         apply_mpv_eq(current_ipc)
         # apply default volume to mpv if not using private sink loopback
         if not (PRIVATE_SINK and loopback_module):
@@ -4633,7 +5043,7 @@ def main():
 
     def start_track_for_hour(hour, volume=None):
         nonlocal current_track, current_track_hour, current_ipc, playback_started_ts
-        active_games = None if game_idx == 0 else {games_list[game_idx]}
+        active_games = current_active_games()
         active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
         tracks = list_tracks_for_hour(hour, active_games, active_variants)
         track = pick_weighted(tracks)
@@ -4645,12 +5055,14 @@ def main():
                 os.remove(next_ipc)
         except Exception:
             pass
-        proc = mpv_start(track, next_ipc, audio_device, volume=volume)
+        try:
+            proc = mpv_start(track, next_ipc, audio_device, volume=volume)
+        except Exception:
+            return None, None, None
         playback_started_ts = time.time()
-        for _ in range(30):
-            if os.path.exists(next_ipc):
-                break
-            time.sleep(0.02)
+        if not _wait_for_ipc_socket(next_ipc):
+            stop_mpv_proc(proc, next_ipc)
+            return None, None, None
         apply_mpv_eq(next_ipc)
         current_track = track
         current_track_hour = hour
@@ -4672,9 +5084,9 @@ def main():
             tracks = [t for t in tracks if t != current_track]
         if not tracks:
             return ()
-        if len(tracks) <= QUEUE_SIZE:
-            return tuple(os.path.basename(t) for t in tracks)
-        return tuple(os.path.basename(t) for t in random.sample(tracks, QUEUE_SIZE))
+        # Sort deterministically so the Up Next list is stable between frames.
+        tracks_sorted = sorted(tracks, key=lambda t: os.path.basename(t).lower())
+        return tuple(os.path.basename(t) for t in tracks_sorted[:QUEUE_SIZE])
 
 
     def set_volume(vol, ipc_path=None):
@@ -4688,17 +5100,19 @@ def main():
 
 
     def set_output_volume(vol):
-        nonlocal output_vol
+        nonlocal output_vol, last_loopback_vol
         try:
             v = int(max(0, min(100, vol)))
         except Exception:
             v = 0
         if PRIVATE_SINK and loopback_module:
+            output_vol = v
+            persist_ui_state()
             if set_loopback_volume(loopback_module, private_sink, v):
-                output_vol = v
-                persist_ui_state()
-                return v
-            return None
+                last_loopback_vol = v
+            else:
+                last_loopback_vol = None
+            return v
         # fallback to mpv volume
         v2 = set_volume(v)
         if v2 is not None:
@@ -4720,7 +5134,7 @@ def main():
             pass
 
     def adjust_output_volume(delta):
-        nonlocal mute_prev_vol, cached_vol
+        nonlocal mute_prev_vol, cached_vol, output_vol
         try:
             delta = int(delta)
         except Exception:
@@ -4729,12 +5143,11 @@ def main():
             base = mute_prev_vol if mute_prev_vol is not None else output_vol
             new_vol = int(max(0, min(100, base + delta)))
             mute_prev_vol = new_vol
+            # Update output_vol so unmute restores the new level, but don't touch
+            # the loopback/mpv — the mute state must stay in effect.
+            output_vol = new_vol
+            cached_vol = new_vol
             persist_ui_state()
-            if PRIVATE_SINK and loopback_module:
-                applied = set_output_volume(new_vol)
-                if applied is not None:
-                    cached_vol = applied
-                return applied
             return new_vol
         new_vol = set_output_volume(output_vol + delta)
         if new_vol is not None:
@@ -4748,6 +5161,13 @@ def main():
         now = time.time()
         state_changed = (last_loopback_vol != output_vol) or (last_loopback_muted != muted)
         if not state_changed:
+            return
+        if now - last_loopback_ts < 1.0 and last_loopback_vol is None:
+            return
+        if not find_loopback_input_ids(loopback_module, private_sink):
+            last_loopback_ts = now
+            last_loopback_vol = None
+            last_loopback_muted = None
             return
         last_loopback_ts = now
         # Apply mute/unmute to loopback when sink-input appears
@@ -4886,29 +5306,28 @@ def main():
                     last_term_cols = term_cols
                     last_term_rows = term_rows
                     info_w_cache = 0
-                    # Layout mode based on current size (no hysteresis)
-                    if term_cols < 58 or term_rows < 18:
-                        layout_mode = "tiny"
-                    elif term_cols < 78 or term_rows < 22:
-                        layout_mode = "small"
-                    else:
-                        layout_mode = "normal"
+                    layout_mode = layout_mode_for_size(term_cols, term_rows)
+                    _uc = term_rows < 10
+                    _tiny = layout_mode == "tiny"
+                    footer_control_lines, footer_has_separator = build_footer_controls(
+                        term_cols, term_rows, tiny_term=_tiny, ultra_compact=_uc,
+                    )
 
                 # Responsive layout for small terminals
                 tiny_term = layout_mode == "tiny"
                 small_term = layout_mode in ("tiny", "small")
-                # Prioritize time + visualizer in very short terminals (height-driven)
                 ultra_compact = term_rows < 10
-                # Keep box borders under terminal width to prevent auto-wrap
                 info_max_width = max(10, term_cols - 5)
+                footer_rows = len(footer_control_lines) + (1 if footer_has_separator else 0)
                 spectrum_use_color = USE_COLOR
-                min_spectrum_rows = 6
-                base_spectrum = 3 if ultra_compact else 4 if tiny_term else 6 if small_term else CAVA_HEIGHT
-                min_spectrum_height = max(min_spectrum_rows, base_spectrum)
+                min_spectrum_rows = layout_min_spectrum_rows(term_rows, layout_mode)
+                base_spectrum = layout_base_spectrum_rows(layout_mode, ultra_compact)
+                available_spectrum_rows = max(1, term_rows - footer_rows - 1)
+                min_spectrum_height = min(available_spectrum_rows, max(min_spectrum_rows, base_spectrum))
 
                 # Pinned layout zones; spectrum expands into spare rows after content is built
                 _chrome_rows = 1
-                _footer_rows = (2 if USE_COLOR else 1) if term_rows >= min_spectrum_height + 5 else 0
+                _footer_rows = footer_rows
                 _max_content_rows = max(0, term_rows - _chrome_rows - _footer_rows - min_spectrum_height - 1)
 
                 hour_changed = (last_hour is not None and hour != last_hour)
@@ -4969,25 +5388,33 @@ def main():
                 if last_time_sec != now_sec:
                     last_time_sec = now_sec
                     last_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now_sec))
+                display_vol = output_vol if (PRIVATE_SINK and loopback_module) else (int(vol) if vol is not None else None)
                 # Full-width header bar: time + playing indicator left, ├ ac-ui ┤ right.
                 if USE_COLOR:
+                    header_time = last_time_str if term_cols >= 48 else last_time_str[-8:]
                     _tod_hi = gradient_at(_active_tod_grad, 95)
                     playing_indicator = c256("♪", _tod_hi) if (current_track and not muted) else c256("♪", 236)
-                    _hdr_left_plain = f"─── ♪ {last_time_str} "
+                    _hdr_left_plain = f"─── ♪ {header_time} "
                     _hdr_left = (c256("─" * 3, 238) + " " + playing_indicator + " "
-                                 + c256(last_time_str, 245) + " ")
+                                 + c256(header_time, 245) + " ")
                     # In ultra-compact mode show current track; otherwise show app name
                     if ultra_compact and current_track:
                         _hdr_tag = parse_filename(os.path.basename(current_track))
-                        _hdr_inner = f" {_hdr_tag['game']}: {_hdr_tag['variant']} " if _hdr_tag else f" {os.path.basename(current_track)} "
+                        _hdr_inner_text = f"{_hdr_tag['game']}: {_hdr_tag['variant']}" if _hdr_tag else os.path.basename(current_track)
                     else:
-                        _hdr_inner = " ac-ui "
-                    _hdr_right_plain = f"┤{_hdr_inner}├"
-                    _hdr_pad = max(0, term_cols - len(_hdr_left_plain) - len(_hdr_right_plain))
-                    _hdr_right = (c256("┤", 240) + f"\x1b[1;38;5;{gradient_at(_active_tod_grad, 95)}m{_hdr_inner}\x1b[0m" + c256("├", 240))
-                    lines.append(_hdr_left + c256("─" * _hdr_pad, 238) + _hdr_right)
+                        _hdr_inner_text = "ac-ui"
+                    if term_cols < 28:
+                        lines.append(truncate_ansi_visible(_hdr_left.rstrip(), term_cols))
+                    else:
+                        _hdr_inner_max = max(1, term_cols - plain_visible_len(_hdr_left_plain) - plain_visible_len("┤  ├"))
+                        _hdr_inner = f" {truncate_plain(_hdr_inner_text, _hdr_inner_max)} "
+                        _hdr_right_plain = f"┤{_hdr_inner}├"
+                        _hdr_pad = max(0, term_cols - plain_visible_len(_hdr_left_plain) - plain_visible_len(_hdr_right_plain))
+                        _hdr_right = (c256("┤", 240) + f"\x1b[1;38;5;{gradient_at(_active_tod_grad, 95)}m{_hdr_inner}\x1b[0m" + c256("├", 240))
+                        lines.append(_hdr_left + c256("─" * _hdr_pad, 238) + _hdr_right)
                 else:
-                    lines.append(f"─── ♪ {last_time_str}")
+                    header_time = last_time_str if term_cols >= 48 else last_time_str[-8:]
+                    lines.append(truncate_plain(f"─── ♪ {header_time}", term_cols))
 
                 # btop ▲▼ volume delta flash (shown inline next to vol label)
                 _vol_flash_str = ""
@@ -4999,6 +5426,22 @@ def main():
                     else:
                         vol_delta_flash = None
 
+                if ultra_compact:
+                    compact_summary = truncate_plain(
+                        build_ultra_compact_summary(
+                            current_game_label(),
+                            variants_list[variant_idx],
+                            VIS_MODES[vis_idx],
+                            remaining,
+                            display_vol=display_vol,
+                            muted=muted,
+                            showing_chime=showing_chime,
+                            chime_kind=chime_kind,
+                        ),
+                        max(10, term_cols - 2),
+                    )
+                    lines.append(c(compact_summary, "2"))
+
                 # Content zone budget (chrome + footer + spectrum already reserved)
                 max_info_rows = max(0, _max_content_rows - 2)  # 2 for box borders
                 compact_info = max_info_rows < 10 or term_cols < 70 or ultra_compact
@@ -5007,14 +5450,13 @@ def main():
                 info_plain = []
                 if not ultra_compact:
                     _tod_grad = _active_tod_grad
-                    display_vol = output_vol if (PRIVATE_SINK and loopback_module) else (int(vol) if vol is not None else None)
                     info_key = (
                         term_cols,
                         info_max_width,
                         compact_info,
                         tiny_term,
                         TITLE_ART_VERSION,
-                        games_list[game_idx],
+                        current_game_label(),
                         variants_list[variant_idx],
                         VIS_MODES[vis_idx],
                         showing_chime,
@@ -5028,6 +5470,7 @@ def main():
                         muted,
                         int(remaining),
                         now_sec,  # ensures pulse dot + gradient bars refresh every second
+                        bool(vol_delta_flash and time.monotonic() < vol_delta_flash[1]),
                     )
                     if info_key != info_cache_key:
                         info = []
@@ -5047,12 +5490,13 @@ def main():
                                 info.extend([c256(line, _art_col) for line in TITLE_ART])
                                 info_plain.extend([line for line in TITLE_ART])
 
-                        fline = f"Filter: Game={games_list[game_idx]}  Variant={variants_list[variant_idx]}"
+                        current_game = current_game_label()
+                        fline = f"Filter: Game={current_game}  Variant={variants_list[variant_idx]}"
                         if USE_COLOR:
                             _flt_col = gradient_at(_tod_grad, 65)
                             fline_color = (
                                 f"[2mFilter: Game=[0m"
-                                f"[38;5;{_flt_col}m{games_list[game_idx]}[0m"
+                                f"[38;5;{_flt_col}m{current_game}[0m"
                                 f"[2m  Variant=[0m"
                                 f"[38;5;{_flt_col}m{variants_list[variant_idx]}[0m"
                             )
@@ -5085,11 +5529,11 @@ def main():
                             track_name = os.path.basename(current_track)
                             _meta = parse_filename(track_name)
                             display_name = f"{_meta['game']}: {_meta['variant']}" if _meta else track_name
-                            play_sym = SYM_PAUSE if (muted or background_mode) else SYM_PLAY
+                            play_sym = SYM_PLAY
                             line1_plain = f"Hour folder: {display_hour:02d}    Now playing: {display_name}"
                             if USE_COLOR:
                                 _sym_hi = gradient_at(_tod_grad, 90)
-                                sym_color = "\x1b[2;32m" if muted else f"\x1b[1;38;5;{_sym_hi}m"
+                                sym_color = "\x1b[2;31m" if muted else ("\x1b[2;37m" if background_mode else f"\x1b[1;38;5;{_sym_hi}m")
                                 info_plain.append(truncate_plain(line1_plain, info_max_width))
                                 info.append(f"{sym_color}{play_sym}\x1b[0m [38;5;{_sym_hi}m{display_hour:02d}h[0m  [2;36mNow playing:[0m [97m{display_name}[0m{(chr(32)+chr(32)+chr(0x1b)+"[2m"+humanize_seconds(dur)+chr(0x1b)+"[0m") if dur else ""}")
                             else:
@@ -5142,11 +5586,11 @@ def main():
                         info_plain = list(info_plain_cache)
                         info = list(info_color_cache)
 
-                # Refresh "next candidates" at most once per second or on filter/hour change
-                active_games = None if game_idx == 0 else {games_list[game_idx]}
+                # Refresh "next candidates" on filter/hour/track change (sorted, stable)
+                active_games = current_active_games()
                 active_variants = None if variant_idx == 0 else {variants_list[variant_idx]}
-                cand_key = (hour, game_idx, variant_idx)
-                if now - next_candidates_ts > 1.0 or cand_key != next_candidates_key:
+                cand_key = (hour, game_idx, variant_idx, current_track)
+                if cand_key != next_candidates_key:
                     next_candidates = compute_next_candidates(hour, active_games, active_variants)
                     next_candidates_ts = now
                     next_candidates_key = cand_key
@@ -5165,11 +5609,12 @@ def main():
                         stats_data["hour_buckets"] = hb
                     if now_ts - stats_last_flush > 10.0:
                         stats_last_flush = now_ts
-                        stats_data["total_listen_seconds"] = int(stats_data.get("total_listen_seconds", 0))
+                        flush_copy = dict(stats_data)
+                        flush_copy["total_listen_seconds"] = int(stats_data.get("total_listen_seconds", 0) + session_listen)
                         if stats_q:
-                            stats_q.put(("json", dict(stats_data)))
+                            stats_q.put(("json", flush_copy))
                         else:
-                            save_stats(stats_data)
+                            save_stats(flush_copy)
 
                 info_box = None
                 info_w = 0
@@ -5185,7 +5630,12 @@ def main():
                     if info_plain and (not (show_help and compact_info)):
                         info_w_needed = max([plain_visible_len(line) for line in info_plain] + [0])
                         info_w_cache = min(info_max_width, max(info_w_cache, info_w_needed))
-                        info_box, info_w = build_box(info_plain, info, info_w_cache, title="Now Playing")
+                        _ibox_key = (info_cache_key, info_w_cache, show_help, compact_info)
+                        if _ibox_key != info_box_cache_key:
+                            info_box_cache, _ = build_box(info_plain, info, info_w_cache, title="Now Playing")
+                            info_box_cache_key = _ibox_key
+                        info_box = info_box_cache
+                        info_w = info_w_cache
 
                 stats_box = None
                 stats_w = 0
@@ -5194,7 +5644,7 @@ def main():
                     hb = stats_data.get("hour_buckets", [0] * 24)
                     top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
                     top_fmt = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none)"
-                    stats_key = (total_sec, int(session_listen), top_fmt, hour, now_sec)
+                    stats_key = (total_sec, int(session_listen), top_fmt, hour)
                     if stats_key != stats_cache_key:
                         # Derived stats from hour_buckets
                         hb_total = sum(hb)
@@ -5333,7 +5783,8 @@ def main():
                 # Help overlay panel (skip if space is tight to keep spectrum visible)
                 render_help = show_help and (not ultra_compact)
                 rows_after_info = len(lines)
-                if _max_content_rows - (rows_after_info - _chrome_rows) <= 0:
+                help_rows_budget = _max_content_rows - (rows_after_info - _chrome_rows)
+                if help_rows_budget <= 2:
                     render_help = False
                 if (not ultra_compact) and render_help:
                     if current_output_sink:
@@ -5345,24 +5796,25 @@ def main():
                             help_sink_cache = get_default_sink() or "(unknown)"
                             help_sink_cache_ts = now
                         help_sink = help_sink_cache
-                    help_key = (help_sink, hour)
+                    help_max_width = max(14, min(info_max_width, term_cols - 8))
+                    help_key = (help_sink, hour, help_max_width, help_rows_budget)
                     if help_key != help_cache_key:
-                        help_lines = list(HELP_LINES_BASE)
+                        help_lines = list(HELP_LINES_BASE[1:])
                         help_lines.append(f"Audio output: {help_sink}")
                         help_lines.append("Focus throttle: AC_UI_FOCUS_THROTTLE=1")
-                        if USE_COLOR:
-                            _hk_col = gradient_at(_active_tod_grad, 80)
-                            help_color = []
-                            for s in help_lines:
-                                colored = re.sub(
-                                    r'\[([^\]]+)\]',
-                                    lambda m, _c=_hk_col: f"[\x1b[1;38;5;{_c}m{m.group(1)}\x1b[0;2m]",
-                                    s
-                                )
-                                help_color.append(f"\x1b[2m{colored}\x1b[0m")
+                        wrapped_help = []
+                        for help_line in help_lines:
+                            wrapped_help.extend(wrap_plain(help_line, help_max_width) or [""])
+                        wrapped_help = wrapped_help[:max(0, help_rows_budget - 2)]
+                        if wrapped_help:
+                            if USE_COLOR:
+                                _hk_col = gradient_at(_active_tod_grad, 80)
+                                help_color = [colorize_hint_keys(s, _hk_col, base_code="2") for s in wrapped_help]
+                            else:
+                                help_color = [c(s, "2") for s in wrapped_help]
+                            help_box_cache, _ = build_box(wrapped_help, help_color, maxw_override=help_max_width, title="Help")
                         else:
-                            help_color = [c(s, "2") for s in help_lines]
-                        help_box_cache, _ = build_box(help_lines, help_color, title="Help")
+                            help_box_cache = None
                         help_cache_key = help_key
                     if help_box_cache:
                         lines.extend(help_box_cache)
@@ -5387,7 +5839,7 @@ def main():
                 up_w = 0
                 if show_history:
                     hist_list = tuple(history)[-HISTORY_MAX:]
-                    hist_key = (hist_list, panel_max_width, info_max_width, hour, now_sec)
+                    hist_key = (hist_list, panel_max_width, info_max_width, hour)
                     if hist_key != hist_cache_key:
                         hist_title = "Recently played"
                         hist_title_trunc = truncate_plain(hist_title, info_max_width)
@@ -5419,7 +5871,7 @@ def main():
 
                 if show_up_next:
                     next_list = next_candidates
-                    up_key = (next_list, panel_max_width, info_max_width, UP_NEXT_MAX, now_sec)
+                    up_key = (next_list, panel_max_width, info_max_width, UP_NEXT_MAX, hour)
                     if up_key != up_cache_key:
                         if next_list:
                             def _fmt_candidate(name):
@@ -5491,19 +5943,21 @@ def main():
                 if state_banner is not None:
                     banner_text, banner_color, banner_expire = state_banner
                     if time.monotonic() < banner_expire:
-                        pad_w = max(0, term_cols - plain_visible_len(banner_text) - 4)
+                        banner_plain = truncate_plain(str(banner_text), max(4, term_cols - 3))
                         if USE_COLOR:
-                            lines.append(f"  \x1b[1;38;5;{banner_color}m{banner_text}{'':>{pad_w}}\x1b[0m")
+                            lines.append(f"  \x1b[1;38;5;{banner_color}m{banner_plain}\x1b[0m")
                         else:
-                            lines.append(f"  {banner_text}")
+                            lines.append(f"  {banner_plain}")
                     else:
                         state_banner = None
 
                 # Spectrum expands to fill space above actual content
                 _natural_len = len(lines)
-                _available_for_spectrum = term_rows - _footer_rows - 1  # subtract footer + divider
-                spectrum_height_dyn = max(min_spectrum_height, _available_for_spectrum - _natural_len)
-                _content_end = term_rows - _footer_rows - 1 - spectrum_height_dyn
+                _available_for_spectrum = max(1, term_rows - _footer_rows - 1)
+                _reserved_spectrum = min(_available_for_spectrum, min_spectrum_height)
+                spectrum_height_dyn = max(_reserved_spectrum, _available_for_spectrum - _natural_len)
+                spectrum_height_dyn = max(0, min(spectrum_height_dyn, _available_for_spectrum))
+                _content_end = max(_chrome_rows, term_rows - _footer_rows - 1 - spectrum_height_dyn)
                 while len(lines) < _content_end:
                     lines.append("")
                 if len(lines) > _content_end:
@@ -5583,7 +6037,8 @@ def main():
                         cap_vel = new_cap_vel
 
                         draw_mode = VIS_MODES[vis_idx]
-                        game_tag = games_list[game_idx] if games_list else None
+                        active_games = current_active_games()
+                        game_tag = next(iter(active_games)) if active_games and len(active_games) == 1 else None
 
                         if draw_mode == "flame":
                             vis_lines = flame_render_lines(smooth_bars, spectrum_height_dyn, bars_len, flame_state, use_color=spectrum_use_color, game_tag=game_tag)
@@ -5631,7 +6086,7 @@ def main():
                                 # peaks has physics caps that always change — never skip
                                 lines.extend([prefix + ln for ln in spectrum_lines(smooth_bars, height=spectrum_height_dyn, use_color=spectrum_use_color, mode=draw_mode, trail_bars=trail_bars, peak_bars=pass_peaks, game_tag=game_tag)])
                     elif cava_err:
-                        lines.append(prefix + c(f"({cava_err})", "31"))
+                        lines.append(prefix + c(format_visualizer_status(cava_err, label=cava_last_label, max_width=bars_len), "31"))
                     elif ok:
                         lines.append(prefix + c("(no data)", "33"))
                     else:
@@ -5639,10 +6094,7 @@ def main():
                         if warmup_since and (now - warmup_since) < AUDIO_WARMUP_GRACE:
                             lines.append(prefix)
                         else:
-                            wait_msg = "(waiting for audio...)"
-                            if cava_last_label:
-                                wait_msg = f"(waiting for audio via {cava_last_label}...)"
-                            lines.append(prefix + c(wait_msg, "33"))
+                            lines.append(prefix + c(format_visualizer_status(label=cava_last_label, waiting=True, max_width=bars_len), "33"))
                     # Pad spectrum zone to its exact reserved height
                     while len(lines) < _spec_row0 + spectrum_height_dyn:
                         lines.append("")
@@ -5663,22 +6115,14 @@ def main():
                         _div_line = c256(BOX_CHARS["h"] * bars_len, 238)
                     lines.append(prefix + _div_line)
                     # Pinned footer: thin TOD-colored separator + always-visible controls hint
-                    if _footer_rows:
-                        _footer_plain = CONTROL_TEXT_TINY if tiny_term else CONTROL_TEXT
-                        _footer_trunc = truncate_plain(_footer_plain, term_cols - 1)
+                    if footer_has_separator:
+                        _sep_col = gradient_at(_active_tod_grad, 30)
+                        lines.append(c256("─" * max(1, term_cols - 1), _sep_col) if USE_COLOR else ("-" * max(1, term_cols - 1)))
+                    for footer_line in footer_control_lines:
                         if USE_COLOR:
-                            _sep_col = gradient_at(_active_tod_grad, 30)
-                            _footer_sep = c256("─" * (term_cols - 1), _sep_col)
-                            lines.append(_footer_sep)
-                            _tod_key_col = gradient_at(_active_tod_grad, 85)
-                            _footer_colored = re.sub(
-                                r'\[([^\]]+)\]',
-                                lambda m: f"[0;38;5;{_tod_key_col}m[{m.group(1)}][0;2m",
-                                _footer_trunc
-                            )
-                            lines.append(f"[2m{_footer_colored}[0m")
+                            lines.append(colorize_hint_keys(footer_line, gradient_at(_active_tod_grad, 85), base_code="2"))
                         else:
-                            lines.append(_footer_trunc)
+                            lines.append(truncate_plain(footer_line, max(1, term_cols - 1)))
 
                 # Handle crossfade volumes (non-blocking)
                 if fade:
@@ -5793,7 +6237,7 @@ def main():
                     # Track non-m keypresses to prevent auto-repeat toggling
                     if ch.lower() == "q":
                         handle_exit()
-                    if ch.lower() == "n":
+                    if ch.lower() == "n" and transition is None:
                         # skip: crossfade to another random track in same hour
                         start_for_hour(hour, crossfade=True, fade_dur=1.0)
                         next_candidates_ts = 0.0
@@ -5810,15 +6254,15 @@ def main():
                     if ch.lower() == "g":
                         game_idx = (game_idx + 1) % len(games_list)
                         persist_ui_state()
-                        last_hour = None
                         start_for_hour(hour, crossfade=False)
+                        last_hour = hour  # prevent double-start next frame
                         next_candidates_ts = 0.0
-                        state_banner = (f"Game: {games_list[game_idx]}", gradient_at(_active_tod_grad, 75), time.monotonic() + 1.5)
+                        state_banner = (f"Game: {current_game_label()}", gradient_at(_active_tod_grad, 75), time.monotonic() + 1.5)
                     if ch.lower() == "v":
                         variant_idx = (variant_idx + 1) % len(variants_list)
                         persist_ui_state()
-                        last_hour = None
                         start_for_hour(hour, crossfade=False)
+                        last_hour = hour  # prevent double-start next frame
                         next_candidates_ts = 0.0
                         state_banner = (f"Variant: {variants_list[variant_idx]}", gradient_at(_active_tod_grad, 75), time.monotonic() + 1.5)
                     if ch.lower() == "t":
@@ -5839,7 +6283,7 @@ def main():
                         invalidate_render_cache(clear_screen=True)
                     if ch.lower() == "s":
                         if PRIVATE_SINK and private_sink and shutil.which("pactl"):
-                            sinks = list_sinks()
+                            sinks = [sink for sink in list_sinks() if sink != private_sink]
                             if sinks:
                                 if current_output_sink in sinks:
                                     idx = (sinks.index(current_output_sink) + 1) % len(sinks)
@@ -5856,9 +6300,15 @@ def main():
                                         get_mute_volume() if muted else output_vol,
                                     )
                                     set_loopback_mute(loopback_module, private_sink, muted)
+                                    _sink_label = truncate_plain(next_sink, 40)
+                                    state_banner = (f"→ Output: {_sink_label}", gradient_at(_active_tod_grad, 80), time.monotonic() + 2.0)
+                                else:
+                                    state_banner = ("Output switch failed", 196, time.monotonic() + 2.0)
                                 last_loopback_ts = 0.0
-                                _sink_label = truncate_plain(next_sink, 40)
-                                state_banner = (f"→ Output: {_sink_label}", gradient_at(_active_tod_grad, 80), time.monotonic() + 2.0)
+                                last_loopback_vol = None
+                                last_loopback_muted = None
+                            else:
+                                state_banner = ("No alternate output sink", 220, time.monotonic() + 2.0)
                     if ch == "-":
                         adjust_output_volume(-5)
                         vol_delta_flash = (f"{SYM_VOL_DN} -5", time.monotonic() + 1.2)
@@ -5875,7 +6325,7 @@ def main():
                         background_mode = not background_mode
                         last_lines = None
                         state_banner = ("⬛ BACKGROUND MODE ON" if background_mode else "▣  BACKGROUND MODE OFF", 245, time.monotonic() + 1.5)
-                    if ch.lower() == "m":
+                    if ch.lower() == "m" or ch == " ":
                         # debounce + ignore auto-repeat bursts
                         now_ts = time.time()
                         if last_key == "m" and (now_ts - last_key_ts) < 0.4:

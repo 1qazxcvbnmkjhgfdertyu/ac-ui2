@@ -86,6 +86,26 @@ Useful commands:
 ./ac-ui layout-sweep
 ```
 
+## Development
+
+The launcher script at repo root stays intentionally small:
+
+```bash
+./ac-ui
+```
+
+It simply loads the packaged implementation from `ac_ui/` and runs `ac_ui.ui:main`.
+
+Useful local checks during refactors:
+
+```bash
+python -m py_compile ac_ui/*.py
+python -m pytest
+```
+
+The smoke tests under `tests/` focus on launcher startup, help output, state defaults,
+layout preview rendering, and the public audio-module surface.
+
 ## Audio Pipeline
 
 The default Linux audio routing is:

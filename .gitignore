@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 
+# Local agent/worktree artifacts and refactor backups; never publish.
+.claude/
+ac-ui.monolith
+
 # Local reverse-engineering/decomp reference material; never publish.
 acgc-reference/
 

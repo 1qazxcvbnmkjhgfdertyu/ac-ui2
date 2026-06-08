@@ -8,6 +8,9 @@ from ac_ui.constants import (
 )
 from ac_ui.visualizer import resample_bars
 
+STATS_VERSION = 1
+
+
 def load_stats():
     data = {
         "total_listen_seconds": 0,
@@ -48,7 +51,9 @@ def load_stats():
     return data
 
 def save_stats(data):
-    _atomic_write_json(STATS_JSON, data)
+    payload = dict(data)
+    payload["_version"] = STATS_VERSION
+    _atomic_write_json(STATS_JSON, payload)
 
 def append_stats_csv(row):
     os.makedirs(STATS_DIR, exist_ok=True)

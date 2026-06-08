@@ -5,6 +5,8 @@ from ac_ui.constants import (
     EQ_ENABLED, _atomic_write_json,
 )
 
+EQ_STATE_VERSION = 1
+
 def _clamp_eq_band(value):
     return max(EQ_BAND_MIN, min(EQ_BAND_MAX, float(value)))
 
@@ -32,7 +34,9 @@ def load_eq_bands():
             if isinstance(data, dict) and isinstance(data.get("bands"), list):
                 return normalize_eq_bands(data["bands"]), data.get("preset")
             if isinstance(data, list):
-                return normalize_eq_bands(data), None
+                bands = normalize_eq_bands(data)
+                save_eq_bands(bands)  # migrate legacy bare-list format to versioned dict
+                return bands, None
     except Exception:
         pass
     return default_eq_bands(), "flat"
@@ -41,7 +45,7 @@ def load_eq_bands():
 def save_eq_bands(bands, preset_name=None):
     path = EQ_CONFIG_PATH
     try:
-        payload = {"bands": normalize_eq_bands(bands)}
+        payload = {"_version": EQ_STATE_VERSION, "bands": normalize_eq_bands(bands)}
         if preset_name:
             payload["preset"] = preset_name
         _atomic_write_json(path, payload)

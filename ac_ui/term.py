@@ -1,4 +1,4 @@
-import os, sys, re, select, termios, tty, subprocess, shutil, unicodedata
+import os, sys, re, select, termios, tty, subprocess, shutil, unicodedata, ctypes, ctypes.util
 
 from ac_ui.constants import SHOW_TITLE_ART
 from ac_ui.colors import USE_COLOR, visible_len, char_cell_width, plain_visible_len, strip_ansi
@@ -37,6 +37,33 @@ def disable_autowrap():
 def enable_autowrap():
     sys.stdout.write("\033[?7h")
     sys.stdout.flush()
+
+def _write_tty(seq: bytes):
+    """Write bytes directly to the terminal fd, bypassing Python stdout buffering."""
+    try:
+        os.write(sys.stdout.fileno(), seq)
+    except OSError:
+        try:
+            with open("/dev/tty", "wb", buffering=0) as t:
+                t.write(seq)
+        except OSError:
+            pass
+
+def rename_process(name: str):
+    """Rename the process via prctl so fish/ps see 'ac-ui' instead of 'python3'."""
+    try:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        PR_SET_NAME = 15
+        _libc.prctl(PR_SET_NAME, name.encode()[:15], 0, 0, 0)
+    except Exception:
+        pass
+    sys.argv[0] = name  # fallback for tools that read argv
+
+def set_terminal_title(title: str):
+    _write_tty(f"\033]0;{title}\007".encode())
+
+def reset_terminal_title():
+    _write_tty(b"\033]0;\007")
 
 def enter_alt_screen():
     sys.stdout.write("\033[?1049h\033[H\033[2J")

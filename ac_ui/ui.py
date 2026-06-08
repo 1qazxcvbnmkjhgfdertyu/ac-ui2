@@ -31,7 +31,8 @@ from ac_ui.term import (
     TITLE_ART,
     build_title_art, render, _read_key, invalidate_render_cache,
     hide_cursor, show_cursor, enable_autowrap, disable_autowrap,
-    enter_alt_screen, exit_alt_screen, truncate_plain, truncate_ansi_visible,
+    enter_alt_screen, exit_alt_screen, set_terminal_title, reset_terminal_title,
+    rename_process, truncate_plain, truncate_ansi_visible,
     RawMode,
 )
 from ac_ui.tracks import (
@@ -53,7 +54,7 @@ from ac_ui.town_tune import _wait_for_ipc_socket
 from ac_ui.visualizer import (
     spectrum_lines, flame_render_lines, braille_wave_lines, braille_scope_lines,
     butterfly_render_lines, led_matrix_lines, matrix_rain_lines,
-    heartbeat_render_lines, braille_spectrum_lines,
+    heartbeat_render_lines, braille_spectrum_lines, ascii_bars_lines,
 )
 from ac_ui.layout import (
     build_box, pad_box_lines, build_footer_controls,
@@ -77,85 +78,11 @@ from ac_ui.eq import load_eq_bands, save_eq_bands, apply_mpv_eq, build_mpv_eq_fi
 from ac_ui.persist import load_ui_state, save_ui_state
 from ac_ui.town_tune import town_tune_cli, normalize_town_tune
 from ac_ui.editors import run_eq_editor, run_tune_editor
+from ac_ui.app import parse_cli_args  # noqa: F401 — re-exported for callers
+from ac_ui.panels import history as _hist_panel, up_next as _up_next_panel, stats as _stats_panel, help as _help_panel
+from ac_ui.panels.now_playing import NowPlayingContext, render as _render_now_playing
 
 _active_tod_grad = _clrs._active_tod_grad
-
-def parse_cli_args(argv):
-    mode = "run"
-    games = None
-    vis_mode = None
-    import_paths = []
-    tune_action = None
-    layout_opts = None
-    i = 1
-    while i < len(argv):
-        arg = argv[i]
-        if arg in ("-h", "--help"):
-            print("Usage:")
-            print("  ac-ui [--games GCN,WW] [--vis MODE]")
-            print("  ac-ui import <files...>")
-            print("  ac-ui tune [show|play|reset]")
-            print("  ac-ui stats")
-            print("  ac-ui layout-sweep")
-            print()
-            print("Keys (in-app):")
-            print("  n  next track    m/space  mute   T  town tune   E  EQ editor")
-            print("  g  cycle game    v  variant   t  vis next   R  vis random")
-            print("  h  simulate hour change       s  audio sink   l  repeat current track")
-            print("  L  cycle layout preset")
-            print("  +/-  volume ±5   PgUp/Dn volume ±10")
-            print("  8  background mode   ?  help   q  quit")
-            print()
-            print(f"Vis modes: {', '.join(VIS_MODES)}")
-            print()
-            print("Env vars: AC_UI_MUSIC_DIR, AC_UI_MPV, AC_UI_VIS, AC_UI_REFRESH,")
-            print("          AC_UI_CAVA_SOURCE, AC_UI_EQ_PATH, AC_UI_STATS,")
-            print("          AC_UI_VIS_ATTACK_MS, AC_UI_VIS_DECAY_MS,")
-            print("          AC_UI_LOOPBACK_LATENCY_MSEC, AC_UI_REPEAT_GUARD,")
-            print("          AC_UI_LAYOUT_PRESET")
-            sys.exit(0)
-        if arg == "import":
-            mode = "import"
-            import_paths = argv[i + 1:]
-            break
-        if arg == "tune":
-            mode = "tune"
-            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                tune_action = argv[i + 1]
-            break
-        if arg == "stats":
-            mode = "stats"
-            break
-        if arg == "layout-sweep":
-            mode = "layout-sweep"
-            layout_opts = {}
-            i += 1
-            while i < len(argv):
-                if argv[i].startswith("--"):
-                    key = argv[i][2:].replace("-", "_")
-                    if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-                        layout_opts[key] = argv[i + 1]
-                        i += 1
-                    else:
-                        layout_opts[key] = "1"
-                i += 1
-            break
-        if arg.startswith("--games="):
-            games = arg.split("=", 1)[1]
-        elif arg == "--games" and i + 1 < len(argv):
-            games = argv[i + 1]
-            i += 1
-        elif arg.startswith("--vis="):
-            vis_mode = arg.split("=", 1)[1]
-        elif arg == "--vis" and i + 1 < len(argv):
-            vis_mode = argv[i + 1]
-            i += 1
-        i += 1
-    if games:
-        games = {g.strip().upper() for g in games.split(",") if g.strip()}
-    if vis_mode is not None:
-        vis_mode = normalize_vis_mode(vis_mode, default=VIS_MODE)
-    return mode, games, vis_mode, import_paths, tune_action, layout_opts
 
 def build_layout_preview(term_cols, term_rows, layout_config=None):
     # Minimal, deterministic preview for layout debugging
@@ -456,6 +383,7 @@ def layout_sweep_cli(opts=None):
     return 0
 
 def main():
+    rename_process("ac-ui")
     ui_state = load_ui_state()
     mode, allowed_games, cli_vis_mode, import_paths, tune_action, layout_opts = parse_cli_args(sys.argv)
     if mode == "import":
@@ -577,9 +505,11 @@ def main():
     flame_state = {"heat": None, "rng": 0xF1A3C0DE0BADCAFE, "frame": 0, "rows": 0, "cols": 0}
     butterfly_state = {"frame": 0}
     matrix_state = {"frame": 0}
+    ascii_state = {"frame": 0}
     heartbeat_state = {"buf": None, "prev_bass": 0.0, "spike_phase": 0.0}
     scope_frame = 0
     last_title_anim_ts = 0.0
+    last_wm_title_ts = 0.0
 
     muted = ui_state["muted"]
     repeat_current = ui_state["repeat_current"]
@@ -1232,6 +1162,7 @@ def main():
         teardown_private_sink(private_module, loopback_module)
         enable_autowrap()
         show_cursor()
+        reset_terminal_title()
         exit_alt_screen()
         sys.exit(0)
 
@@ -1285,6 +1216,7 @@ def main():
     start_cava()
 
     enter_alt_screen()
+    set_terminal_title("ac-ui")
     hide_cursor()
     disable_autowrap()
     try:
@@ -1292,6 +1224,9 @@ def main():
             while True:
                 now = time.time()
                 hour = int(time.strftime("%H", time.localtime(now)))
+                if now - last_wm_title_ts >= 1.0:
+                    set_terminal_title("ac-ui")
+                    last_wm_title_ts = now
                 if GRADIENT_ANIMATE:
                     _layout.BOX_GRADIENT_PHASE = (now * GRADIENT_SPEED) % 1.0
                 if BOX_BORDER_SPIN:
@@ -1464,14 +1399,14 @@ def main():
                 info = []
                 info_plain = []
                 if not ultra_compact:
-                    _tod_grad = _active_tod_grad
+                    _game_label = current_game_label()
                     info_key = (
                         term_cols,
                         info_max_width,
                         compact_info,
                         tiny_term,
                         _term.TITLE_ART_VERSION,
-                        current_game_label(),
+                        _game_label,
                         variants_list[variant_idx],
                         VIS_MODES[vis_idx],
                         repeat_current,
@@ -1485,158 +1420,37 @@ def main():
                         int(display_vol) if display_vol is not None else None,
                         muted,
                         int(remaining),
-                        (now_sec if not NO_MOTION else 0),  # ensures pulse dot + gradient bars refresh every second
+                        (now_sec if not NO_MOTION else 0),
                         bool(vol_delta_flash and time.monotonic() < vol_delta_flash[1]),
                         track_pick_reason,
                     )
                     if info_key != info_cache_key:
-                        info = []
-                        info_plain = []
-
-                        def add_info_line(text, color_code="2"):
-                            text = truncate_plain(text, info_max_width)
-                            info_plain.append(text)
-                            info.append(c(text, color_code))
-
-                        if (not compact_info) and TITLE_ART:
-                            if _term.TITLE_ART_COLORED:
-                                info.extend([line for line in TITLE_ART])
-                                info_plain.extend([strip_ansi(line) for line in TITLE_ART])
-                            else:
-                                _art_col = gradient_at(_tod_grad, 70)
-                                info.extend([c256(line, _art_col) for line in TITLE_ART])
-                                info_plain.extend([line for line in TITLE_ART])
-
-                        current_game = current_game_label()
-                        pulse_bright = (not NO_MOTION) and (int(now) % 2 == 0)
-                        _flt_sum = format_filter_summary(current_game, variants_list[variant_idx])
-
-                        if compact_info:
-                            # Compact: dense filter+vis line, then track name, then until
-                            dense_plain = f"{_flt_sum} · {VIS_MODES[vis_idx]}"
-                            if USE_COLOR:
-                                _flt_col = gradient_at(_tod_grad, 65)
-                                _pd_col = gradient_at(_tod_grad, 90)
-                                _pulse = (f"\x1b[1;38;5;{_pd_col}m●\x1b[0m" if (pulse_bright and not muted)
-                                          else f"\x1b[2;38;5;{_pd_col}m·\x1b[0m")
-                                _muted_c = f"  \x1b[1;31m◆\x1b[0m" if muted else ""
-                                dense_color = (
-                                    f"\x1b[38;5;{_flt_col}m{_flt_sum}\x1b[0m"
-                                    f"\x1b[2m · \x1b[0m"
-                                    f"\x1b[2;36m{VIS_MODES[vis_idx]}\x1b[0m"
-                                    f"  {_pulse}{_muted_c}"
-                                )
-                                info_plain.append(truncate_plain(dense_plain, info_max_width))
-                                info.append(dense_color)
-                            else:
-                                add_info_line(dense_plain, "2")
-                            if showing_chime:
-                                add_info_line(f"♪ ({chime_kind or 'hour chime'})", "36")
-                            elif current_track:
-                                _cn = os.path.basename(current_track)
-                                _cm = parse_filename(_cn)
-                                _cd = f"{_cm['game']}: {_cm['variant']}" if _cm else _cn
-                                add_info_line(_cd, "97")
-                            else:
-                                add_info_line(f"(none for {hour:02d}h)", "2")
-                            uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
-                            add_info_line(f"Until: {uvalue}", "95")
-                        else:
-                            # ── Full mode: new information hierarchy ──
-
-                            # Line 1: track name (primary, bold) or chime label
-                            if showing_chime:
-                                label = chime_kind or "hour chime"
-                                if USE_COLOR:
-                                    _hr_col = gradient_at(_tod_grad, 80)
-                                    info_plain.append(truncate_plain(f"♪ ({label})", info_max_width))
-                                    info.append(f"\x1b[38;5;{_hr_col}m♪\x1b[0m \x1b[2;36m({label})\x1b[0m")
-                                else:
-                                    add_info_line(f"♪ ({label})", "36")
-                            elif current_track:
-                                display_hour = current_track_hour if current_track_hour is not None else hour
-                                track_name = os.path.basename(current_track)
-                                _meta = parse_filename(track_name)
-                                display_name = f"{_meta['game']}: {_meta['variant']}" if _meta else track_name
-                                dur_tag = f"  {humanize_seconds(dur)}" if dur else ""
-                                if USE_COLOR:
-                                    _sym_hi = gradient_at(_tod_grad, 90)
-                                    sym_color = "\x1b[2;31m" if muted else ("\x1b[2;37m" if background_mode else f"\x1b[1;38;5;{_sym_hi}m")
-                                    _pin_str = f" \x1b[33m[pinned]\x1b[0m" if repeat_current else ""
-                                    _dur_col = gradient_at(_tod_grad, 50)
-                                    info_plain.append(truncate_plain(f"{SYM_PLAY} {display_name}{dur_tag}", info_max_width))
-                                    info.append(
-                                        f"{sym_color}{SYM_PLAY}\x1b[0m "
-                                        f"\x1b[1;97m{display_name}\x1b[0m{_pin_str}"
-                                        f"\x1b[2;38;5;{_dur_col}m{dur_tag}\x1b[0m"
-                                    )
-                                else:
-                                    _pin_str = " [pinned]" if repeat_current else ""
-                                    add_info_line(f"{SYM_PLAY} {display_name}{_pin_str}{dur_tag}", "36")
-
-                                # Line 2: hour + playback position + inline progress bar
-                                t_pos_s = tpos or 0.0
-                                t_dur_s = dur or 0.0
-                                bar_w = max(8, min(20, info_max_width - 26))
-                                pct = (t_pos_s / max(1.0, t_dur_s) * 100) if t_dur_s > 0 else 0
-                                pb_bar = (solid_bar(pct, bar_w, gradient_at(_tod_grad, 65)) if USE_COLOR
-                                          else ("[" + "=" * int(pct / 100 * bar_w) + "─" * (bar_w - int(pct / 100 * bar_w)) + "]"))
-                                pos_plain = f"  {display_hour:02d}h  {fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}"
-                                if USE_COLOR:
-                                    _h_col = gradient_at(_tod_grad, 70)
-                                    info_plain.append(truncate_plain(pos_plain, info_max_width))
-                                    info.append(
-                                        f"  \x1b[38;5;{_h_col}m{display_hour:02d}h\x1b[0m"
-                                        f"  \x1b[2;36m{fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}\x1b[0m"
-                                        f"  {pb_bar}"
-                                    )
-                                else:
-                                    add_info_line(f"{pos_plain}  {pb_bar}", "2")
-                            else:
-                                add_info_line(f"  (no track for {hour:02d}h)", "2")
-
-                            # Line 3: filter + vis + pulse + vol (secondary, dim)
-                            if USE_COLOR:
-                                _flt_col = gradient_at(_tod_grad, 60)
-                                _pd_col = gradient_at(_tod_grad, 90)
-                                pulse_dot = (f"\x1b[1;38;5;{_pd_col}m●\x1b[0m" if (pulse_bright and not muted)
-                                             else f"\x1b[2;38;5;{_pd_col}m·\x1b[0m")
-                                muted_tag = f"  \x1b[1;31m◆ MUTED\x1b[0m" if muted else ""
-                                _vol_inline = (f"  \x1b[2;36mVol\x1b[0m {int(display_vol):3d}%{_vol_flash_str}"
-                                               if display_vol is not None else "")
-                                meta_plain = f"  {_flt_sum}  {VIS_MODES[vis_idx]}"
-                                meta_color = (
-                                    f"  \x1b[2;38;5;{_flt_col}m{_flt_sum}\x1b[0m"
-                                    f"  \x1b[2;36m{VIS_MODES[vis_idx]}\x1b[0m"
-                                    f"  {pulse_dot}{muted_tag}{_vol_inline}"
-                                )
-                                info_plain.append(truncate_plain(meta_plain, info_max_width))
-                                info.append(meta_color)
-                            else:
-                                _vol_inline = f"  Vol {int(display_vol)}%" if display_vol is not None else ""
-                                add_info_line(f"  {_flt_sum}  {VIS_MODES[vis_idx]}{_vol_inline}", "2")
-
-                            # Line 4: until next hour with bar
-                            uvalue = f"{remaining//60:02d}:{remaining%60:02d}"
-                            if USE_COLOR:
-                                hr_pct = min(100, int(remaining / 3600 * 100))
-                                cbar_w = max(4, min(20, info_max_width - 18))
-                                cbar = solid_bar(hr_pct, cbar_w, gradient_at(_tod_grad, 50))
-                                _uc = gradient_at(_tod_grad, 55)
-                                info_plain.append(truncate_plain(f"  Until: {uvalue}", info_max_width))
-                                info.append(f"  \x1b[2;36mUntil:\x1b[0m \x1b[38;5;{_uc}m{uvalue}\x1b[0m  {cbar}")
-                            else:
-                                add_info_line(f"  Until: {uvalue}", "95")
-
-                            # Line 5: pick reason (explainability, dim)
-                            if track_pick_reason and not showing_chime:
-                                reason_plain = f"  why: {track_pick_reason}"
-                                if USE_COLOR:
-                                    info_plain.append(truncate_plain(reason_plain, info_max_width))
-                                    info.append(f"  \x1b[2mwhy: {track_pick_reason}\x1b[0m")
-                                else:
-                                    add_info_line(reason_plain, "2")
-
+                        _np_ctx = NowPlayingContext(
+                            compact=compact_info,
+                            max_width=info_max_width,
+                            current_track=current_track,
+                            current_track_hour=current_track_hour,
+                            hour=hour,
+                            tpos=tpos,
+                            dur=dur,
+                            showing_chime=showing_chime,
+                            chime_kind=chime_kind,
+                            repeat_current=repeat_current,
+                            track_pick_reason=track_pick_reason,
+                            background_mode=background_mode,
+                            muted=muted,
+                            game_label=_game_label,
+                            variant=variants_list[variant_idx],
+                            vis_mode=VIS_MODES[vis_idx],
+                            display_vol=display_vol,
+                            vol_flash_str=_vol_flash_str,
+                            remaining=remaining,
+                            pulse_bright=(not NO_MOTION) and (int(now) % 2 == 0),
+                            title_art=list(TITLE_ART) if (not compact_info) and TITLE_ART else [],
+                            title_art_colored=_term.TITLE_ART_COLORED,
+                            tod_grad=_active_tod_grad,
+                        )
+                        info_plain, info = _render_now_playing(_np_ctx)
                         info_cache_key = info_key
                         info_plain_cache = tuple(info_plain)
                         info_color_cache = tuple(info)
@@ -1702,76 +1516,11 @@ def main():
                     total_sec = int(stats_data.get("total_listen_seconds", 0) + session_listen)
                     hb = stats_data.get("hour_buckets", [0] * 24)
                     stats_inner_width = max(28, min(info_max_width, max(28, term_cols - 12)))
-                    top = sorted([(i, v) for i, v in enumerate(hb)], key=lambda x: x[1], reverse=True)[:3]
                     stats_key = (total_sec, int(session_listen), tuple(int(v) for v in hb), hour, stats_inner_width)
                     if stats_key != stats_cache_key:
-                        # Derived stats from hour_buckets
-                        hb_total = sum(hb)
-                        peak_h, peak_v = (top[0][0], top[0][1]) if top and top[0][1] > 0 else (0, 0)
-                        peak_pct = int(peak_v / max(1, hb_total) * 100)
-                        active_count = sum(1 for v in hb if v > 0)
-                        avg_per_h = format_seconds(int(hb_total / max(1, active_count))) if active_count > 0 else "--"
-                        top_hours_text = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none yet)"
-                        hist_plain, marker_plain, axis_plain = build_hour_histogram_lines(hb, hour, stats_inner_width)
-
-                        stats_plain = [
-                            truncate_plain(f"Total listening: {format_seconds(total_sec)}", stats_inner_width),
-                            truncate_plain(f"This session: {format_seconds(session_listen)}", stats_inner_width),
-                            truncate_plain(f"Most-listened hours: {top_hours_text}", stats_inner_width),
-                            truncate_plain(
-                                f"Busiest hour: {peak_h:02d}:00 ({peak_pct}% of total)" if peak_v > 0 else "Busiest hour: (not enough listening yet)",
-                                stats_inner_width,
-                            ),
-                            truncate_plain(f"Hours used: {active_count} of 24   Avg used hour: {avg_per_h}", stats_inner_width),
-                            hist_plain,
-                            marker_plain,
-                            axis_plain,
-                        ]
-                        if USE_COLOR:
-                            _s_total_pct = min(100, int(total_sec / 360000 * 100))
-                            _s_sess_pct  = min(100, int(session_listen / 28800 * 100))
-                            _s_total_bar = gradient_bar(_s_total_pct, 8, _active_tod_grad)
-                            _s_sess_bar  = gradient_bar(_s_sess_pct,  8, _active_tod_grad)
-
-                            # Each sampled histogram bar inherits the color of its nearest hour.
-                            hist_parts = []
-                            for col_idx, ch in enumerate(hist_plain):
-                                if ch == " ":
-                                    hist_parts.append(" ")
-                                else:
-                                    h_idx = int(round(col_idx / max(1, stats_inner_width - 1) * 23))
-                                    brightness = 100 if h_idx == (hour % 24) else 70
-                                    col = gradient_at(_grad_for_hour(h_idx), brightness)
-                                    bold = "[1;" if h_idx == (hour % 24) else "["
-                                    hist_parts.append(f"{bold}38;5;{col}m{ch}[0m")
-                            hist_colored = "".join(hist_parts)
-
-                            _mc = gradient_at(_active_tod_grad, 95)
-                            marker_pos = marker_plain.find("▴")
-                            marker_colored = (" " * max(0, marker_pos)
-                                             + f"[1;38;5;{_mc}m▴[0m"
-                                             + " " * max(0, stats_inner_width - marker_pos - 1))
-                            axis_colored = c256(axis_plain, gradient_at(_active_tod_grad, 35))
-
-                            _tc = gradient_at(_active_tod_grad, 70)
-                            _pc = gradient_at(_active_tod_grad, 80)
-                            _cc = gradient_at(_active_tod_grad, 55)
-                            stats_color = [
-                                f"[2;36mTotal listening:[0m  [2m{format_seconds(total_sec)}[0m  {_s_total_bar}",
-                                f"[2;36mThis session:[0m  [2m{format_seconds(session_listen)}[0m  {_s_sess_bar}",
-                                f"[2;36mMost-listened hours:[0m [38;5;{_tc}m{top_hours_text}[0m",
-                                (
-                                    f"[2;36mBusiest hour:[0m [38;5;{_pc}m{peak_h:02d}:00 ({peak_pct}% of total)[0m"
-                                    if peak_v > 0 else
-                                    f"[2;36mBusiest hour:[0m [38;5;{_cc}m(not enough listening yet)[0m"
-                                ),
-                                f"[2;36mHours used:[0m [2m{active_count} of 24[0m   [2;36mAvg used hour:[0m [2m{avg_per_h}[0m",
-                                hist_colored,
-                                marker_colored,
-                                axis_colored,
-                            ]
-                        else:
-                            stats_color = [c(s, "2") for s in stats_plain]
+                        stats_plain, stats_color = _stats_panel.render(
+                            stats_data, session_listen, stats_inner_width, hour, _active_tod_grad,
+                        )
                         stats_box_cache, stats_w_cache = build_box(stats_plain, stats_color, maxw_override=stats_inner_width, title="Stats")
                         stats_cache_key = stats_key
                     stats_box = stats_box_cache
@@ -1807,33 +1556,9 @@ def main():
                     _hist_sel_clamped = max(0, min(hist_sel, len(hist_list) - 1)) if hist_list else 0
                     hist_key = (hist_list, panel_max_width, hour, layout_preset, _hist_focused, _hist_sel_clamped)
                     if hist_key != hist_cache_key:
-                        hist_title = "Recently played"
-                        hist_title_trunc = truncate_plain(hist_title, panel_max_width)
-                        def _fmt_hist(name):
-                            meta = parse_filename(name)
-                            if meta:
-                                return f"{meta['game']}: {meta['variant']}"
-                            return name
-                        hist_entries = [_fmt_hist(s) for s in hist_list] if hist_list else ["(none yet)"]
-                        hist_lines = [hist_title_trunc] + hist_entries
-                        hist_lines = [truncate_plain(s, panel_max_width) for s in hist_lines]
-                        hist_plain = hist_lines
-                        if USE_COLOR and hist_list:
-                            n_h = len(hist_list)
-                            _hh_hi = gradient_at(_active_tod_grad, 70)
-                            hist_color = [c256(hist_title_trunc, _hh_hi)]
-                            for hi, hs in enumerate(hist_lines[1:]):
-                                if _hist_focused and hi == _hist_sel_clamped:
-                                    hist_color.append(f"\x1b[7m{hs}\x1b[0m")  # reverse video = selected
-                                else:
-                                    age_frac = (n_h - 1 - hi) / max(1, n_h - 1)
-                                    shade = gradient_at(_active_tod_grad, int(35 + (1 - age_frac) * 35))
-                                    hist_color.append(c256(hs, shade))
-                        else:
-                            hist_color = [c(hist_title_trunc, "36")] + [
-                                (f"\x1b[7m{s}\x1b[0m" if (_hist_focused and hi == _hist_sel_clamped) else c(s, "2"))
-                                for hi, s in enumerate(hist_lines[1:])
-                            ]
+                        hist_plain, hist_color = _hist_panel.render(
+                            list(hist_list), panel_max_width, _active_tod_grad, _hist_focused, _hist_sel_clamped,
+                        )
                         _hist_title = "▶ History" if _hist_focused else "History"
                         hist_box_cache, hist_w_cache = build_box(hist_plain, hist_color, maxw_override=panel_max_width, title=_hist_title)
                         hist_cache_key = hist_key
@@ -1846,40 +1571,9 @@ def main():
                     _up_sel_clamped = max(0, min(up_sel, len(next_list) - 1)) if next_list else 0
                     up_key = (next_list, panel_max_width, UP_NEXT_MAX, hour, layout_preset, _up_focused, _up_sel_clamped)
                     if up_key != up_cache_key:
-                        if next_list:
-                            def _fmt_candidate(name):
-                                meta = parse_filename(name)
-                                if meta:
-                                    return f"{meta['game']}: {meta['variant']}"
-                                return name
-                            shown_raw = list(next_list[:UP_NEXT_MAX])
-                            shown = [_fmt_candidate(s) for s in shown_raw]
-                            if len(next_list) > UP_NEXT_MAX:
-                                shown.append(f"{SYM_ELLIPSIS} +{len(next_list) - UP_NEXT_MAX} more")
-                            header_plain = f"Up next ({min(len(next_list), UP_NEXT_MAX)}/{len(next_list)})"
-                            header_plain_trunc = truncate_plain(header_plain, panel_max_width)
-                            up_plain = [header_plain_trunc] + shown
-                            up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
-                            if USE_COLOR:
-                                _uc_hi = gradient_at(_active_tod_grad, 70)
-                                _uc_lo = gradient_at(_active_tod_grad, 40)
-                                up_color = [c256(header_plain_trunc, _uc_hi)]
-                                for i, s in enumerate(up_plain[1:]):
-                                    if _up_focused and i == _up_sel_clamped:
-                                        up_color.append(f"\x1b[7m{s}\x1b[0m")
-                                    else:
-                                        up_color.append(f"\x1b[2m{superscript_num(i+1)}\x1b[0m {c256(s, _uc_lo if i >= 1 else _uc_hi)}")
-                            else:
-                                up_color = [c(header_plain_trunc, "36")] + [
-                                    (f"\x1b[7m{s}\x1b[0m" if (_up_focused and i == _up_sel_clamped) else c(s, "2"))
-                                    for i, s in enumerate(up_plain[1:])
-                                ]
-                        else:
-                            up_title = "Up next"
-                            up_title_trunc = truncate_plain(up_title, panel_max_width)
-                            up_plain = [up_title_trunc, "(no candidates)"]
-                            up_plain = [truncate_plain(s, panel_max_width) for s in up_plain]
-                            up_color = [c(up_title_trunc, "36"), c("(no candidates)", "2")]
+                        up_plain, up_color = _up_next_panel.render(
+                            list(next_list), panel_max_width, _active_tod_grad, _up_focused, _up_sel_clamped,
+                        )
                         _up_title = "▶ Up Next" if _up_focused else "Up Next"
                         up_box_cache, up_w_cache = build_box(up_plain, up_color, maxw_override=panel_max_width, title=_up_title)
                         up_cache_key = up_key
@@ -1961,22 +1655,10 @@ def main():
                     help_max_width = max(14, min(info_max_width, term_cols - 8))
                     help_key = (help_sink, hour, help_max_width, help_rows_budget)
                     if help_key != help_cache_key:
-                        help_lines = list(HELP_LINES_BASE[1:])
-                        help_lines.append(f"Audio output: {help_sink}")
-                        help_lines.append("Focus throttle: AC_UI_FOCUS_THROTTLE=1")
-                        wrapped_help = []
-                        for help_line in help_lines:
-                            wrapped_help.extend(wrap_plain(help_line, help_max_width) or [""])
-                        wrapped_help = wrapped_help[:max(0, help_rows_budget - 2)]
-                        if wrapped_help:
-                            if USE_COLOR:
-                                _hk_col = gradient_at(_active_tod_grad, 80)
-                                help_color = [colorize_hint_keys(s, _hk_col, base_code="2") for s in wrapped_help]
-                            else:
-                                help_color = [c(s, "2") for s in wrapped_help]
-                            help_box_cache, _ = build_box(wrapped_help, help_color, maxw_override=help_max_width, title="Help")
-                        else:
-                            help_box_cache = None
+                        _hp, _hc = _help_panel.render(
+                            HELP_LINES_BASE, help_sink, help_max_width, help_rows_budget - 2, _active_tod_grad,
+                        )
+                        help_box_cache = build_box(_hp, _hc, maxw_override=help_max_width, title="Help")[0] if _hp else None
                         help_cache_key = help_key
                     if help_box_cache and (len(lines) + len(help_box_cache) <= max_content_end):
                         lines.extend(help_box_cache)
@@ -2149,6 +1831,9 @@ def main():
                             lines.extend([prefix + ln for ln in vis_lines])
                         elif draw_mode == "braille":
                             vis_lines = braille_spectrum_lines(smooth_bars, spectrum_height_dyn, bars_len, peak_bars=cap_pos, use_color=spectrum_use_color, game_tag=game_tag)
+                            lines.extend([prefix + ln for ln in vis_lines])
+                        elif draw_mode == "ascii":
+                            vis_lines = ascii_bars_lines(smooth_bars, spectrum_height_dyn, bars_len, state=ascii_state, use_color=spectrum_use_color, game_tag=game_tag)
                             lines.extend([prefix + ln for ln in vis_lines])
                         else:
                             pass_peaks = cap_pos if draw_mode == "peaks" else peak_bars
@@ -2604,6 +2289,7 @@ def main():
         teardown_private_sink(private_module, loopback_module)
         enable_autowrap()
         show_cursor()
+        reset_terminal_title()
         exit_alt_screen()
 
 if __name__ == "__main__":

@@ -6,6 +6,22 @@ from ac_ui.constants import (
 )
 from ac_ui.layout_config import normalize_layout_config
 
+UI_STATE_VERSION = 2
+
+
+def _migrate_ui_state(src: dict) -> dict:
+    """Migrate older ui_state dicts to current version."""
+    try:
+        v = int(src.get("_version", 1))
+    except (TypeError, ValueError):
+        v = 1
+    if v < 2:
+        # v1 → v2: layout_preset moved into nested layout dict
+        if "layout_preset" in src and "layout" not in src:
+            src["layout"] = {"preset": src.pop("layout_preset")}
+    return src
+
+
 def load_ui_state():
     data = {
         "output_vol": 75,
@@ -23,6 +39,7 @@ def load_ui_state():
             with open(UI_STATE_PATH, "r", encoding="utf-8") as f:
                 src = json.load(f)
             if isinstance(src, dict):
+                src = _migrate_ui_state(src)
                 data.update(src)
     except Exception:
         pass
@@ -53,5 +70,7 @@ def load_ui_state():
     return data
 
 def save_ui_state(data):
-    _atomic_write_json(UI_STATE_PATH, data)
+    payload = dict(data)
+    payload["_version"] = UI_STATE_VERSION
+    _atomic_write_json(UI_STATE_PATH, payload)
 

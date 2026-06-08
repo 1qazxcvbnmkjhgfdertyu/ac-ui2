@@ -1,5 +1,6 @@
 import os, sys, subprocess, json, time, stat, errno, shutil, socket
 
+import ac_ui.diagnostics as _diag
 import ac_ui.colors as _clrs
 from ac_ui.town_tune import spawn_town_tune
 from ac_ui.constants import (
@@ -52,11 +53,11 @@ def calc_cava_bars():
 
 
 def pactl(*args):
-    # Suppress pactl stderr to avoid noisy "Failure: No such entity"
     try:
         res = subprocess.run(["pactl", *args], text=True, capture_output=True)
         return res.stdout if res.stdout is not None else ""
-    except Exception:
+    except Exception as exc:
+        _diag.warn("pactl", f"command failed: {list(args)}", exc=exc)
         return ""
 
 def get_default_sink():
@@ -319,7 +320,6 @@ def setup_private_sink(output_sink=None, sink_name=None):
         for line in out.splitlines():
             cols = line.split("\t")
             if len(cols) > 1 and cols[1] == sink_name:
-                # already exists
                 break
         else:
             null_module_id = pactl(
@@ -328,7 +328,8 @@ def setup_private_sink(output_sink=None, sink_name=None):
                 f"sink_name={sink_name}",
                 "sink_properties=device.description=AC_UI",
             ).strip()
-    except Exception:
+    except Exception as exc:
+        _diag.error("sink", f"null sink creation failed for {sink_name}", exc=exc)
         return None, None, None, None
 
     # Clean up stale loopbacks for this sink so each run owns a single route.
@@ -476,16 +477,14 @@ def mpv_command(ipc_path, command):
         return False
 
 def mpv_query(ipc_path, prop):
-    # Query via unix socket using python's socket module (reliable)
-    import socket
+    import socket as _socket
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         s.settimeout(0.2)
         s.connect(ipc_path)
         s.sendall((json.dumps({"command": ["get_property", prop]}) + "\n").encode("utf-8"))
         data = s.recv(4096).decode("utf-8", errors="ignore")
         s.close()
-        # mpv can return multiple JSON lines; parse last valid line
         lines = [ln for ln in data.splitlines() if ln.strip().startswith("{")]
         for ln in reversed(lines):
             try:
@@ -495,7 +494,8 @@ def mpv_query(ipc_path, prop):
             except Exception:
                 pass
         return None
-    except Exception:
+    except Exception as exc:
+        _diag.warn("mpv", f"query '{prop}' failed", exc=exc)
         return None
 
 def mpv_query_props(ipc_path, props):

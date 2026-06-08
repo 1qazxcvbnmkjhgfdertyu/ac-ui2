@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest
+          pip install -e . --no-deps
+
+      - name: Ruff — undefined name check (F821)
+        run: ruff check ac_ui/ --select F821
+
+      - name: Ruff — full lint
+        run: ruff check ac_ui/ tests/
+        continue-on-error: true  # warn but don't block on style issues
+
+      - name: Pytest
+        run: pytest tests/ -v --tb=short

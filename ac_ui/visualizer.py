@@ -614,6 +614,57 @@ def heartbeat_render_lines(bars, height, width, state, use_color=True, game_tag=
 
 
 
+_ASCII_FRAC = (" ", ".", "'", "`", ",", ";", ":", "-", "~", "=", "+", "*", "%", "&", "#", "@")  # 16 levels: empty → full
+_ASCII_LEVELS = len(_ASCII_FRAC) - 1  # 15 steps
+
+def ascii_bars_lines(bars, height, width, state=None, use_color=True, game_tag=None):
+    """Solid # pillars with 8-step density scale and 2-frame temporal dithering.
+
+    Sub-row resolution: the tip row cycles through 8 ASCII density chars
+    (. : - = + * #) giving 8x vertical smoothness. Temporal dithering
+    alternates adjacent levels per-bar per-frame, doubling that to ~16x.
+    Adjacent bars are out of phase so no whole-row strobe effect.
+    """
+    if state is not None:
+        frame = state.get("frame", 0)
+        state["frame"] = frame + 1
+    else:
+        frame = 0
+    bars = bars or []
+    if not bars or height <= 0 or width <= 0:
+        return [" " * max(1, width)] * max(1, height)
+    resampled = resample_bars(bars, width)
+    lines = []
+    for row in range(height):
+        row_chars = []
+        for i, v in enumerate(resampled):
+            v = max(0.0, min(1.0, v))
+            fill_f = v * height
+            fill_full = int(fill_f)
+            frac = fill_f - fill_full
+            row_from_bottom = height - 1 - row
+            if row_from_bottom < fill_full:
+                ch = "#"
+            elif row_from_bottom == fill_full:
+                level_f = frac * _ASCII_LEVELS  # 0.0 .. 7.0
+                level = int(level_f)
+                sub = level_f - level            # sub-step fraction 0..1
+                # Temporal dither: promote to level+1 on alternating frames
+                # when sub ≥ 0.5; per-bar phase keeps adjacent cols out of sync
+                if sub >= 0.5 and (frame + i) % 2 == 0:
+                    level = min(_ASCII_LEVELS, level + 1)
+                ch = _ASCII_FRAC[level]
+            else:
+                ch = " "
+            if use_color and ch != " ":
+                col = spectrum_color(i, width, row_from_bottom / max(1, height - 1), game_tag=game_tag)
+                row_chars.append(f"\x1b[38;5;{col}m{ch}\x1b[0m")
+            else:
+                row_chars.append(ch)
+        lines.append("".join(row_chars))
+    return lines
+
+
 def braille_spectrum_lines(bars, height, width, peak_bars=None, use_color=True, game_tag=None):
     """
     Btop-style two-value-per-char braille spectrum.

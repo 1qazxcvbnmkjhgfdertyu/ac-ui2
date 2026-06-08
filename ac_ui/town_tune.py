@@ -125,12 +125,16 @@ def load_town_tune():
         pass
     return normalize_town_tune(notes)
 
+TOWN_TUNE_VERSION = 1
+
+
 def save_town_tune(notes):
     notes = normalize_town_tune(notes)
     values = town_tune_tokens_to_values(notes)
     _atomic_write_json(
         TOWN_TUNE_PATH,
         {
+            "_version": TOWN_TUNE_VERSION,
             "notes": notes,
             "values": values,
             "packed": f"0x{pack_town_tune_values(values):016X}",

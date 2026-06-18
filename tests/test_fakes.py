@@ -114,6 +114,26 @@ def test_fake_cava_stop():
     assert cava.bars is None
 
 
+# ── FakePcmRuntime ────────────────────────────────────────────────────────────
+
+def test_fake_pcm_runtime_emits_stereo_waveform():
+    from ac_ui.fakes import FakePcmRuntime
+    pcm = FakePcmRuntime(buffer_frames=512)
+    assert not pcm.is_running
+    pcm.start_fake()
+    left, right = pcm.waveform_window(128)
+    assert pcm.is_running
+    assert pcm.ok
+    assert len(left) == 128
+    assert len(right) == 128
+    assert any(abs(v) > 0.01 for v in left)
+    assert left != right
+    pcm.tick(frames=64)
+    left2, right2 = pcm.waveform_window(64)
+    assert len(left2) == 64
+    assert len(right2) == 64
+
+
 # ── Now Playing panel renderer ───────────────────────────────────────────────
 
 def _make_np_ctx(**kwargs):
@@ -156,6 +176,13 @@ def test_now_playing_full_mode():
     assert any("14h" in s for s in plain)
     assert any("Until" in s for s in plain)
     assert len(plain) == len(color)
+
+
+def test_now_playing_hides_persistent_volume_counter():
+    from ac_ui.panels.now_playing import render
+    ctx = _make_np_ctx(display_vol=80, vol_flash_str="")
+    plain, _color = render(ctx)
+    assert not any("Vol " in s for s in plain)
 
 
 def test_now_playing_compact_mode():
@@ -201,9 +228,9 @@ def test_now_playing_pick_reason():
 def test_history_panel_empty():
     import ac_ui.colors as _clrs
     from ac_ui.panels.history import render
+    # btop-style: the panel name is in the box border, not an internal header line.
     plain, color = render([], max_width=40, tod_grad=_clrs._active_tod_grad)
-    assert plain[0] == "Recently played"
-    assert "(none yet)" in plain[1]
+    assert "(none yet)" in plain[0]
 
 
 def test_history_panel_entries():
@@ -211,8 +238,8 @@ def test_history_panel_entries():
     from ac_ui.panels.history import render
     tracks = ["14-GCN-normal.mp3", "15-WW-rainy.flac"]
     plain, color = render(tracks, max_width=40, tod_grad=_clrs._active_tod_grad)
-    assert len(plain) == 3  # header + 2 entries
-    assert "GCN" in plain[1]
+    assert len(plain) == 2  # no header — just the 2 entries
+    assert "GCN" in plain[0]
 
 
 def test_up_next_panel_empty():
@@ -227,8 +254,8 @@ def test_up_next_panel_truncation():
     from ac_ui.panels.up_next import render
     tracks = [f"14-GCN-variant{i}.mp3" for i in range(10)]
     plain, color = render(tracks, max_width=40, tod_grad=_clrs._active_tod_grad, max_shown=3)
-    # header + 3 shown + overflow indicator
-    assert len(plain) == 5
+    # 3 shown + overflow indicator (no internal header line)
+    assert len(plain) == 4
     assert "more" in plain[-1]
 
 
@@ -297,7 +324,9 @@ def test_stats_panel_empty_data():
     from ac_ui.panels.stats import render
     data = {"total_listen_seconds": 0, "hour_buckets": [0] * 24}
     plain, color = render(data, 0.0, max_width=40, hour=14, tod_grad=_clrs._active_tod_grad)
-    assert len(plain) == 8  # 5 text lines + hist + marker + axis
+    # 5 text lines + 3-row area graph + marker + axis
+    assert len(plain) == 10
+    assert len(plain) == len(color)
     assert "Total listening" in plain[0]
     assert "0s" in plain[0]
 
@@ -365,3 +394,60 @@ def test_ui_state_v1_migration(tmp_path, monkeypatch):
     state = load_ui_state()
     assert state["output_vol"] == 70
     assert isinstance(state["layout"], dict)
+
+
+def test_theme_display_names_and_roles():
+    import ac_ui.colors as _clrs
+    _clrs.set_theme("crayon")
+    assert _clrs.theme_display_name() == "Crayola Box"
+    assert _clrs.theme_blurb() == "Banana Mania / Pink Sherbet"
+    accent = _clrs.theme_role("accent", _clrs._grad_for_hour(6))
+    danger = _clrs.theme_role("danger", _clrs._grad_for_hour(6))
+    assert hasattr(accent, "rgb")
+    assert hasattr(accent, "ansi")
+    assert hasattr(danger, "rgb")
+    _clrs.set_theme("default")
+
+
+def test_rgb_gradient_interpolation_returns_terminal_colors():
+    import ac_ui.colors as _clrs
+    grad = _clrs._make_gradient((255, 128, 128), (128, 200, 255), 5)
+    assert len(grad) == 5
+    assert grad[0].rgb == (255, 128, 128)
+    assert grad[-1].rgb == (128, 200, 255)
+    assert all(hasattr(c, "ansi") for c in grad)
+
+
+def test_theme_art_and_visualizer_styles_vary_by_theme():
+    import ac_ui.colors as _clrs
+    _clrs.set_theme("ocean")
+    ocean_art = _clrs.theme_art_style()
+    ocean_chrome = _clrs.theme_chrome()
+    ocean_vis = _clrs.theme_visualizer_color("spectrum", 72, active=True)
+    _clrs.set_theme("chalk")
+    chalk_art = _clrs.theme_art_style()
+    chalk_chrome = _clrs.theme_chrome()
+    chalk_vis = _clrs.theme_visualizer_color("spectrum", 72, active=True)
+    assert ocean_art["mode"] != chalk_art["mode"]
+    assert ocean_art["font"] != chalk_art["font"]
+    assert ocean_chrome["box_chars"]["v"] != chalk_chrome["box_chars"]["v"] or ocean_chrome["divider"] != chalk_chrome["divider"]
+    assert ocean_vis.rgb != chalk_vis.rgb
+    _clrs.set_theme("default")
+
+
+def test_build_box_uses_theme_chrome():
+    import ac_ui.colors as _clrs
+    from ac_ui.layout import build_box
+
+    _clrs.set_theme("night")
+    chrome = _clrs.theme_chrome()
+    box, _ = build_box(["hello"], ["hello"], title="Now")
+    top = _clrs.strip_ansi(box[0])
+    bottom = _clrs.strip_ansi(box[-1])
+    assert top.startswith(chrome["box_chars"]["tl"])
+    assert top.endswith(chrome["box_chars"]["tr"])
+    assert bottom.startswith(chrome["box_chars"]["bl"])
+    assert bottom.endswith(chrome["box_chars"]["br"])
+    assert chrome["title_left"] in top
+    assert chrome["title_right"] in top
+    _clrs.set_theme("default")

@@ -1,17 +1,23 @@
+import math
 import os, sys, re, select, termios, tty, subprocess, shutil, unicodedata, ctypes, ctypes.util
 
 from ac_ui.constants import SHOW_TITLE_ART
-from ac_ui.colors import USE_COLOR, visible_len, char_cell_width, plain_visible_len, strip_ansi
+import ac_ui.colors as _clrs
+from ac_ui.colors import (
+    USE_COLOR, visible_len, char_cell_width, plain_visible_len, strip_ansi,
+    paint, gradient_at, theme_art_gradient, theme_art_style, theme_role,
+)
 
 # Mutable globals updated by ui.py via module reference
 TITLE_ART = []
 TITLE_ART_COLORED = False
 TITLE_ART_BASE = []
-TITLE_LOLCAT_PATH = None
 TITLE_ART_VERSION = 0
 
 # Differential render: only rewrite lines that changed (btop pattern)
 _render_prev_lines: list = []
+_render_prev_raw_lines: list = []
+_render_prev_width: int | None = None
 
 class RawMode:
     def __enter__(self):
@@ -79,16 +85,100 @@ def exit_alt_screen():
 
 def invalidate_render_cache(clear_screen=False):
     """Reset line-diff state (resize, full-screen overlays)."""
-    global _render_prev_lines
+    global _render_prev_lines, _render_prev_raw_lines, _render_prev_width
     _render_prev_lines = []
+    _render_prev_raw_lines = []
+    _render_prev_width = None
     if clear_screen:
         sys.stdout.write("\033[2J")
         sys.stdout.flush()
 
 
+def animate_title_art(base_lines, phase=0.0):
+    """Colorize title art in-process using the active theme gradient."""
+    if not USE_COLOR or not base_lines:
+        return list(base_lines), False
+    style = theme_art_style()
+    mode = style.get("mode", "sweep")
+    outline = theme_role(style.get("outline", "border_hi"), _clrs._active_tod_grad)
+    art_grad = theme_art_gradient(_clrs._active_tod_grad)
+    total = sum(max(1, len(line)) for line in base_lines)
+    cursor = 0
+    out = []
+    phase_shift = int(phase * 100)
+
+    def is_edge(row_idx, col_idx):
+        neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
+        for drow, dcol in neighbors:
+            rr = row_idx + drow
+            cc = col_idx + dcol
+            if rr < 0 or rr >= len(base_lines):
+                return True
+            line = base_lines[rr]
+            if cc < 0 or cc >= len(line) or line[cc] == " ":
+                return True
+        return False
+
+    for row_idx, line in enumerate(base_lines):
+        parts = []
+        for col_idx, ch in enumerate(line):
+            if ch == " ":
+                parts.append(ch)
+                cursor += 1
+                continue
+            sweep = ((cursor * 100) // max(1, total - 1) + phase_shift + row_idx * 7 + col_idx * 2) % 101
+            edge = is_edge(row_idx, col_idx)
+            dim = False
+            if mode == "outline":
+                color = outline if edge else gradient_at(art_grad, sweep)
+                bold = edge or ((row_idx + col_idx + phase_shift) % 11 == 0)
+            elif mode == "neon":
+                glow = (sweep + int(14 * math.sin(row_idx * 0.8 + col_idx * 0.18 + phase * math.tau))) % 101
+                color = outline if edge and ((row_idx + col_idx + phase_shift) % 2 == 0) else gradient_at(art_grad, glow)
+                bold = True
+            elif mode == "ember":
+                ember = min(100, max(0, sweep + int(18 * math.sin(row_idx * 0.55 + phase * math.tau))))
+                color = outline if edge else gradient_at(art_grad, ember)
+                bold = edge or ((row_idx + col_idx + phase_shift) % 7 == 0)
+            elif mode == "tide":
+                tide = (sweep + int(16 * math.sin(row_idx * 0.9 + col_idx * 0.22 + phase * math.tau))) % 101
+                color = outline if edge else gradient_at(art_grad, tide)
+                bold = edge or ((col_idx + phase_shift) % 13 == 0)
+            elif mode == "bloom":
+                bloom = (
+                    sweep
+                    + int(10 * math.sin(row_idx * 0.75 + phase * math.tau))
+                    + int(8 * math.cos(col_idx * 0.18 + phase * math.tau))
+                ) % 101
+                color = outline if edge and ((row_idx + col_idx + phase_shift) % 3 == 0) else gradient_at(art_grad, bloom)
+                bold = edge or ((row_idx * 3 + col_idx + phase_shift) % 17 == 0)
+                dim = (not edge) and ((row_idx + col_idx + phase_shift) % 11 == 0)
+            elif mode == "crayon":
+                stripe = (row_idx * 19 + col_idx * 9 + phase_shift * 3) % 101
+                color = outline if edge else gradient_at(art_grad, stripe)
+                bold = (not edge) or ((row_idx + col_idx + phase_shift) % 5 == 0)
+                dim = edge and ((col_idx + phase_shift) % 4 == 0)
+            elif mode == "chalk":
+                stripe = (row_idx * 13 + col_idx * 7 + phase_shift * 2) % 101
+                color = outline if edge else gradient_at(art_grad, stripe)
+                bold = edge or ((row_idx + phase_shift) % 6 == 0)
+                dim = (not edge) and ((row_idx * 5 + col_idx + phase_shift) % 4 == 0)
+            elif mode == "ribbon":
+                ribbon = (sweep + int(16 * math.sin(col_idx * 0.26 - phase * math.tau))) % 101
+                color = outline if edge else gradient_at(art_grad, ribbon)
+                bold = edge or ((row_idx + col_idx + phase_shift) % 8 == 0)
+            else:
+                color = gradient_at(art_grad, sweep)
+                bold = ((row_idx + col_idx + phase_shift) % 9 == 0)
+            parts.append(paint(ch, fg=color, bold=bold, dim=dim))
+            cursor += 1
+        out.append("".join(parts))
+    return out, True
+
+
 def render(lines, width=None, height=None):
     """Differential renderer: only outputs lines that changed since last frame."""
-    global _render_prev_lines
+    global _render_prev_lines, _render_prev_raw_lines, _render_prev_width
     if width is None or height is None:
         size = shutil.get_terminal_size(fallback=(80, 24))
         width = size.columns
@@ -100,7 +190,11 @@ def render(lines, width=None, height=None):
 
     # Clip each line to terminal width
     clipped = []
-    for line in lines:
+    same_width = _render_prev_width == width
+    for idx, line in enumerate(lines):
+        if same_width and idx < len(_render_prev_raw_lines) and line == _render_prev_raw_lines[idx]:
+            clipped.append(_render_prev_lines[idx])
+            continue
         vis = len(line) if "\x1b[" not in line and line.isascii() else visible_len(line)
         if vis >= width:
             line = truncate_ansi_visible(line, max(0, width - 1))
@@ -121,6 +215,8 @@ def render(lines, width=None, height=None):
         sys.stdout.flush()
 
     _render_prev_lines = clipped
+    _render_prev_raw_lines = list(lines)
+    _render_prev_width = width
 
 def _read_key(fd, timeout=0.1):
     try:
@@ -199,36 +295,39 @@ def truncate_plain(s, maxlen):
         width += ch_w
     return "".join(out) + ellipsis
 
-def truncate_ansi_visible(s, maxlen):
+def fit_ansi_line(s, maxlen):
+    """Truncate to ``maxlen`` visible columns AND return (line, visible_width).
+
+    Returning the width lets callers (e.g. build_box padding) avoid a second
+    full walk of the string just to measure it.
     """
-    Btop uresize() port: truncate to maxlen visible columns while
-    - respecting Unicode codepoint boundaries (not bytes)
-    - counting East-Asian wide chars as 2 columns
-    - closing any open ANSI color sequence at the cut point
-    """
-    import unicodedata
     if maxlen <= 0:
-        return ""
+        return "", 0
+    # Fast path: plain ASCII with no escapes is one column per char.
+    if "\x1b" not in s and s.isascii():
+        if len(s) <= maxlen:
+            return s, len(s)
+        return s[:maxlen], maxlen
     out = []
     visible = 0
     i = 0
+    n = len(s)
     open_ansi = False
-    while i < len(s):
+    while i < n:
         ch = s[i]
-        if ch == "\x1b" and i + 1 < len(s) and s[i + 1] == "[":
+        if ch == "\x1b" and i + 1 < n and s[i + 1] == "[":
             end = i + 2
-            while end < len(s) and s[end] != "m":
+            while end < n and s[end] != "m":
                 end += 1
-            end = min(end + 1, len(s))
-            seq = s[i:end]
-            out.append(seq)
-            open_ansi = not seq.endswith("[0m")
+            end = min(end + 1, n)
+            out.append(s[i:end])
+            open_ansi = not s[i:end].endswith("[0m")
             i = end
             continue
         if visible >= maxlen:
             break
-        # Count wide chars (CJK, some emoji) as 2 columns — btop "wide" flag
-        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        # Count wide chars (CJK, some emoji) as 2 columns — btop "wide" flag.
+        w = char_cell_width(ch)
         if visible + w > maxlen:
             break  # don't write a wide char that would overflow
         out.append(ch)
@@ -236,39 +335,40 @@ def truncate_ansi_visible(s, maxlen):
         i += 1
     if open_ansi:
         out.append("\x1b[0m")
-    return "".join(out)
+    return "".join(out), visible
+
+
+def truncate_ansi_visible(s, maxlen):
+    """
+    Btop uresize() port: truncate to maxlen visible columns while
+    - respecting Unicode codepoint boundaries (not bytes)
+    - counting East-Asian wide chars as 2 columns
+    - closing any open ANSI color sequence at the cut point
+    """
+    return fit_ansi_line(s, maxlen)[0]
 
 def build_title_art(text, width):
     if not SHOW_TITLE_ART:
-        return [], False, [], None
+        return [], False, []
     if shutil.which("figlet") is None:
-        return [], False, [], None
+        return [], False, []
     try:
-        art = subprocess.check_output(
-            ["figlet", "-w", str(max(10, width)), text],
-            text=True,
-        )
+        style = theme_art_style()
+        font = str(style.get("font") or "standard").strip() or "standard"
+        cmd = ["figlet", "-w", str(max(10, width))]
+        if font:
+            cmd.extend(["-f", font])
+        cmd.append(text)
+        try:
+            art = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            art = subprocess.check_output(
+                ["figlet", "-w", str(max(10, width)), text],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
         base_lines = [ln.rstrip("\n") for ln in art.splitlines()]
-        lines = list(base_lines)
-        lolcat_path = shutil.which("lolcat")
-        if lolcat_path is None:
-            for candidate in ("/usr/games/lolcat", "/usr/bin/lolcat", "/bin/lolcat"):
-                if os.path.exists(candidate) and os.access(candidate, os.X_OK):
-                    lolcat_path = candidate
-                    break
-        if USE_COLOR and lolcat_path is not None:
-            try:
-                colored = subprocess.check_output(
-                    [lolcat_path, "-f"],
-                    input="\n".join(base_lines),
-                    text=True,
-                )
-                lines = [ln.rstrip("\n") for ln in colored.splitlines()]
-                return lines, True, base_lines, lolcat_path
-            except Exception:
-                return lines, False, base_lines, lolcat_path
-        return lines, False, base_lines, lolcat_path
+        lines, colored = animate_title_art(base_lines, 0.0)
+        return lines, colored, base_lines
     except Exception:
-        return [], False, [], None
-
-
+        return [], False, []

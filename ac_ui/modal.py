@@ -18,7 +18,8 @@ from ac_ui.term import (
     invalidate_render_cache, render, _read_key,
     truncate_plain,
 )
-from ac_ui.colors import USE_COLOR, c, c256, gradient_at
+import ac_ui.colors as _clrs
+from ac_ui.colors import USE_COLOR, c, c256, theme_role
 from ac_ui.layout import build_box, wrap_plain
 
 
@@ -87,7 +88,7 @@ def modal_confirm(question, cols=None, rows=None, yes_key="y", no_key="n"):
     prompt_w = min(len(prompt) + 4, cols - 4)
     prompt_trunc = truncate_plain(prompt, prompt_w)
     if USE_COLOR:
-        colored = [c256(prompt_trunc, 220)]
+        colored = [c256(prompt_trunc, theme_role("accent", _clrs._active_tod_grad))]
     else:
         colored = [prompt_trunc]
     box, _ = build_box([prompt_trunc], colored, maxw_override=prompt_w, title="Confirm")
@@ -123,7 +124,7 @@ def modal_status_bar(message, color_code=None, cols=None):
     if USE_COLOR and color_code is not None:
         return c256(text, color_code)
     if USE_COLOR:
-        return c(text, "2")
+        return c256(text, theme_role("label_dim", _clrs._active_tod_grad))
     return text
 
 

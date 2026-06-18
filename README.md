@@ -106,6 +106,21 @@ python -m pytest
 The smoke tests under `tests/` focus on launcher startup, help output, state defaults,
 layout preview rendering, and the public audio-module surface.
 
+### Optional speed build (compiled visualizer)
+
+`ac-ui` is pure Python and runs anywhere. The heaviest visualizers — the
+feedback "tunnel" modes (`kaleido`, `liquid`, `plasma`) — have an **optional**
+compiled fast path. Build it once (needs a C compiler + `pip install cython`):
+
+```bash
+.venv/bin/python build_native.py
+```
+
+This produces `ac_ui/_vizfast*.so`; the app picks it up automatically (~5×
+faster kaleido) and falls back to pure Python if it isn't built. Nothing else
+needs the compiler. For weak machines, see `--low-power` / `--tty` and the
+in-app frame-rate menu (`r`).
+
 ## Audio Pipeline
 
 The default Linux audio routing is:

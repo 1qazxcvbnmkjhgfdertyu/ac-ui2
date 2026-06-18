@@ -3,10 +3,11 @@ import os, json
 from ac_ui.constants import (
     UI_STATE_PATH, VIS_MODE, VIS_MODES,
     coerce_bool, normalize_vis_mode, _atomic_write_json, DEFAULT_LAYOUT_PRESET,
+    default_vis_fps_map, VIS_FPS_CHOICES,
 )
 from ac_ui.layout_config import normalize_layout_config
 
-UI_STATE_VERSION = 2
+UI_STATE_VERSION = 3
 
 
 def _migrate_ui_state(src: dict) -> dict:
@@ -19,6 +20,11 @@ def _migrate_ui_state(src: dict) -> dict:
         # v1 → v2: layout_preset moved into nested layout dict
         if "layout_preset" in src and "layout" not in src:
             src["layout"] = {"preset": src.pop("layout_preset")}
+    if v < 3:
+        # v2 → v3: free-play runtime queue now persisted; older files simply
+        # have no saved queue, so a fresh shuffle is built on next launch.
+        src.setdefault("free_play_queue", [])
+        src.setdefault("free_play_idx", 0)
     return src
 
 
@@ -28,11 +34,17 @@ def load_ui_state():
         "muted": False,
         "mute_prev_vol": 50,
         "vis_mode": VIS_MODE,
+        "vis_shuffle": False,
         "repeat_current": False,
         "game": "ALL",
         "variant": "ALL",
         "layout": None,
         "theme": "default",
+        "free_play_mode": False,
+        "free_play_dir": "~/.local/share/ac-terminal-radio/playlists/f2p_nostalgia/f2p_nostalgia.acpl",
+        "free_play_queue": [],
+        "free_play_idx": 0,
+        "vis_fps": default_vis_fps_map(),
     }
     try:
         if os.path.exists(UI_STATE_PATH):
@@ -48,6 +60,7 @@ def load_ui_state():
     except Exception:
         data["output_vol"] = 75
     data["muted"] = coerce_bool(data.get("muted", False), False)
+    data["vis_shuffle"] = coerce_bool(data.get("vis_shuffle", False), False)
     data["repeat_current"] = coerce_bool(data.get("repeat_current", False), False)
     try:
         data["mute_prev_vol"] = max(0, min(100, int(data.get("mute_prev_vol", data["output_vol"]))))
@@ -67,7 +80,27 @@ def load_ui_state():
     if layout_src is None and isinstance(data.get("layout_preset"), str):
         layout_src = {"preset": data.get("layout_preset")}
     data["layout"] = normalize_layout_config(layout_src, default_preset=DEFAULT_LAYOUT_PRESET)
+    q = data.get("free_play_queue")
+    data["free_play_queue"] = [str(p) for p in q if isinstance(p, str)] if isinstance(q, list) else []
+    try:
+        data["free_play_idx"] = max(0, int(data.get("free_play_idx", 0)))
+    except (TypeError, ValueError):
+        data["free_play_idx"] = 0
+    data["vis_fps"] = _normalize_vis_fps(data.get("vis_fps"))
     return data
+
+
+def _normalize_vis_fps(value):
+    """Coerce a persisted tier->fps map into valid, in-range integers."""
+    base = default_vis_fps_map()
+    lo, hi = min(VIS_FPS_CHOICES), max(VIS_FPS_CHOICES)
+    if isinstance(value, dict):
+        for tier in base:
+            try:
+                base[tier] = max(lo, min(hi, int(value[tier])))
+            except (KeyError, TypeError, ValueError):
+                pass  # keep the default for this tier
+    return base
 
 def save_ui_state(data):
     payload = dict(data)

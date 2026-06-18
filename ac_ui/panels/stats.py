@@ -1,9 +1,14 @@
 """Stats panel renderer — pure function, no side effects."""
 from __future__ import annotations
 
-from ac_ui.colors import USE_COLOR, c, c256, gradient_at, gradient_bar, _grad_for_hour
+from ac_ui.colors import USE_COLOR, c256, gradient_at, paint, theme_role, _grad_for_hour
+from ac_ui.constants import SYM_HIST_MARKER
+from ac_ui.meters import braille_graph, meter_bar
 from ac_ui.stats import build_hour_histogram_lines, format_seconds
 from ac_ui.term import truncate_plain
+
+# Rows in the btop-style 24-hour listening area graph.
+HOUR_GRAPH_HEIGHT = 3
 
 
 def render(
@@ -32,9 +37,14 @@ def render(
     active_count = sum(1 for v in hb if v > 0)
     avg_per_h = format_seconds(int(hb_total / max(1, active_count))) if active_count > 0 else "--"
     top_hours_text = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none yet)"
-    hist_plain, marker_plain, axis_plain = build_hour_histogram_lines(hb, hour, max_width)
+    _hist_plain, marker_plain, axis_plain = build_hour_histogram_lines(hb, hour, max_width)
 
-    plain = [
+    # btop-style multi-row area graph of the 24h listening histogram.
+    hb_max = max(hb) if any(hb) else 1
+    normalized = [min(1.0, max(0.0, v / hb_max)) for v in hb]
+    graph_plain = braille_graph(normalized, max_width, HOUR_GRAPH_HEIGHT, use_color=False)
+
+    text_plain = [
         truncate_plain(f"Total listening: {format_seconds(total_sec)}", max_width),
         truncate_plain(f"This session: {format_seconds(session_listen)}", max_width),
         truncate_plain(f"Most-listened hours: {top_hours_text}", max_width),
@@ -44,56 +54,54 @@ def render(
             max_width,
         ),
         truncate_plain(f"Hours used: {active_count} of 24   Avg used hour: {avg_per_h}", max_width),
-        hist_plain,
-        marker_plain,
-        axis_plain,
     ]
+    plain = text_plain + graph_plain + [marker_plain, axis_plain]
 
     if USE_COLOR:
         _s_total_pct = min(100, int(total_sec / 360000 * 100))
         _s_sess_pct = min(100, int(session_listen / 28800 * 100))
-        _s_total_bar = gradient_bar(_s_total_pct, 8, tod_grad)
-        _s_sess_bar = gradient_bar(_s_sess_pct, 8, tod_grad)
+        _s_total_bar = meter_bar(_s_total_pct, 8, tod_grad)
+        _s_sess_bar  = meter_bar(_s_sess_pct,  8, tod_grad)
 
-        hist_parts = []
-        for col_idx, ch in enumerate(hist_plain):
-            if ch == " ":
-                hist_parts.append(" ")
-            else:
-                h_idx = int(round(col_idx / max(1, max_width - 1) * 23))
-                brightness = 100 if h_idx == (hour % 24) else 70
-                col = gradient_at(_grad_for_hour(h_idx), brightness)
-                bold = "\x1b[1;" if h_idx == (hour % 24) else "\x1b["
-                hist_parts.append(f"{bold}38;5;{col}m{ch}\x1b[0m")
-        hist_colored = "".join(hist_parts)
+        # Per-column time-of-day palette: each column glows in that hour's color,
+        # brightest at the current hour — a living 24h timeline, btop-style.
+        cur_hour = hour % 24
+        col_colors = []
+        for col_idx in range(max_width):
+            h_idx = int(round(col_idx / max(1, max_width - 1) * 23))
+            brightness = 100 if h_idx == cur_hour else 72
+            col_colors.append(gradient_at(_grad_for_hour(h_idx), brightness))
+        graph_colored = braille_graph(normalized, max_width, HOUR_GRAPH_HEIGHT,
+                                      col_colors=col_colors, use_color=True)
 
-        _mc = gradient_at(tod_grad, 95)
-        marker_pos = marker_plain.find("▴")
+        _mc = theme_role("title", tod_grad)
+        marker_pos = marker_plain.find(SYM_HIST_MARKER)
         marker_colored = (
             " " * max(0, marker_pos)
-            + f"\x1b[1;38;5;{_mc}m▴\x1b[0m"
+            + paint(SYM_HIST_MARKER, fg=_mc, bold=True)
             + " " * max(0, max_width - marker_pos - 1)
         )
-        axis_colored = c256(axis_plain, gradient_at(tod_grad, 35))
+        axis_colored = c256(axis_plain, theme_role("label_dim", tod_grad))
 
-        _tc = gradient_at(tod_grad, 70)
-        _pc = gradient_at(tod_grad, 80)
-        _cc = gradient_at(tod_grad, 55)
-        color: list[str] = [
-            f"\x1b[2;36mTotal listening:\x1b[0m  \x1b[2m{format_seconds(total_sec)}\x1b[0m  {_s_total_bar}",
-            f"\x1b[2;36mThis session:\x1b[0m  \x1b[2m{format_seconds(session_listen)}\x1b[0m  {_s_sess_bar}",
-            f"\x1b[2;36mMost-listened hours:\x1b[0m \x1b[38;5;{_tc}m{top_hours_text}\x1b[0m",
+        _tc = theme_role("accent", tod_grad)
+        _pc = theme_role("value", tod_grad)
+        _cc = theme_role("label", tod_grad)
+        _lc = theme_role("label_dim", tod_grad)
+        color = [
+            f"{paint('Total listening:', fg=_lc, dim=True)}  {paint(format_seconds(total_sec), fg=_cc)}  {_s_total_bar}",
+            f"{paint('This session:', fg=_lc, dim=True)}  {paint(format_seconds(session_listen), fg=_cc)}  {_s_sess_bar}",
+            f"{paint('Most-listened hours:', fg=_lc, dim=True)} {paint(top_hours_text, fg=_tc)}",
             (
-                f"\x1b[2;36mBusiest hour:\x1b[0m \x1b[38;5;{_pc}m{peak_h:02d}:00 ({peak_pct}% of total)\x1b[0m"
+                f"{paint('Busiest hour:', fg=_lc, dim=True)} {paint(f'{peak_h:02d}:00 ({peak_pct}% of total)', fg=_pc)}"
                 if peak_v > 0 else
-                f"\x1b[2;36mBusiest hour:\x1b[0m \x1b[38;5;{_cc}m(not enough listening yet)\x1b[0m"
+                f"{paint('Busiest hour:', fg=_lc, dim=True)} {paint('(not enough listening yet)', fg=_cc)}"
             ),
-            f"\x1b[2;36mHours used:\x1b[0m \x1b[2m{active_count} of 24\x1b[0m   \x1b[2;36mAvg used hour:\x1b[0m \x1b[2m{avg_per_h}\x1b[0m",
-            hist_colored,
+            f"{paint('Hours used:', fg=_lc, dim=True)} {paint(f'{active_count} of 24', fg=_cc)}   {paint('Avg used hour:', fg=_lc, dim=True)} {paint(avg_per_h, fg=_cc)}",
+            *graph_colored,
             marker_colored,
             axis_colored,
         ]
     else:
-        color = [c(s, "2") for s in plain]
+        color = list(plain)
 
     return plain, color

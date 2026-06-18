@@ -239,10 +239,13 @@ def _town_tune_sample_path(note):
     return os.path.join(TOWN_TUNE_SAMPLE_DIR, f"{note}.wav")
 
 def _load_wav_pcm(path):
-    with wave.open(path, "rb") as wf:
-        params = wf.getparams()
-        pcm = wf.readframes(wf.getnframes())
-    return params, pcm
+    try:
+        with wave.open(path, "rb") as wf:
+            params = wf.getparams()
+            pcm = wf.readframes(wf.getnframes())
+        return params, pcm
+    except Exception as e:
+        raise RuntimeError(f"failed to load WAV {path}: {e}") from e
 
 def _pad_pcm_segment(segment, wanted_bytes, frame_size):
     if len(segment) >= wanted_bytes:
@@ -368,7 +371,10 @@ def render_town_tune_from_samples(notes, path):
     ref_params = None
     sample_pcm = {}
     for note, sample_path in sample_paths.items():
-        params, pcm = _load_wav_pcm(sample_path)
+        try:
+            params, pcm = _load_wav_pcm(sample_path)
+        except Exception:
+            return False
         if ref_params is None:
             ref_params = params
         elif (params.nchannels != ref_params.nchannels or
@@ -418,11 +424,18 @@ def render_town_tune_from_samples(notes, path):
         current_offset_frames = 0
         out.extend(b"\x00" * step_bytes)
 
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(nchannels)
-        wf.setsampwidth(sampwidth)
-        wf.setframerate(framerate)
-        wf.writeframes(bytes(out))
+    try:
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(nchannels)
+            wf.setsampwidth(sampwidth)
+            wf.setframerate(framerate)
+            wf.writeframes(bytes(out))
+    except Exception:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        return False
     return True
 
 def render_town_tune_preview(notes, path, audio_device=None):

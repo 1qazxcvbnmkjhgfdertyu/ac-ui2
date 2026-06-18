@@ -30,6 +30,10 @@ ACTION_THEME      = "theme"
 ACTION_HOUR_SIM   = "hour_sim"
 ACTION_BG_MODE    = "bg_mode"
 ACTION_PANEL_NAV  = "panel_nav"
+ACTION_FREE_PLAY  = "free_play"
+ACTION_ADD_TRACK  = "add_track"
+ACTION_PLAYLIST_MGR = "playlist_mgr"
+ACTION_QUEUE_MGR  = "queue_mgr"
 
 # Map raw key strings → action IDs (subset — single-key actions only)
 KEY_MAP: dict[str, str] = {
@@ -60,4 +64,8 @@ KEY_MAP: dict[str, str] = {
     "h": ACTION_HOUR_SIM,
     "8": ACTION_BG_MODE,
     "\t": ACTION_PANEL_NAV,
+    "f": ACTION_FREE_PLAY,
+    "a": ACTION_ADD_TRACK,
+    "F": ACTION_PLAYLIST_MGR,
+    "Q": ACTION_QUEUE_MGR,
 }

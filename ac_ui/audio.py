@@ -1,4 +1,4 @@
-import os, sys, subprocess, json, time, stat, errno, shutil, socket
+import os, sys, subprocess, json, time, stat, errno, shutil, socket, tempfile, hashlib
 
 import ac_ui.diagnostics as _diag
 import ac_ui.colors as _clrs
@@ -6,7 +6,7 @@ from ac_ui.town_tune import spawn_town_tune
 from ac_ui.constants import (
     MPV, MUTE_MODE, SOFT_MUTE_VOL, LOOPBACK_LATENCY_MSEC,
     CAVA_FRAMERATE, CAVA_AUTOSENS, CAVA_SENSITIVITY, CAVA_LOWER_CUTOFF,
-    CAVA_HIGHER_CUTOFF, CAVA_NOISE_REDUCTION_SET, CAVA_NOISE_REDUCTION,
+    CAVA_BARS, CAVA_HIGHER_CUTOFF, CAVA_NOISE_REDUCTION_SET, CAVA_NOISE_REDUCTION,
     CAVA_CHANNELS, CAVA_MAX, CAVA_MIN_BARS, CAVA_MARGIN,
     HOUR_CHIME_PATH, TOWN_TUNE_CHIME_ENABLED,
 )
@@ -43,11 +43,15 @@ def cava_config_text(bars, input_method=None, input_source=None):
         + smoothing_block
     )
 
-def calc_cava_bars():
-    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-    bars = max(CAVA_MIN_BARS, cols - CAVA_MARGIN)
+def calc_cava_bars(cols=None):
+    cols = int(cols or shutil.get_terminal_size(fallback=(80, 24)).columns)
+    min_bars = 2 if CAVA_CHANNELS == "stereo" else 1
+    if CAVA_BARS > 0:
+        bars = max(min_bars, int(CAVA_BARS))
+    else:
+        bars = max(CAVA_MIN_BARS, cols - CAVA_MARGIN)
     if CAVA_CHANNELS == "stereo" and bars % 2:
-        bars -= 1
+        bars = max(min_bars, bars - 1)
     return bars
 
 
@@ -407,7 +411,8 @@ def pulse_monitor_source_for_audio_device(audio_device):
         return f"{sink}.monitor"
     return None
 
-def build_cava_input_candidates(base_method, base_source, detect_mode, audio_device=None, private_sink=None, output_sink=None):
+
+def _build_monitor_input_candidates(base_method, base_source, detect_mode, audio_device=None, private_sink=None, output_sink=None):
     candidates = []
     seen = set()
 
@@ -445,6 +450,141 @@ def build_cava_input_candidates(base_method, base_source, detect_mode, audio_dev
     add("pulse", "@DEFAULT_MONITOR@", "default-monitor")
     return candidates
 
+
+def build_cava_input_candidates(base_method, base_source, detect_mode, audio_device=None, private_sink=None, output_sink=None):
+    return _build_monitor_input_candidates(
+        base_method, base_source, detect_mode,
+        audio_device=audio_device, private_sink=private_sink, output_sink=output_sink,
+    )
+
+
+def build_pcm_input_candidates(base_method, base_source, detect_mode, audio_device=None, private_sink=None, output_sink=None):
+    return _build_monitor_input_candidates(
+        base_method, base_source, detect_mode,
+        audio_device=audio_device, private_sink=private_sink, output_sink=output_sink,
+    )
+
+
+def available_pcm_capture_backends():
+    backends = []
+    if shutil.which("parec"):
+        backends.append("parec")
+    if shutil.which("pw-record"):
+        backends.append("pw-record")
+    return tuple(backends)
+
+
+def pcm_capture_command(
+    input_method=None,
+    input_source=None,
+    *,
+    backend=None,
+    sample_rate=48000,
+    channels=2,
+    latency_ms=30,
+    client_name="ac-ui",
+    stream_name="ac-ui visualizer",
+):
+    """Build a raw stereo PCM capture command for the chosen monitor source."""
+    method = (input_method or "").strip().lower()
+    source = (input_source or "").strip() or "@DEFAULT_MONITOR@"
+    if method and method not in ("pulse", "pipewire"):
+        return None
+
+    if backend == "parec" and shutil.which("parec"):
+        cmd = [
+            "parec",
+            "--record",
+            "--raw",
+            f"--rate={int(sample_rate)}",
+            "--format=s16le",
+            f"--channels={int(channels)}",
+            f"--latency-msec={int(latency_ms)}",
+            f"--client-name={client_name}",
+            f"--stream-name={stream_name}",
+        ]
+        if source:
+            cmd.append(f"--device={source}")
+        return cmd
+
+    if backend == "pw-record" and shutil.which("pw-record"):
+        cmd = [
+            "pw-record",
+            "--raw",
+            "--rate", str(int(sample_rate)),
+            "--channels", str(int(channels)),
+            "--format", "s16",
+            "--latency", f"{int(latency_ms)}ms",
+        ]
+        if source and not source.startswith("@DEFAULT"):
+            cmd.extend(["--target", source])
+        cmd.append("-")
+        return cmd
+
+    return None
+
+_MIDI_EXTENSIONS = {".midi", ".mid"}
+
+def convert_midi_to_wav(midi_path):
+    """Render a MIDI file to a temp WAV via timidity. Returns temp path or None on failure."""
+    timidity_bin = shutil.which("timidity")
+    if not timidity_bin:
+        return None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="ac_ui_midi_")
+        os.close(fd)
+        result = subprocess.run(
+            [timidity_bin, midi_path, "-Ow", "-o", tmp_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+        if result.returncode == 0 and os.path.getsize(tmp_path) > 0:
+            return tmp_path
+        os.unlink(tmp_path)
+        return None
+    except Exception:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        return None
+
+
+MIDI_WAV_CACHE_DIR = os.path.expanduser("~/.cache/ac-terminal-radio/midi-wav")
+
+
+def _midi_cache_key(midi_path: str) -> str:
+    """16-char hex key derived from path + mtime + size. Changes if file is replaced."""
+    try:
+        st = os.stat(midi_path)
+        raw = f"{os.path.abspath(midi_path)}:{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        raw = os.path.abspath(midi_path)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def lookup_midi_cache(midi_path: str) -> str | None:
+    """Return path to a cached WAV if it exists and is non-empty, else None."""
+    wav = os.path.join(MIDI_WAV_CACHE_DIR, _midi_cache_key(midi_path) + ".wav")
+    if os.path.isfile(wav) and os.path.getsize(wav) > 0:
+        return wav
+    return None
+
+
+def store_to_midi_cache(midi_path: str, wav_path: str) -> str | None:
+    """Copy wav_path into the persistent cache keyed by midi_path. Returns cache path or None."""
+    try:
+        os.makedirs(MIDI_WAV_CACHE_DIR, exist_ok=True)
+        dest = os.path.join(MIDI_WAV_CACHE_DIR, _midi_cache_key(midi_path) + ".wav")
+        if not os.path.isfile(dest):
+            shutil.copy2(wav_path, dest)
+        return dest
+    except Exception:
+        return None
+
+
 def mpv_start(track, ipc_path, audio_device=None, volume=None, loop_file=False):
     # Start mpv with IPC server so we can query time-pos/duration, and quit on demand.
     # --no-video avoids cover art display.
@@ -463,28 +603,67 @@ def mpv_start(track, ipc_path, audio_device=None, volume=None, loop_file=False):
     cmd.append(track)
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def set_mpv_volume(vol, ipc_path):
+    try:
+        v = int(max(0, min(100, vol)))
+        mpv_command(ipc_path, ["set_property", "volume", v])
+        return v
+    except Exception:
+        return None
+
+
+def stop_mpv_proc(proc, ipc_path):
+    if ipc_path and os.path.exists(ipc_path):
+        try:
+            mpv_command(ipc_path, ["quit"])
+        except Exception:
+            pass
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except Exception:
+                pass
+    cleanup_stale_socket(ipc_path)
+    try:
+        if ipc_path and os.path.exists(ipc_path):
+            os.remove(ipc_path)
+    except Exception:
+        pass
+
+
 def mpv_command(ipc_path, command):
     # Send a command via unix socket (best-effort)
     import socket
+    s = None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.2)
         s.connect(ipc_path)
         s.sendall((json.dumps({"command": command}) + "\n").encode("utf-8"))
-        s.close()
         return True
     except Exception:
         return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 def mpv_query(ipc_path, prop):
     import socket as _socket
+    s = None
     try:
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         s.settimeout(0.2)
         s.connect(ipc_path)
         s.sendall((json.dumps({"command": ["get_property", prop]}) + "\n").encode("utf-8"))
         data = s.recv(4096).decode("utf-8", errors="ignore")
-        s.close()
         lines = [ln for ln in data.splitlines() if ln.strip().startswith("{")]
         for ln in reversed(lines):
             try:
@@ -497,6 +676,12 @@ def mpv_query(ipc_path, prop):
     except Exception as exc:
         _diag.warn("mpv", f"query '{prop}' failed", exc=exc)
         return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 def mpv_query_props(ipc_path, props):
     import socket
@@ -599,5 +784,3 @@ def start_hour_chime(audio_device=None):
 
 # Differential render: only rewrite lines that changed (btop pattern)
 _render_prev_lines: list = []
-
-

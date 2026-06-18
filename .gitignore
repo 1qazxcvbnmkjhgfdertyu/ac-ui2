@@ -1,6 +1,12 @@
 __pycache__/
 *.pyc
 
+# Compiled optional native extension (build with build_native.py) + Cython's
+# generated C. The .pyx source is committed; these are build artifacts.
+*.so
+ac_ui/_vizfast.c
+ac-ui.tar.gz
+
 # Local agent/worktree artifacts and refactor backups; never publish.
 .claude/
 ac-ui.monolith

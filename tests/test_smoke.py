@@ -75,7 +75,7 @@ def test_load_ui_state_returns_valid_dict(tmp_path, monkeypatch):
     (60, 20),   # tiny / compact path
 ])
 def test_build_layout_preview(cols, rows):
-    from ac_ui.ui import build_layout_preview
+    from ac_ui.layout_preview import build_layout_preview
     lines = build_layout_preview(cols, rows)
     assert isinstance(lines, list), "build_layout_preview must return a list"
     assert len(lines) > 0, f"build_layout_preview({cols},{rows}) returned empty"

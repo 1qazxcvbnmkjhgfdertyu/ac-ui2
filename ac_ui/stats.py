@@ -3,7 +3,7 @@ import os, json, queue, threading, time
 import ac_ui.colors as _clrs
 from ac_ui.colors import c
 from ac_ui.constants import (
-    STATS_ENABLED, STATS_DIR, STATS_JSON, STATS_CSV,
+    ASCII_ONLY, STATS_ENABLED, STATS_DIR, STATS_JSON, STATS_CSV, SYM_HIST_MARKER,
     _atomic_write_json,
 )
 from ac_ui.visualizer import resample_bars
@@ -119,10 +119,10 @@ def build_hour_histogram_lines(hour_buckets, current_hour, width):
     hb_max = max(buckets) if any(buckets) else 1
     normalized = [min(1.0, max(0.0, value / hb_max)) for value in buckets]
     sampled = resample_bars(normalized, width)
-    blocks = " ▁▂▃▄▅▆▇█"
+    blocks = " .:-=+*#@" if ASCII_ONLY else " ▁▂▃▄▅▆▇█"
     hist_plain = "".join(blocks[max(0, min(8, int(round(value * 8))))] for value in sampled)
     marker_pos = int(round((current_hour % 24) / 23 * (width - 1))) if width > 1 else 0
-    marker_plain = (" " * marker_pos) + "▴" + (" " * max(0, width - marker_pos - 1))
+    marker_plain = (" " * marker_pos) + SYM_HIST_MARKER + (" " * max(0, width - marker_pos - 1))
 
     axis_chars = [" "] * width
     labels = ((0, "00"), (6, "06"), (12, "12"), (18, "18"), (23, "23"))
@@ -134,5 +134,4 @@ def build_hour_histogram_lines(hour_buckets, current_hour, width):
                 axis_chars[start + i] = ch
     axis_plain = "".join(axis_chars)
     return hist_plain, marker_plain, axis_plain
-
 

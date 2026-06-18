@@ -8,8 +8,8 @@ ac_ui/
   audio_config.py     — CAVA/EQ/VIS/accessibility settings (self-contained)
   town_tune_config.py — TOWN_TUNE_*/ACGC_*/FluidSynth constants (self-contained)
   state.py            — dataclasses: UIState, PlaybackState, AudioState, VisualizerState, PanelState, RenderCache, SessionState
-  services.py         — service classes: MpvClient, PactlClient, SinkManager, CavaRuntime
-  fakes.py            — fake backends for tests: FakeMpvClient, FakePactlClient, FakeSinkManager, FakeCavaRuntime
+  services.py         — service classes: MpvClient, PactlClient, SinkManager, CavaRuntime, PlaybackCache
+  fakes.py            — fake backends for tests: FakeMpvClient, FakePactlClient, FakeSinkManager, FakeCavaRuntime, FakePlaybackCache
   diagnostics.py      — structured error collector (warn/error/info, ring buffer)
   app.py              — parse_cli_args, future entry-point logic
   actions.py          — KEY_MAP and action ID constants
@@ -21,7 +21,7 @@ ac_ui/
     up_next.py        — Up Next panel pure renderer
     stats.py          — Stats panel pure renderer
     help.py           — Help panel pure renderer
-  ui.py               — main() event loop (2500 lines; being split incrementally)
+  ui.py               — main() event loop (1940 lines; being split incrementally)
   audio.py            — subprocess wrappers: mpv_start, pactl, cava config
   colors.py           — ANSI color helpers, gradient system, theme palettes
   layout.py           — build_box, footer controls, layout sizing
@@ -29,12 +29,22 @@ ac_ui/
   stats.py            — session stats (versioned)
   eq.py               — EQ bands (versioned)
   town_tune.py        — town tune CLI, renderer integration (versioned)
-  tracks.py           — track listing, pick_weighted, filter_recent_tracks
-  visualizer.py       — spectrum/flame/braille/etc. renderers
+  tracks.py           — track listing, pick_weighted, filter_recent_tracks;
+                        playlist models (PlaylistSource/PlaylistEntry/QueueCandidate),
+                        load_playlist_source, build_free_play_queue, save_queue_acpl
+  visualizer.py       — spectrum/flame/braille/fireworks/starfield/ripple/aurora renderers
+  _vizfast.pyx        — OPTIONAL compiled hot path for the feedback visualizers
+                        (kaleido/liquid/plasma). Built with `python build_native.py`
+                        → ac_ui/_vizfast*.so. visualizer.py imports it when present
+                        and falls back to the pure-Python _feedback_transform if not.
+  meters.py           — btop-style primitives: meter_bar() gradient meter,
+                        braille_graph() area graph of a 0..1 value series
+  art.py              — game_mosaic(): deterministic themed "album art" mosaic
   term.py             — terminal control, RawMode, title art
   editors.py          — interactive EQ and tune editors
   layout_config.py    — layout preset normalization
   layout_engine.py    — layout constraint solver
+  layout_preview.py   — build_layout_preview() debug renderer + layout_sweep_cli
 ```
 
 ## Persisted formats
@@ -43,7 +53,7 @@ All JSON files include `"_version": N`. Migration logic lives in the loader.
 
 | File           | Module       | Version constant       |
 |----------------|--------------|------------------------|
-| state.json     | persist.py   | UI_STATE_VERSION = 2   |
+| state.json     | persist.py   | UI_STATE_VERSION = 3   |
 | stats.json     | stats.py     | STATS_VERSION = 1      |
 | eq.json        | eq.py        | EQ_STATE_VERSION = 1   |
 | town_tune.json | town_tune.py | TOWN_TUNE_VERSION = 1  |
@@ -55,6 +65,7 @@ All JSON files include `"_version": N`. Migration logic lives in the loader.
 - `_active_tod_grad` is a mutable module global in `colors.py`. Never snapshot it at import time; always reference it as `_clrs._active_tod_grad`.
 - Panel renderers (`panels/*.py`) must be pure functions: given state, return `(plain_lines, color_lines)`. No I/O, no terminal writes.
 - `diagnostics.warn/error` instead of bare `except Exception: pass` for any system boundary (audio, pactl, file I/O).
+- `_vizfast.pyx` must stay behaviourally in sync with the pure-Python `_feedback_transform` in `visualizer.py` (tests/test_native_parity.py guards this). If you change one, change both, then rerun `build_native.py`.
 
 ## Test suite
 

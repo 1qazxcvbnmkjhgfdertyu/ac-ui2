@@ -1,7 +1,7 @@
 """Help panel renderer — pure function, no side effects."""
 from __future__ import annotations
 
-from ac_ui.colors import USE_COLOR, c, gradient_at
+from ac_ui.colors import USE_COLOR, theme_role
 from ac_ui.layout import wrap_plain, colorize_hint_keys
 
 
@@ -34,9 +34,10 @@ def render(
         return None, None
 
     if USE_COLOR:
-        hk_col = gradient_at(tod_grad, 80)
-        color: list[str] = [colorize_hint_keys(s, hk_col, base_code="2") for s in wrapped]
+        hk_col = theme_role("accent", tod_grad)
+        base_col = theme_role("label_dim", tod_grad)
+        color: list[str] = [colorize_hint_keys(s, hk_col, base_fg=base_col, dim=True) for s in wrapped]
     else:
-        color = [c(s, "2") for s in wrapped]
+        color = list(wrapped)
 
     return wrapped, color

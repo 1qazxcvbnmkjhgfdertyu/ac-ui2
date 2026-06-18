@@ -16,6 +16,10 @@ except Exception:
     pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ac_ui.app import apply_cli_runtime_env, config_set_cli
+sys.argv = apply_cli_runtime_env(sys.argv)
+if config_set_cli(sys.argv):
+    sys.exit(0)
 from ac_ui.ui import main
 if __name__ == "__main__":
     main()

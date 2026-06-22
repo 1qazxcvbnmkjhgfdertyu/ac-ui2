@@ -2251,6 +2251,11 @@ def main():
                         from ac_ui.overlay import ExtractAcOverlay
                         active_overlay = ExtractAcOverlay()
                         last_lines = None
+                    if ch == "G":
+                        # Guided tour — paged walkthrough of the app.
+                        from ac_ui.overlay import TourOverlay
+                        active_overlay = TourOverlay()
+                        last_lines = None
                     if ch == "r":
                         # Frame-rate menu as a LIVE overlay: the visualizer keeps
                         # animating beneath it (result applied on close above).

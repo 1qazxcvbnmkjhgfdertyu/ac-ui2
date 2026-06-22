@@ -223,6 +223,7 @@ ACTIONS = (
     ("free_play",    ("f",),  "full compact", "[f]ree play",      "[f]ree",    "[f] toggle free play mode"),
     ("import",       ("i",),  "full compact", "[i]mport",         "[i]mport",  "[i] import your music (wizard)"),
     ("extract_ac",   ("X",),  "full",         "[X]tract AC",      None,        "[X] extract AC GameCube music from your disc"),
+    ("tour",         ("G",),  "full",         "[G]uide",          None,        "[G] guided tour of the app"),
     ("add_track",    ("a",),  "full compact", "[a]dd to list",    "[a]dd",     "[a] add current track to a playlist"),
     ("playlist_mgr", ("F",),  "full compact", "[F]playlists",     "[F]lists",  "[F] playlist manager (create/edit/delete)"),
     ("queue_mgr",    ("Q",),  "full compact", "[Q]ueue",          "[Q]ueue",   "[Q] manage free-play queue"),

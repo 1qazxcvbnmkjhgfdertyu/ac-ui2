@@ -306,6 +306,35 @@ class VisPickerOverlay:
         return False
 
 
+class TourOverlay:
+    """Paged guided tour of the app. Live overlay; the player keeps animating
+    behind it. ``result`` is always None (informational)."""
+
+    kind = "tour"
+
+    def __init__(self, pages=None):
+        from ac_ui.tour import TOUR_GENERAL
+        self.pages = pages or TOUR_GENERAL
+        self.idx = 0
+        self.result = None
+
+    def build(self, cols: int, rows: int) -> list[str]:
+        from ac_ui.tour import build_tour_lines
+        inner_w = max(50, min(cols - 6, 70))
+        return build_tour_lines(self.pages, self.idx, inner_w)
+
+    def handle(self, ch: str) -> bool:
+        if ch in ("ESC", "q", "Q"):
+            return True
+        if ch in ("RIGHT", " ", "\r", "\n"):
+            if self.idx >= len(self.pages) - 1:
+                return True                      # past the last page → close
+            self.idx += 1
+        elif ch == "LEFT":
+            self.idx = max(0, self.idx - 1)
+        return False
+
+
 class WelcomeOverlay:
     """First-run greeting, shown automatically when there's no music yet. Points
     the user straight at the two ways to get music. ``result`` is a key to
@@ -325,6 +354,7 @@ class WelcomeOverlay:
             "",
             "  [i]   Import your own music     — point at a folder, done.",
             "  [X]   Extract Animal Crossing   — from your own GameCube disc.",
+            "  [G]   Take a quick guided tour  — learn the app in a minute.",
             "",
             "  [esc] Not now — explore the player first.",
         ]
@@ -338,6 +368,9 @@ class WelcomeOverlay:
             return True
         if ch == "X":
             self.result = "X"
+            return True
+        if ch == "G":
+            self.result = "G"
             return True
         if ch in ("ESC", "\r", "\n"):
             self.result = None

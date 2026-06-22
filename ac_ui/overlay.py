@@ -306,6 +306,45 @@ class VisPickerOverlay:
         return False
 
 
+class WelcomeOverlay:
+    """First-run greeting, shown automatically when there's no music yet. Points
+    the user straight at the two ways to get music. ``result`` is a key to
+    re-dispatch ('i' import / 'X' extract) or None (dismiss)."""
+
+    kind = "welcome"
+
+    def __init__(self):
+        self.result = None
+
+    def build(self, cols: int, rows: int) -> list[str]:
+        inner_w = max(50, min(cols - 6, 66))
+        plain = [
+            "Welcome to ac-ui!",
+            "",
+            "There's no music here yet. Two easy ways to fill it:",
+            "",
+            "  [i]   Import your own music     — point at a folder, done.",
+            "  [X]   Extract Animal Crossing   — from your own GameCube disc.",
+            "",
+            "  [esc] Not now — explore the player first.",
+        ]
+        box, _ = build_box(plain, plain, maxw_override=inner_w,
+                           title="Getting started", title2="")
+        return box
+
+    def handle(self, ch: str) -> bool:
+        if ch in ("i", "I"):
+            self.result = "i"
+            return True
+        if ch == "X":
+            self.result = "X"
+            return True
+        if ch in ("ESC", "\r", "\n"):
+            self.result = None
+            return True
+        return False
+
+
 class ImportOverlay:
     """In-app music import wizard. Browse to a folder, import it into the
     free-play library (tags read automatically, formats kept or converted), all

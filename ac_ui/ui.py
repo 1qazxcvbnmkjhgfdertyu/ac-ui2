@@ -414,6 +414,13 @@ def main():
     game_idx = games_list.index(ui_state["game"]) if ui_state["game"] in games_list else 0
     variant_idx = variants_list.index(ui_state["variant"]) if ui_state["variant"] in variants_list else 0
 
+    # First-run onboarding: no catalog music and not already in free-play → greet
+    # the user and point them straight at importing / extracting music.
+    if not catalog_games and not free_play_mode:
+        from ac_ui.overlay import WelcomeOverlay
+        active_overlay = WelcomeOverlay()
+        last_lines = None
+
     cava_method, cava_source, cava_detect_mode = detect_cava_input()
     private_sink = None
     private_module = None
@@ -2141,9 +2148,9 @@ def main():
                                     "accent" if repeat_current else "label", 1.8,
                                 )
                             continue
-                        if _ov_kind == "palette":
-                            # Re-dispatch the chosen command's key through the
-                            # normal handler chain below (don't `continue`).
+                        if _ov_kind in ("palette", "welcome"):
+                            # Re-dispatch the chosen key through the normal handler
+                            # chain below (palette → command key; welcome → i / X).
                             ch = _ov_result or ""
                         else:
                             continue  # help / viewer: nothing to apply

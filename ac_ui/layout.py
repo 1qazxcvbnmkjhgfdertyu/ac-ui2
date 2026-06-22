@@ -137,6 +137,93 @@ def colorize_hint_keys(text, key_color, base_code="2", bold=True, base_fg=None, 
     )
     return f"{base_seq}{colored}{RESET}"
 
+def selection_marker(selected=True):
+    if not selected:
+        return "  "
+    return "> " if _clrs.ASCII_ONLY else "▶ "
+
+def format_position_label(selected, total):
+    try:
+        total = int(total)
+        selected = int(selected)
+    except (TypeError, ValueError):
+        return "0/0"
+    if total <= 0:
+        return "0/0"
+    selected = max(0, min(total - 1, selected))
+    return f"{selected + 1}/{total}"
+
+def search_prompt_line(query, inner_w, placeholder="Search", count_text=None):
+    """Uniform overlay search row: prompt on the left, result count on the right."""
+    inner_w = max(1, int(inner_w))
+    query = str(query or "")
+    count_text = str(count_text or "").strip()
+    lead = f"/ {placeholder}: "
+    cursor = "_"
+    count_w = plain_visible_len(count_text)
+    prompt_w = inner_w if not count_text else max(1, inner_w - count_w - 1)
+    prompt = truncate_plain(f"{lead}{query}{cursor}", prompt_w)
+    if count_text:
+        pad = " " * max(1, inner_w - plain_visible_len(prompt) - count_w)
+        plain = truncate_plain(prompt + pad + count_text, inner_w)
+    else:
+        pad = ""
+        plain = truncate_plain(prompt, inner_w)
+    if not USE_COLOR:
+        return plain, plain
+    grad = _clrs._active_tod_grad
+    if count_text:
+        color = (
+            c256(prompt, theme_role("accent", grad))
+            + pad
+            + c256(count_text, theme_role("label_dim", grad))
+        )
+        return plain, truncate_ansi_visible(color, inner_w)
+    return plain, c256(plain, theme_role("accent", grad))
+
+def empty_state_line(message, inner_w):
+    row = truncate_plain(f"  {message}", max(1, int(inner_w)))
+    if USE_COLOR:
+        return row, paint(row, fg=theme_role("label_dim", _clrs._active_tod_grad), dim=True)
+    return row, row
+
+def section_heading_line(title, inner_w):
+    row = truncate_plain(str(title), max(1, int(inner_w)))
+    if USE_COLOR:
+        return row, paint(row, fg=theme_role("accent", _clrs._active_tod_grad), bold=True)
+    return row, row
+
+def render_selectable_row(label, selected, inner_w, right=None, dim=False):
+    """Return one uniformly styled selectable row for menus, search results, and help."""
+    inner_w = max(1, int(inner_w))
+    prefix = selection_marker(selected)
+    right = str(right or "").strip()
+    right_w = plain_visible_len(right)
+    label_w = max(1, inner_w - plain_visible_len(prefix) - (right_w + 1 if right else 0))
+    label = truncate_plain(str(label), label_w)
+    pad_w = inner_w - plain_visible_len(prefix) - plain_visible_len(label) - right_w
+    if right:
+        pad_w = max(1, pad_w)
+    else:
+        pad_w = max(0, pad_w)
+    row = truncate_plain(f"{prefix}{label}{' ' * pad_w}{right}", inner_w)
+    if plain_visible_len(row) < inner_w:
+        row += " " * (inner_w - plain_visible_len(row))
+    if not USE_COLOR:
+        return row, row
+    grad = _clrs._active_tod_grad
+    if selected:
+        return row, paint(row, fg=theme_role("focus_fg", grad), bg=theme_role("focus_bg", grad), bold=True)
+    base_col = theme_role("label_dim" if dim else "label", grad)
+    if right:
+        return row, colorize_hint_keys(
+            row,
+            theme_role("accent_soft", grad),
+            base_fg=base_col,
+            dim=dim,
+        )
+    return row, paint(row, fg=base_col, dim=dim)
+
 def format_filter_summary(game_label, variant_label):
     if game_label == "ALL" and variant_label == "ALL":
         return "ALL"
@@ -205,16 +292,18 @@ def _coerce_title_items(value):
         text = str(value).strip()
         return [text] if text else []
 
-def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=None, focused=False):
+def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=None, focused=False,
+              lines_fitted=False):
     """
-    Btop-style Unicode box with rounded corners.
+    Btop-style Unicode box with title notches on the border.
 
-    Mirrors btop++'s box chrome: the primary `title` is anchored in the top-LEFT
-    corner (not centered), and the optional `title2` can be either one string or
-    a sequence of strings that become separate top-right title blocks with border
-    segments between them. Bracketed keys stay highlighted, and the bottom border
-    stays clean. When `focused` is True the whole border glows in the highlight
-    color, exactly like btop's selected box.
+    The primary `title` is cut into the top border near the left corner, and the
+    optional `title2` becomes one secondary notch on the bottom border, which is
+    closer to btop++'s real createBox() behavior than the older top-right badge
+    system. When `focused` is True the border shifts toward the highlight color.
+    `lines_fitted=True` tells the content loop the caller already guaranteed each
+    row is exactly `maxw_override` visible columns wide, so it can skip the
+    expensive truncate+measure walk for every line.
     """
     if maxw_override is not None:
         maxw = maxw_override
@@ -243,6 +332,8 @@ def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=N
     box_chars = chrome.get("box_chars", BOX_CHARS)
     title_left = chrome.get("title_left", BOX_TITLE_L)
     title_right = chrome.get("title_right", BOX_TITLE_R)
+    title_left_down = chrome.get("title_left_down", "+" if _clrs.ASCII_ONLY else "┘")
+    title_right_down = chrome.get("title_right_down", "+" if _clrs.ASCII_ONLY else "└")
 
     def border_color(idx):
         if not BOX_BORDER_SPIN or perimeter <= 0:
@@ -291,69 +382,44 @@ def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=N
     _top_idx = lambda c: border_index(0, c)
     _bot_idx = lambda c: border_index(height - 1, c)
 
-    # ── Build the top border, then overlay corner-anchored title blocks ──────
-    top_raw = box_chars["tl"] + box_chars["h"] * inner_w + box_chars["tr"]
-
-    def _title_block(text, text_fg, *, bold=False, dim=False, hint=False):
+    def _title_inner(text, text_fg, *, bold=False, dim=False, hint=False):
         inner = f" {text} "
-        plain = title_left + inner + title_right
         if not USE_COLOR:
-            return plain, plain_visible_len(plain)
+            return inner
         if hint:
-            inner_c = colorize_hint_keys(inner, theme_role("accent", grad),
-                                         base_fg=text_fg, dim=dim)
-        else:
-            inner_c = paint(inner, fg=text_fg, bold=bold, dim=dim)
-        colored = c256(title_left, hilite) + inner_c + c256(title_right, hilite)
-        return colored, plain_visible_len(plain)
+            return colorize_hint_keys(inner, theme_role("accent", grad), base_fg=text_fg, dim=dim)
+        return paint(inner, fg=text_fg, bold=bold, dim=dim)
 
-    overlays = []   # (start_col, visible_len, colored_block)
-    left_end = 1    # first usable column after the corner
-    if title:
-        tcol = theme_role("accent", grad) if focused else theme_role("panel_title", grad)
-        # Truncate (…) rather than drop, so every box keeps a label even when
-        # narrow. Block = ┤ + space + text + space + ├, so text gets width-6 cells.
-        _max_tw = width - 6
-        if _max_tw >= 1:
-            ttext = title if plain_visible_len(title) <= _max_tw else truncate_plain(title, _max_tw)
-            lblock, lvis = _title_block(ttext, tcol, bold=True)
-            if 1 + lvis <= width - 1:    # fits without overwriting the right corner
-                overlays.append((1, lvis, lblock))
-                left_end = 1 + lvis
-    _right_end = width - 1
-    for item in reversed(_coerce_title_items(title2)):
-        rblock, rvis = _title_block(item, theme_role("panel_subtitle", grad),
-                                    dim=True, hint=True)
-        rstart = _right_end - rvis
-        if rstart < left_end + 1:         # keep a gap from the left title/corner
-            break
-        overlays.append((rstart, rvis, rblock))
-        _right_end = rstart - 1
+    def _border_with_title(raw, idx_fn, text, left_marker, right_marker, text_fg, *, bold=False, dim=False, hint=False):
+        if not text:
+            return _color_run(raw, idx_fn)
+        start = 2   # btop leaves one horizontal cell between the corner and title
+        max_tw = width - 7
+        if max_tw < 1:
+            return _color_run(raw, idx_fn)
+        text = text if plain_visible_len(text) <= max_tw else truncate_plain(text, max_tw)
+        inner_plain = f" {text} "
+        block_plain = left_marker + inner_plain + right_marker
+        block_w = plain_visible_len(block_plain)
+        if start + block_w > width - 1:
+            return _color_run(raw, idx_fn)
+        prefix = _color_run(raw[:start], idx_fn, base=0)
+        suffix = _color_run(raw[start + block_w :], idx_fn, base=start + block_w)
+        if not USE_COLOR:
+            return prefix + block_plain + suffix
+        left_col = c256(left_marker, border_color(idx_fn(start)))
+        right_col = c256(right_marker, border_color(idx_fn(start + block_w - 1)))
+        return prefix + left_col + _title_inner(text, text_fg, bold=bold, dim=dim, hint=hint) + right_col + suffix
 
-    overlays.sort(key=lambda o: o[0])
-    top_parts = []
-    col = 0
-    oi = 0
-    while col < width:
-        if oi < len(overlays) and overlays[oi][0] == col:
-            start, vlen, colored = overlays[oi]
-            top_parts.append(colored)
-            col += vlen
-            oi += 1
-        else:
-            # Paint the border run up to the next overlay, coalescing same-colour
-            # cells into as few escapes as possible (1 if static, ~3 if spinning).
-            nxt = overlays[oi][0] if oi < len(overlays) else width
-            top_parts.append(_color_run(top_raw[col:nxt], _top_idx, base=col))
-            col = nxt
-    out = ["".join(top_parts)]
+    # ── Build top and bottom borders with btop-like title notches ─────────────
+    top_raw = box_chars["tl"] + box_chars["h"] * inner_w + box_chars["tr"]
+    top_title_color = theme_role("accent", grad) if focused else theme_role("panel_title", grad)
+    out = [_border_with_title(top_raw, _top_idx, title, title_left, title_right, top_title_color, bold=True)]
 
     # ── Content rows ─────────────────────────────────────────────────────────
     # Pre-colour the vertical borders once when they don't vary per row.
     _vbar = c256(box_chars["v"], base_gray) if (_uniform_border and USE_COLOR) else None
-    for row, (plain, line) in enumerate(zip(lines_plain, lines_color)):
-        line, _vis = fit_ansi_line(line, maxw)   # single walk: truncate + measure
-        pad = " " * max(0, maxw - _vis)
+    for row, (_plain, line) in enumerate(zip(lines_plain, lines_color)):
         if _vbar is not None:
             left_border = right_border = _vbar
         elif _uniform_border:
@@ -361,11 +427,26 @@ def build_box(lines_plain, lines_color, maxw_override=None, title=None, title2=N
         else:
             left_border  = bc(box_chars["v"], border_index(row + 1, 0))
             right_border = bc(box_chars["v"], border_index(row + 1, width - 1))
+        if lines_fitted:
+            pad = ""
+        else:
+            line, _vis = fit_ansi_line(line, maxw)   # single walk: truncate + measure
+            pad = " " * max(0, maxw - _vis)
         out.append(left_border + " " + line + pad + " " + right_border)
 
-    # ── Bottom border (kept clean, btop-style) ───────────────────────────────
+    # ── Bottom border (secondary title notch, like btop title2) ─────────────
     bot_raw = box_chars["bl"] + box_chars["h"] * (width - 2) + box_chars["br"]
-    out.append(_color_run(bot_raw, _bot_idx))
+    bottom_title = "  ".join(_coerce_title_items(title2))
+    out.append(_border_with_title(
+        bot_raw,
+        _bot_idx,
+        bottom_title,
+        title_left_down,
+        title_right_down,
+        theme_role("panel_subtitle", grad),
+        dim=True,
+        hint=True,
+    ))
     return out, maxw
 
 def pad_box_lines(box_lines, width, target_len):

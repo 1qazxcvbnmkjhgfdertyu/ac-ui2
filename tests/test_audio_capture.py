@@ -170,6 +170,20 @@ def test_build_live_audio_snapshot_prefers_existing_bar_feed():
     assert snap.bars == (0.2, 0.4, 0.6)
 
 
+def test_build_live_audio_snapshot_can_preserve_pcm_presence_without_copying_waveform():
+    from ac_ui.audio_snapshot import build_live_audio_snapshot
+
+    snap = build_live_audio_snapshot(
+        [0.2, 0.4, 0.6],
+        {},
+        waveform_available=True,
+        frame_dt=0.016,
+    )
+    assert snap.source_kind == "cava+pcm"
+    assert not snap.has_waveform
+    assert snap.bars == (0.2, 0.4, 0.6)
+
+
 def test_calc_cava_bars_respects_override_and_stereo_evenness(monkeypatch):
     import ac_ui.audio as audio
     import ac_ui.audio_config as audio_config

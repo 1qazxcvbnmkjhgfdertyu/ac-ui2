@@ -42,10 +42,15 @@ def test_native_feedback_matches_pure_python(monkeypatch):
         params["pinch"], params["warp_amp"], params["warp_freq"], params["warp_phase"],
     )
 
-    # Force the pure-Python path and run the same transform.
+    # Force the pure-Python path and run the same transform on the same source.
+    # Seed the source through the real buffer accessor so this stays correct even
+    # if the internal feedback-buffer layout (e.g. ping-pong keys) changes.
     monkeypatch.setattr(V, "_vizfast", None)
-    state = {"fb_inten": list(src_i), "fb_hue": list(src_h),
-             "fb_rows": dot_rows, "fb_cols": dot_cols}
+    state = {}
+    src_buf_i, src_buf_h, _out_i, _out_h = V._feedback_buffers(state, dot_rows, dot_cols)
+    for k in range(dot_rows * dot_cols):
+        src_buf_i[k] = src_i[k]
+        src_buf_h[k] = src_h[k]
     pure_i, pure_h = V._feedback_transform(state, dot_rows, dot_cols, **params)
 
     assert len(native_i) == len(pure_i) == dot_rows * dot_cols
@@ -69,3 +74,37 @@ def test_native_output_well_formed():
     )
     assert len(out_i) == 32 and len(out_h) == 32
     assert all(0.0 <= v <= 1.0 for v in out_i)
+
+
+@pytest.mark.skipif(V._vizfast is None or not hasattr(V._vizfast, "kaleido_overlay"), reason="native module not built")
+def test_native_kaleido_overlay_matches_python():
+    h, w = 6, 48
+    dot_rows, dot_cols = h * 4, w * 2
+    bars = [min(1.0, abs(math.sin(i * 0.27 + 0.4))) for i in range(48)]
+    active = V._tunnel_geometry({}, dot_rows, dot_cols, len(bars))
+    inten_native = [0.0] * (dot_rows * dot_cols)
+    hue_native = [50] * (dot_rows * dot_cols)
+    inten_pure = list(inten_native)
+    hue_pure = list(hue_native)
+
+    frame = 37.25
+    symmetry = 7
+    phase = frame * 0.41
+    ang_off = frame * 0.014
+    f03 = frame * 0.03
+    f09 = frame * 0.9
+
+    V._vizfast.kaleido_overlay(inten_native, hue_native, active, list(bars), phase, symmetry, ang_off, f03, f09)
+    V._kaleido_overlay(inten_pure, hue_pure, active, list(bars), phase, symmetry, ang_off, f03, f09)
+
+    total = len(inten_native)
+    near = sum(1 for a, b in zip(inten_native, inten_pure) if abs(a - b) < 1e-4)
+    assert near >= total - max(3, total // 1000), f"{total - near} pixels diverged"
+
+    lit_native = sum(1 for v in inten_native if v > 0.06)
+    lit_pure = sum(1 for v in inten_pure if v > 0.06)
+    assert abs(lit_native - lit_pure) <= max(3, total // 100)
+
+    hot_native = [h for v, h in zip(inten_native, hue_native) if v > 0.06]
+    hot_pure = [h for v, h in zip(inten_pure, hue_pure) if v > 0.06]
+    assert hot_native == hot_pure

@@ -40,6 +40,14 @@ def test_cli_help():
     assert out.strip(), "--help produced no output"
 
 
+def test_module_doctor_json():
+    result = subprocess.run(
+        [sys.executable, "-m", "ac_ui", "doctor", "--json"],
+        capture_output=True, text=True, timeout=10, cwd=REPO,
+    )
+    assert result.stdout.strip(), "doctor --json produced no output"
+
+
 # ── 3. load_ui_state() returns a valid dict ──────────────────────────────────
 
 REQUIRED_UI_STATE_KEYS = {
@@ -80,6 +88,15 @@ def test_build_layout_preview(cols, rows):
     assert isinstance(lines, list), "build_layout_preview must return a list"
     assert len(lines) > 0, f"build_layout_preview({cols},{rows}) returned empty"
     assert all(isinstance(ln, str) for ln in lines), "all lines must be str"
+
+
+def test_footer_separator_helper_does_not_depend_on_visualizer_branch():
+    from ac_ui.colors import strip_ansi
+    from ac_ui.ui import _footer_separator_line
+
+    line = _footer_separator_line(80, None)
+    assert isinstance(line, str)
+    assert len(strip_ansi(line)) == 79
 
 
 # ── 5. Audio module public API surface ───────────────────────────────────────

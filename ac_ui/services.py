@@ -383,15 +383,16 @@ class CavaRuntime:
         return self.candidate_idx != start_idx
 
     def start(self) -> bool:
-        import shutil as _shutil
         from ac_ui.audio import cava_config_text, calc_cava_bars
-        from ac_ui.constants import CAVA_MAX
+        from ac_ui.constants import CAVA_BIN, CAVA_MAX, _resolve_command_path
         import time as _time
 
         if self._proc is not None:
             return True
-        if _shutil.which("cava") is None:
-            self.err = "cava not installed"
+        cava_cmd = CAVA_BIN
+        cava_path = _resolve_command_path(cava_cmd)
+        if not cava_path:
+            self.err = f"cava not installed: {cava_cmd}"
             return False
 
         candidate = self.current_candidate()
@@ -411,7 +412,7 @@ class CavaRuntime:
             return False
         try:
             self._proc = subprocess.Popen(
-                ["cava", "-p", self.conf_path],
+                [cava_path, "-p", self.conf_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

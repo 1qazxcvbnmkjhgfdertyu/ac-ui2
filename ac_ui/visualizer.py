@@ -1,4 +1,5 @@
-import math, random, time
+import math, os, random, time
+from array import array
 
 from ac_ui.audio_snapshot import (
     analyze_audio_features,
@@ -10,9 +11,9 @@ from ac_ui.colors import (
 )
 from ac_ui.meters import meter_bar
 
-# Optional compiled hot path for the feedback visualizers (kaleido/liquid/
+# Optional compiled hot paths for the feedback visualizers (kaleido/liquid/
 # plasma). Built via build_native.py; absent on machines without a compiler, in
-# which case the pure-Python _feedback_transform below is used instead.
+# which case the pure-Python helpers below are used instead.
 try:
     from ac_ui import _vizfast as _vizfast
 except Exception:  # pragma: no cover - import guard
@@ -21,6 +22,133 @@ from ac_ui.constants import (
     VIS_BAR_BLOCKS, VIS_SHADE_BLOCKS, VIS_PEAK_GLYPHS,
     CAVA_HEIGHT, MATRIX_RAIN_CHARS, VIS_SCALE, VIS_GAMMA,
 )
+
+_NATIVE_FEEDBACK_BUFFERS = bool(
+    _vizfast is not None
+    and hasattr(_vizfast, "feedback_transform_into_buf")
+    and hasattr(_vizfast, "braille_field_buf")
+    and hasattr(_vizfast, "kaleido_overlay_geom_buf")
+    and hasattr(_vizfast, "flash_disc_buf")
+)
+# Hoisted capability checks (computed once, not per frame in the hot render path).
+_HAS_OVERLAY_GEOM_BUF = _vizfast is not None and hasattr(_vizfast, "kaleido_overlay_geom_buf")
+_HAS_OVERLAY_GEOM_BUF_TYPED = _vizfast is not None and hasattr(_vizfast, "kaleido_overlay_geom_buf_typed")
+_HAS_OVERLAY = _vizfast is not None and hasattr(_vizfast, "kaleido_overlay")
+
+# --- Geiss-style cached warp map (temporal coherence) -----------------------
+# The per-pixel feedback warp geometry (swirl/pinch/warp/mirror trig) barely
+# moves frame-to-frame because its parameters are slow/continuous functions of
+# the audio envelope. So we precompute the dst->src "warp map" once (Geiss's
+# trick), reuse it across frames, and only regenerate it when the geometry
+# params drift past a threshold or a frame ceiling (K) is hit. The live
+# decay/hue_shift stay per-frame in the cheap gather. Gated by env so the
+# default render path is byte-for-byte unchanged until we promote it.
+_WARP_CACHE = os.environ.get("AC_UI_WARP_CACHE", "1") not in ("0", "", "false", "no")
+_NATIVE_WARP_CACHE = bool(
+    _NATIVE_FEEDBACK_BUFFERS
+    and hasattr(_vizfast, "build_warp_map_buf")
+    and hasattr(_vizfast, "feedback_gather_buf")
+)
+try:
+    # Frame ceiling: rebuild at least this often even if the warp looks static.
+    _WARP_CACHE_KMAX = max(1, int(os.environ.get("AC_UI_WARP_KMAX", "12")))
+except ValueError:
+    _WARP_CACHE_KMAX = 12
+try:
+    # Weighted-L1 geometry drift that triggers a rebuild. 0.02 ~= a couple of
+    # source pixels of accumulated warp movement — the smooth/fidelity sweet spot
+    # from bench_warp_sweep.py (smaller = more faithful + more rebuilds).
+    _WARP_CACHE_THRESH = float(os.environ.get("AC_UI_WARP_THRESH", "0.02"))
+except ValueError:
+    _WARP_CACHE_THRESH = 0.02
+try:
+    # Spread each warp-map rebuild across this many frames (Geiss's "a row at a
+    # time in the background") so no single frame pays the full ~15ms build.
+    _WARP_BUILD_FRAMES = max(1, int(os.environ.get("AC_UI_WARP_BUILD_FRAMES", "8")))
+except ValueError:
+    _WARP_BUILD_FRAMES = 8
+
+
+# --- Adaptive low-resolution feedback grid for large terminals --------------
+# At large terminal sizes the feedback/overlay/braille all scale with the dot
+# grid (height*4 x width*2). Halving the VERTICAL dot count (height*2) halves
+# that upstream work. Because the kaleido works in normalized [-1,1] space, the
+# shape/aspect is unchanged — only vertical detail coarsens (braille replicates
+# each field row into two dot-rows). OFF by default (full quality) — opt into the
+# low-power path with AC_UI_VIS_LOWRES=1 (or "auto" to size-gate it).
+_VIS_LOWRES = os.environ.get("AC_UI_VIS_LOWRES", "off").lower()
+try:
+    _VIS_LOWRES_MIN_CELLS = int(os.environ.get("AC_UI_VIS_LOWRES_CELLS", "50000"))
+except ValueError:
+    _VIS_LOWRES_MIN_CELLS = 50000
+try:
+    # Dot-cell cutoff for the cheaper large-grid tunnel path (drops the feedback
+    # kaleidoscope mirror + treble warp — which visibly changes the tunnel into a
+    # plain swirl). DEFAULT OFF (huge cutoff) so the full symmetric tunnel always
+    # renders; set AC_UI_KALEIDO_LARGE_FIELD_CELLS=12000 to re-enable the cheap
+    # path on weak terminals/hardware.
+    _KALEIDO_LARGE_FIELD_CELLS = int(os.environ.get("AC_UI_KALEIDO_LARGE_FIELD_CELLS", "1000000000"))
+except ValueError:
+    _KALEIDO_LARGE_FIELD_CELLS = 1000000000
+try:
+    # Kaleido-specific low-res threshold. The tunnel remains legible a bit
+    # earlier than the other feedback modes, so we let this one halve its
+    # vertical field resolution sooner to flatten the size curve.
+    _KALEIDO_LOWRES_MIN_CELLS = int(os.environ.get("AC_UI_KALEIDO_LOWRES_CELLS", "38000"))
+except ValueError:
+    _KALEIDO_LOWRES_MIN_CELLS = 38000
+try:
+    # Very large kaleido panes can drop to one field row per terminal row. This
+    # is deliberately kaleido-only because it is visibly coarser.
+    _KALEIDO_ULTRALOWRES_MIN_CELLS = int(os.environ.get("AC_UI_KALEIDO_ULTRALOWRES_CELLS", "90000"))
+except ValueError:
+    _KALEIDO_ULTRALOWRES_MIN_CELLS = 90000
+
+
+def _vis_use_lowres(full_cells):
+    """Whether to render the feedback field at half vertical resolution.
+
+    ``full_cells`` is the full-resolution dot count (height*4 * width*2)."""
+    if _VIS_LOWRES in ("0", "off", "false", "no"):
+        return False
+    if _VIS_LOWRES in ("1", "on", "true", "yes"):
+        return True
+    return full_cells >= _VIS_LOWRES_MIN_CELLS
+
+
+def _kaleido_use_lowres(full_cells):
+    """Kaleido tunnel can accept low-res a bit earlier than the generic modes."""
+    return _kaleido_v_dots(full_cells) < 4
+
+
+def _kaleido_v_dots(full_cells):
+    """Vertical field resolution for kaleido_tunnel."""
+    if _VIS_LOWRES in ("0", "off", "false", "no"):
+        return 4
+    if _VIS_LOWRES in ("1", "on", "true", "yes"):
+        return 2
+    if full_cells >= _KALEIDO_ULTRALOWRES_MIN_CELLS:
+        return 1
+    if full_cells >= _KALEIDO_LOWRES_MIN_CELLS:
+        return 2
+    return 4
+
+
+def _warp_geom_drift(prev, cur):
+    """Weighted L1 drift between two geometry-param tuples, in normalized coord
+    units (~how far source samples move). Each param is weighted by its
+    approximate displacement impact on the sampled coordinate."""
+    # tuple order: zoom, rot, drift_x, drift_y, swirl, pinch, warp_amp, warp_phase
+    return (
+        abs(cur[0] - prev[0]) * 0.7      # zoom * typical radius
+        + abs(cur[1] - prev[1]) * 0.7    # rot * typical radius
+        + abs(cur[2] - prev[2])          # drift_x (direct)
+        + abs(cur[3] - prev[3])          # drift_y (direct)
+        + abs(cur[4] - prev[4]) * 0.4    # swirl
+        + abs(cur[5] - prev[5]) * 0.5    # pinch
+        + abs(cur[6] - prev[6])          # warp_amp
+        + cur[6] * abs(cur[7] - prev[7]) # warp_phase scaled by its (tiny) amp
+    )
 
 
 def anim_clock(state, ref_fps=30.0, key="_anim"):
@@ -43,7 +171,18 @@ def anim_clock(state, ref_fps=30.0, key="_anim"):
         dt = 0.0 if dt < 0 else (0.25 if dt > 0.25 else dt)
         clk += dt * ref_fps
         state[clk_key] = clk
+        # Per-frame motion scale: 1.0 at ref_fps, 0.5 at 2x ref_fps, etc. Lets
+        # per-frame-accumulating effects (feedback zoom/rot/decay) advance by
+        # wall-clock instead of per-frame, so they don't speed up at high fps.
+        state[clk_key + "_d"] = dt * ref_fps
     return clk
+
+
+def _motion_scale(state, key="_anim", lo=0.0, hi=1.5):
+    """Frame-rate motion scale captured by the last anim_clock() call (1.0 at the
+    30fps reference). Clamped so a slow/first frame can't lurch the feedback."""
+    d = state.get(key + "_d", 1.0)
+    return lo if d < lo else (hi if d > hi else d)
 
 
 # ─── Display scaling (linear / log / sqrt / gamma) ────────────────────────────
@@ -82,6 +221,8 @@ def apply_spectrum_scale(bars):
 
 # 4-row x 2-col dot-bit table: _BRAILLE_BIT[row][col] -> bitmask
 _BRAILLE_BIT = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
+_BRAILLE_CHAR_LUT = tuple(chr(0x2800 + i) for i in range(256))
+_BRAILLE_HOT_THRESHOLD = 0.7
 _BAR_BLOCKS = (" ", ".", ":", "-", "=", "+", "*", "#", "@") if ASCII_ONLY else VIS_BAR_BLOCKS
 _SHADE_BLOCKS = (" ", ".", ":", "*", "#") if ASCII_ONLY else VIS_SHADE_BLOCKS
 _PEAK_GLYPHS = ("'", "-", "~", "^") if ASCII_ONLY else VIS_PEAK_GLYPHS
@@ -141,10 +282,10 @@ def spectrum_lines(bars, height=CAVA_HEIGHT, use_color=None, mode="bars", trail_
     if use_color:
         _active = bool(game_tag and game_tag != "ALL")
         _spectrum = theme_visualizer_gradient("spectrum", active=_active)
-        _esc_lut = [sgr(fg=gradient_at(_spectrum, k)) for k in range(101)]
+        _esc_lut = _gradient_escape_lut(_spectrum)
         if not game_tag:
             _tip_grad = theme_visualizer_gradient("tip", active=False)
-            _tip_esc_lut = [sgr(fg=gradient_at(_tip_grad, min(100, 80 + k)), bold=True) for k in range(21)]
+            _tip_esc_lut = _gradient_escape_lut(_tip_grad, bold=True)
 
     row_fragments = []
     # Per-column values that don't vary by row — hoisted out of the inner loop.
@@ -192,7 +333,7 @@ def spectrum_lines(bars, height=CAVA_HEIGHT, use_color=None, mode="bars", trail_
             if not use_color or ch == " ":
                 frags.append(ch)
             elif is_tip and _tip_special:
-                frags.append(_tip_esc_lut[col_boost[i]] + ch + RESET)
+                frags.append(_tip_esc_lut[80 + col_boost[i]] + ch + RESET)
             else:
                 idx = row_base + col_boost[i]
                 frags.append(_esc_lut[100 if idx > 100 else idx] + ch + RESET)
@@ -218,6 +359,21 @@ _BRAILLE_BODY_MASK = [
     for dc in range(2)
 ]
 
+
+_GRAD_ESC_LUT_CACHE = {}
+
+
+def _gradient_escape_lut(grad, *, bold=False):
+    """Memoize ANSI escape prefixes for a 0..100 gradient ramp."""
+    key = (grad, bold)
+    cached = _GRAD_ESC_LUT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    lut = tuple(sgr(fg=gradient_at(grad, k), bold=bold) for k in range(101))
+    _GRAD_ESC_LUT_CACHE[key] = lut
+    return lut
+
+
 def _scatter_hash(seed, y, x, frame):
     """Fast deterministic hash for stochastic braille stipple."""
     h = (seed ^ (y * 2654435761) ^ (x * 2246822519) ^ (frame * 1013904223)) & 0xFFFFFFFF
@@ -236,47 +392,90 @@ def flame_render_lines(bars, height, width, state, use_color=True, game_tag=None
     dot_rows = height * 4
     dot_cols = width * 2
     n_bars = len(bars)
+    last_col = dot_cols - 1
 
     if state.get("heat") is None or state.get("rows") != dot_rows or state.get("cols") != dot_cols:
         state["heat"] = [0.0] * (dot_rows * dot_cols)
         state["rows"] = dot_rows
         state["cols"] = dot_cols
+    if state.get("seed_key") != (dot_cols, n_bars):
+        last_bar = max(0, n_bars - 1)
+        seed_lo = [0] * dot_cols
+        seed_frac = [0.0] * dot_cols
+        if last_bar > 0:
+            span = float(max(1, dot_cols - 1))
+            for x in range(dot_cols):
+                pos = x / span * last_bar
+                lo = int(pos)
+                if lo >= last_bar:
+                    lo = last_bar
+                    frac = 0.0
+                else:
+                    frac = pos - lo
+                seed_lo[x] = lo
+                seed_frac[x] = frac
+        state["seed_key"] = (dot_cols, n_bars)
+        state["seed_lo"] = seed_lo
+        state["seed_frac"] = seed_frac
+    if state.get("decay_rows") != dot_rows:
+        decay_scale = 32.0 / max(1, dot_rows)
+        denom = float(max(1, dot_rows - 1))
+        state["decay_rows"] = dot_rows
+        state["decay_jitter_scale"] = 0.018 * decay_scale
+        state["decay_by_row"] = [
+            (0.010 + 0.028 * (y / denom)) * decay_scale
+            for y in range(dot_rows)
+        ]
 
     heat = state["heat"]
+    seed_lo = state["seed_lo"]
+    seed_frac = state["seed_frac"]
+    decay_by_row = state["decay_by_row"]
+    decay_jitter_scale = state["decay_jitter_scale"]
     rng = state.get("rng", 0xF1A3C0DE0BADCAFE)
     state["frame"] = state.get("frame", 0) + 1
     frame = state["frame"]
 
     # Seed bottom row from interpolated spectrum bars with sparkle
-    last_bar = n_bars - 1
     for x in range(dot_cols):
-        pos = x / max(1, dot_cols - 1) * last_bar
-        lo = int(pos); hi = min(lo + 1, last_bar)
-        src = bars[lo] * (1.0 - (pos - lo)) + bars[hi] * (pos - lo)
+        lo = seed_lo[x]
+        frac = seed_frac[x]
+        if frac > 0.0:
+            src = bars[lo] * (1.0 - frac) + bars[lo + 1] * frac
+        else:
+            src = bars[lo]
         rng = (rng * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
         sparkle = ((rng >> 33) % 100) / 100.0 * 0.20
         # No floor: quiet = near-zero flame, loud = tall flame.
         # Sparkle scales with signal so silence is nearly dark.
-        heat[x] = min(src + sparkle * (0.25 + src), 1.0)
+        value = src + sparkle * (0.25 + src)
+        heat[x] = 1.0 if value > 1.0 else value
 
     # Propagate heat upward: lateral wind jitter + height-dependent decay
     # Normalise decay to dot_rows so flame height scales consistently at any spectrum height.
-    _decay_scale = 32.0 / max(1, dot_rows)
     for y in range(dot_rows - 1, 0, -1):
-        decay_base = (0.010 + 0.028 * (y / max(1, dot_rows - 1))) * _decay_scale
+        decay_base = decay_by_row[y]
+        dst_row = y * dot_cols
+        src_row = dst_row - dot_cols
         for x in range(dot_cols):
             rng = (rng * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
             r = rng >> 33
-            offset = int(r % 3) - 1
-            decay_jitter = ((r >> 2) % 100) / 100.0 * 0.018 * _decay_scale
-            sx = max(0, min(dot_cols - 1, x + offset))
-            heat[y * dot_cols + x] = max(0.0, heat[(y - 1) * dot_cols + sx] - decay_base - decay_jitter)
+            sx = x + int(r % 3) - 1
+            if sx < 0:
+                sx = 0
+            elif sx > last_col:
+                sx = last_col
+            decay_jitter = ((r >> 2) % 100) / 100.0 * decay_jitter_scale
+            value = heat[src_row + sx] - decay_base - decay_jitter
+            heat[dst_row + x] = value if value > 0.0 else 0.0
 
     state["rng"] = rng
 
-    flame_grad = theme_visualizer_gradient("flame", active=bool(game_tag and game_tag != "ALL"))
-    hot_color = gradient_at(flame_grad, 95)
-    body_color = gradient_at(flame_grad, 35)
+    hot_color = body_color = None
+    if use_color:
+        flame_grad = theme_visualizer_gradient("flame", active=bool(game_tag and game_tag != "ALL"))
+        hot_color = gradient_at(flame_grad, 95)
+        body_color = gradient_at(flame_grad, 35)
 
     lines_out = []
     for row in range(height):
@@ -297,7 +496,7 @@ def flame_render_lines(bars, height, width, state, use_color=True, game_tag=None
                     tier = 0 if h >= 0.55 else 1
                     if tier > cell_tier:
                         cell_tier = tier
-            ch = chr(braille)
+            ch = _BRAILLE_CHAR_LUT[braille - 0x2800]
             if use_color and cell_tier >= 0:
                 color = hot_color if cell_tier == 0 else body_color
                 row_str.append(c256(ch, color))
@@ -346,7 +545,7 @@ def braille_wave_lines(bars, height, width, use_color=True, game_tag=None, snaps
                 prev_x = float(x)
                 prev_y = y
             _store_feedback(state, inten, hue)
-            grad = _gradient_for(game_tag)
+            grad = _gradient_for(game_tag) if use_color else None
             return _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
                                   use_color=use_color, threshold=0.06)
 
@@ -452,7 +651,7 @@ def braille_scope_lines(bars, height, width, frame, use_color=True, game_tag=Non
                         if dist <= radius:
                             _plot(inten, hue, dot_rows, dot_cols, x, y, flash * (1.0 - dist / max(0.001, radius)), 98)
             _store_feedback(state, inten, hue)
-            grad = _gradient_for(game_tag)
+            grad = _gradient_for(game_tag) if use_color else None
             return _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
                                   use_color=use_color, threshold=0.06)
 
@@ -546,7 +745,7 @@ def butterfly_render_lines(bars, height, width, state, use_color=True, game_tag=
     band_count = len(bars)
     frame = state.get("frame", 0)
     state["frame"] = frame + 1
-    grid = [False] * (dot_rows * dot_cols)
+    grid = bytearray(dot_rows * dot_cols)
 
     for dy in range(dot_rows):
         band_f = dy / max(1, dot_rows - 1) * (band_count - 1)
@@ -569,15 +768,23 @@ def butterfly_render_lines(bars, height, width, state, use_color=True, game_tag=
             if _scatter_hash(bi, dy, dx, frame // 3) < threshold:
                 rx = center_x + dx
                 if rx < dot_cols:
-                    grid[dy * dot_cols + rx] = True
+                    grid[dy * dot_cols + rx] = 1
                 lx = center_x - 1 - dx
                 if lx >= 0:
-                    grid[dy * dot_cols + lx] = True
+                    grid[dy * dot_cols + lx] = 1
 
         if energy > 0.05:
-            grid[dy * dot_cols + center_x] = True
+            grid[dy * dot_cols + center_x] = 1
             if center_x > 0:
-                grid[dy * dot_cols + center_x - 1] = True
+                grid[dy * dot_cols + center_x - 1] = 1
+
+    row_colors = None
+    if use_color:
+        grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL"))
+        row_colors = [
+            gradient_at(grad, int(row / max(1, height - 1) * 100))
+            for row in range(height)
+        ]
 
     lines_out = []
     for row in range(height):
@@ -590,11 +797,9 @@ def butterfly_render_lines(bars, height, width, state, use_color=True, game_tag=
                     if grid[(row * 4 + dr) * dot_cols + col * 2 + dc]:
                         braille |= _BRAILLE_BIT[dr][dc]
                         has_dot = True
-            ch = chr(braille)
+            ch = _BRAILLE_CHAR_LUT[braille - 0x2800]
             if use_color and has_dot:
-                row_norm = row / max(1, height - 1)
-                color = spectrum_color(col, width, row_norm, game_tag=game_tag)
-                row_str.append(c256(ch, color))
+                row_str.append(c256(ch, row_colors[row]))
             else:
                 row_str.append(ch)
         lines_out.append("".join(row_str))
@@ -774,10 +979,12 @@ def heartbeat_render_lines(bars, height, width, state, use_color=True, game_tag=
         if not grid[base_y * dot_cols + x] and (x // 6) % 2 == 0:
             grid[base_y * dot_cols + x] = True
 
-    heartbeat_grad = theme_visualizer_gradient("heartbeat", active=bool(game_tag and game_tag != "ALL"))
-    trace_hi = gradient_at(heartbeat_grad, 95)
-    trace_lo = gradient_at(heartbeat_grad, 60)
-    base_color = gradient_at(heartbeat_grad, 20)
+    trace_hi = trace_lo = base_color = None
+    if use_color:
+        heartbeat_grad = theme_visualizer_gradient("heartbeat", active=bool(game_tag and game_tag != "ALL"))
+        trace_hi = gradient_at(heartbeat_grad, 95)
+        trace_lo = gradient_at(heartbeat_grad, 60)
+        base_color = gradient_at(heartbeat_grad, 20)
 
     lines_out = []
     for row in range(height):
@@ -979,8 +1186,9 @@ def _plot(inten, hue, dot_rows, dot_cols, x, y, v, h):
             hue[idx] = h
 
 
-def _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
-                   use_color=True, threshold=0.05):
+def _braille_field_py(inten, hue, dot_rows, dot_cols, height, width, grad,
+                      use_color=True, threshold=0.05, esc=None, esc_bold=None,
+                      field_v_dots=4):
     """Render an (intensity, hue) dot field as colored braille rows.
 
     Each braille cell is colored by its brightest lit dot and bolded when that
@@ -988,64 +1196,276 @@ def _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
     """
     # Hue is an index 0..100, so precompute the escape prefix per hue (plain and
     # bold) once instead of calling gradient_at()+paint() for every lit cell.
-    esc = esc_bold = None
-    if use_color:
-        esc = [sgr(fg=gradient_at(grad, k)) for k in range(101)]
-        esc_bold = [sgr(fg=gradient_at(grad, k), bold=True) for k in range(101)]
+    if use_color and esc is None:
+        esc = _gradient_escape_lut(grad)
+        esc_bold = _gradient_escape_lut(grad, bold=True)
 
-    _bit = _BRAILLE_BIT
+    bit00, bit01 = _BRAILLE_BIT[0]
+    bit10, bit11 = _BRAILLE_BIT[1]
+    bit20, bit21 = _BRAILLE_BIT[2]
+    bit30, bit31 = _BRAILLE_BIT[3]
+    inten_arr = inten
+    hue_arr = hue
+    reset = RESET
+    braille_chars = _BRAILLE_CHAR_LUT
+    hot_threshold = _BRAILLE_HOT_THRESHOLD
     lines_out = []
     for row in range(height):
         row_str = []
-        base_row = row * 4
+        append = row_str.append
+        if field_v_dots >= 4:
+            row0 = row * 4 * dot_cols
+            row1 = row0 + dot_cols
+            row2 = row1 + dot_cols
+            row3 = row2 + dot_cols
+        elif field_v_dots <= 1:
+            row0 = row * dot_cols
+            row1 = row0
+            row2 = row0
+            row3 = row0
+        else:
+            row0 = row * 2 * dot_cols
+            row1 = row0
+            row2 = row0 + dot_cols
+            row3 = row2
+        active_prefix = None
         for col in range(width):
             braille = 0x2800
             best = threshold
             best_hue = 50
             base_col = col * 2
-            for dr in range(4):
-                row_off = (base_row + dr) * dot_cols + base_col
-                v = inten[row_off]
-                if v > threshold:
-                    braille |= _bit[dr][0]
-                    if v > best:
-                        best = v
-                        best_hue = hue[row_off]
-                v = inten[row_off + 1]
-                if v > threshold:
-                    braille |= _bit[dr][1]
-                    if v > best:
-                        best = v
-                        best_hue = hue[row_off + 1]
+
+            idx = row0 + base_col
+            v = inten_arr[idx]
+            if v > threshold:
+                braille |= bit00
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx]
+            v = inten_arr[idx + 1]
+            if v > threshold:
+                braille |= bit01
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx + 1]
+
+            idx = row1 + base_col
+            v = inten_arr[idx]
+            if v > threshold:
+                braille |= bit10
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx]
+            v = inten_arr[idx + 1]
+            if v > threshold:
+                braille |= bit11
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx + 1]
+
+            idx = row2 + base_col
+            v = inten_arr[idx]
+            if v > threshold:
+                braille |= bit20
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx]
+            v = inten_arr[idx + 1]
+            if v > threshold:
+                braille |= bit21
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx + 1]
+
+            idx = row3 + base_col
+            v = inten_arr[idx]
+            if v > threshold:
+                braille |= bit30
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx]
+            v = inten_arr[idx + 1]
+            if v > threshold:
+                braille |= bit31
+                if v > best:
+                    best = v
+                    best_hue = hue_arr[idx + 1]
             if braille == 0x2800:
-                row_str.append(" ")
+                if active_prefix is not None:
+                    append(reset)
+                    active_prefix = None
+                append(" ")
             elif esc is not None:
                 k = int(best_hue)
                 if k < 0:
                     k = 0
                 elif k > 100:
                     k = 100
-                prefix = esc_bold[k] if best > 0.7 else esc[k]
-                row_str.append(prefix + chr(braille) + RESET)
+                prefix = esc_bold[k] if best > hot_threshold else esc[k]
+                if prefix != active_prefix:
+                    append(prefix)
+                    active_prefix = prefix
+                append(braille_chars[braille - 0x2800])
             else:
-                row_str.append(chr(braille))
+                if active_prefix is not None:
+                    append(reset)
+                    active_prefix = None
+                append(braille_chars[braille - 0x2800])
+        if active_prefix is not None:
+            append(reset)
         lines_out.append("".join(row_str))
     return lines_out
 
 
+def _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
+                   use_color=True, threshold=0.05, field_v_dots=4):
+    esc = esc_bold = None
+    if use_color:
+        esc = _gradient_escape_lut(grad)
+        esc_bold = _gradient_escape_lut(grad, bold=True)
+    if _NATIVE_FEEDBACK_BUFFERS and not isinstance(inten, list) and hasattr(_vizfast, "braille_field_buf"):
+        return _vizfast.braille_field_buf(
+            inten, hue, dot_rows, dot_cols, height, width,
+            esc, esc_bold, use_color, threshold, _BRAILLE_HOT_THRESHOLD, RESET,
+            field_v_dots,
+        )
+    if _vizfast is not None and hasattr(_vizfast, "braille_field"):
+        return _vizfast.braille_field(
+            inten, hue, dot_rows, dot_cols, height, width,
+            esc, esc_bold, use_color, threshold, _BRAILLE_HOT_THRESHOLD, RESET,
+        ) if field_v_dots >= 4 else _braille_field_py(
+            inten, hue, dot_rows, dot_cols, height, width, grad,
+            use_color=use_color, threshold=threshold, esc=esc, esc_bold=esc_bold,
+            field_v_dots=field_v_dots,
+        )
+    return _braille_field_py(
+        inten, hue, dot_rows, dot_cols, height, width, grad,
+        use_color=use_color, threshold=threshold, esc=esc, esc_bold=esc_bold,
+        field_v_dots=field_v_dots,
+    )
+
+
 def _feedback_buffers(state, dot_rows, dot_cols):
     size = dot_rows * dot_cols
+    buf_inten = "fb_inten_a"
+    buf_hue = "fb_hue_a"
+    alt_inten = "fb_inten_b"
+    alt_hue = "fb_hue_b"
+    if _NATIVE_FEEDBACK_BUFFERS:
+        inten_factory = lambda: array("f", [0.0]) * size
+        hue_factory = lambda: bytearray([50]) * size
+    else:
+        inten_factory = lambda: [0.0] * size
+        hue_factory = lambda: [50] * size
     if (
         state.get("fb_rows") != dot_rows
         or state.get("fb_cols") != dot_cols
-        or len(state.get("fb_inten", ())) != size
-        or len(state.get("fb_hue", ())) != size
+        or len(state.get(buf_inten, ())) != size
+        or len(state.get(buf_hue, ())) != size
+        or len(state.get(alt_inten, ())) != size
+        or len(state.get(alt_hue, ())) != size
     ):
         state["fb_rows"] = dot_rows
         state["fb_cols"] = dot_cols
-        state["fb_inten"] = [0.0] * size
-        state["fb_hue"] = [50] * size
-    return state["fb_inten"], state["fb_hue"]
+        state[buf_inten] = inten_factory()
+        state[buf_hue] = hue_factory()
+        state[alt_inten] = inten_factory()
+        state[alt_hue] = hue_factory()
+        state["fb_active"] = 0
+    active = 1 if state.get("fb_active") else 0
+    if active:
+        return state[alt_inten], state[alt_hue], state[buf_inten], state[buf_hue]
+    return state[buf_inten], state[buf_hue], state[alt_inten], state[alt_hue]
+
+
+def _warp_cached_map(state, dot_rows, dot_cols, zoom, rot, drift_x, drift_y,
+                     mirror, swirl, pinch, warp_amp, warp_freq, warp_phase):
+    """Return the active cached warp-map index array, maintaining it Geiss-style.
+
+    Holds one *active* map (used by every frame's gather) plus, when the warp
+    geometry has drifted, builds a *pending* replacement incrementally across
+    ``_WARP_BUILD_FRAMES`` frames in the background and atomically swaps it in
+    when complete — so no single frame pays the full per-pixel-trig rebuild.
+    Returns the array to gather through this frame.
+    """
+    size = dot_rows * dot_cols
+    grid = (dot_rows, dot_cols)
+    geom = (zoom, rot, drift_x, drift_y, swirl, pinch, warp_amp, warp_phase)
+    # `bp` (the full build-param tuple) is only needed when a (re)build starts;
+    # on the common steady gather frame it is never used, so build it lazily.
+
+    active = state.get("_warp_idx")
+    if active is None or len(active) != size or state.get("_warp_grid") != grid:
+        # First map (or resize): one synchronous full build — nothing to reuse.
+        bp = (zoom, rot, drift_x, drift_y, mirror, swirl, pinch,
+              warp_amp, warp_freq, warp_phase)
+        active = array("i", [-1]) * size
+        _vizfast.build_warp_map_buf(active, dot_rows, dot_cols, *bp)
+        state["_warp_idx"] = active
+        state["_warp_grid"] = grid
+        state["_warp_active_geom"] = geom
+        state["_warp_active_mf"] = (mirror, warp_freq)
+        state["_warp_build_row"] = -1
+        state["_warp_pending"] = None
+        state["_warp_age"] = 0
+        state["_warp_regens"] = state.get("_warp_regens", 0) + 1
+        return active
+
+    rows_per = -(-dot_rows // _WARP_BUILD_FRAMES)   # ceil
+    build_row = state.get("_warp_build_row", -1)
+
+    if build_row >= 0:
+        # Continue an in-flight background rebuild.
+        pending = state["_warp_pending"]
+        r_end = min(dot_rows, build_row + rows_per)
+        _vizfast.build_warp_map_buf(
+            pending, dot_rows, dot_cols, *state["_warp_pending_params"],
+            build_row, r_end,
+        )
+        if r_end >= dot_rows:
+            # Swap: pending becomes active; recycle the old active as next spare.
+            old = state["_warp_idx"]
+            state["_warp_idx"] = pending
+            state["_warp_pending"] = old
+            state["_warp_active_geom"] = state["_warp_pending_geom"]
+            state["_warp_active_mf"] = state["_warp_pending_mf"]
+            state["_warp_build_row"] = -1
+            state["_warp_age"] = 0
+            return pending
+        state["_warp_build_row"] = r_end
+        return active
+
+    # Idle: decide whether the warp has drifted enough to start a new rebuild.
+    age = state.get("_warp_age", 0) + 1
+    state["_warp_age"] = age
+    if (
+        state.get("_warp_active_mf") != (mirror, warp_freq)
+        or age >= _WARP_CACHE_KMAX
+        or _warp_geom_drift(state["_warp_active_geom"], geom) > _WARP_CACHE_THRESH
+    ):
+        bp = (zoom, rot, drift_x, drift_y, mirror, swirl, pinch,
+              warp_amp, warp_freq, warp_phase)
+        pending = state.get("_warp_pending")
+        if pending is None or len(pending) != size:
+            pending = array("i", [-1]) * size
+        r_end = min(dot_rows, rows_per)
+        _vizfast.build_warp_map_buf(pending, dot_rows, dot_cols, *bp, 0, r_end)
+        state["_warp_pending"] = pending
+        state["_warp_pending_params"] = bp
+        state["_warp_pending_geom"] = geom
+        state["_warp_pending_mf"] = (mirror, warp_freq)
+        state["_warp_regens"] = state.get("_warp_regens", 0) + 1
+        if r_end >= dot_rows:
+            # Tiny grid finished in one slice — swap immediately.
+            old = state["_warp_idx"]
+            state["_warp_idx"] = pending
+            state["_warp_pending"] = old
+            state["_warp_active_geom"] = geom
+            state["_warp_active_mf"] = (mirror, warp_freq)
+            state["_warp_age"] = 0
+            return pending
+        state["_warp_build_row"] = r_end
+    return active
 
 
 def _feedback_transform(
@@ -1075,7 +1495,31 @@ def _feedback_transform(
       pinch    — radius-dependent zoom (bulge/contract by distance from center)
       warp_amp — sinusoidal domain warp (the classic MilkDrop "warp" ripples)
     """
-    src_inten, src_hue = _feedback_buffers(state, dot_rows, dot_cols)
+    src_inten, src_hue, out_inten, out_hue = _feedback_buffers(state, dot_rows, dot_cols)
+    if _WARP_CACHE and _NATIVE_WARP_CACHE and _vizfast is not None and not isinstance(src_inten, list):
+        active = _warp_cached_map(
+            state, dot_rows, dot_cols, zoom, rot, drift_x, drift_y,
+            int(mirror or 0), swirl, pinch, warp_amp, warp_freq, warp_phase,
+        )
+        _vizfast.feedback_gather_buf(
+            src_inten, src_hue, out_inten, out_hue, active, dot_rows * dot_cols,
+            decay, hue_shift,
+        )
+        return out_inten, out_hue
+    if _NATIVE_FEEDBACK_BUFFERS and hasattr(_vizfast, "feedback_transform_into_buf"):
+        _vizfast.feedback_transform_into_buf(
+            src_inten, src_hue, out_inten, out_hue, dot_rows, dot_cols,
+            decay, zoom, rot, drift_x, drift_y, hue_shift,
+            int(mirror or 0), swirl, pinch, warp_amp, warp_freq, warp_phase,
+        )
+        return out_inten, out_hue
+    if _vizfast is not None and hasattr(_vizfast, "feedback_transform_into"):
+        _vizfast.feedback_transform_into(
+            src_inten, src_hue, out_inten, out_hue, dot_rows, dot_cols,
+            decay, zoom, rot, drift_x, drift_y, hue_shift,
+            int(mirror or 0), swirl, pinch, warp_amp, warp_freq, warp_phase,
+        )
+        return out_inten, out_hue
     if _vizfast is not None:
         # Compiled fast path (identical math, ~10x faster per call).
         return _vizfast.feedback_transform(
@@ -1171,16 +1615,26 @@ def _feedback_coords(state, dot_rows, dot_cols, cx, cy):
 
 
 def _store_feedback(state, inten, hue):
-    state["fb_inten"] = inten
-    state["fb_hue"] = hue
+    if inten is state.get("fb_inten_a") and hue is state.get("fb_hue_a"):
+        state["fb_active"] = 0
+        return
+    if inten is state.get("fb_inten_b") and hue is state.get("fb_hue_b"):
+        state["fb_active"] = 1
+        return
+    state["fb_inten_a"] = inten
+    state["fb_hue_a"] = hue
+    if len(state.get("fb_inten_b", ())) != len(inten) or len(state.get("fb_hue_b", ())) != len(hue):
+        state["fb_inten_b"] = [0.0] * len(inten)
+        state["fb_hue_b"] = [50] * len(hue)
+    state["fb_active"] = 0
 
 
 def _tunnel_geometry(state, dot_rows, dot_cols, n_bars):
     """Frame-invariant per-pixel geometry for the kaleido tunnel, cached by grid.
 
     For every pixel inside the active annulus (0.04 < r < 1.35) we precompute the
-    radius, base angle, spectrum band index, and (1-r) — none of which change
-    frame to frame.  The per-frame loop then only adds the time-varying angle and
+    base angle, spectrum band index, and the radius-derived constants the hot loop
+    actually uses. The per-frame loop then only adds the time-varying angle,
     does the ridge/twist trig, and iterates *only* the active pixels.
     """
     key = (dot_rows, dot_cols, n_bars)
@@ -1203,10 +1657,72 @@ def _tunnel_geometry(state, dot_rows, dot_cols, n_bars):
             r = _hypot(nx, ny145)
             if r < 0.04 or r > 1.35:
                 continue
+            omr = 1.0 - r
             band_idx = min(n_bars - 1, int(min(0.999, r ** 0.86) * n_bars))
-            active.append((row_base + x, r, _atan2(ny, nx), band_idx, 1.0 - r))
+            active.append((row_base + x, _atan2(ny, nx), band_idx, omr * 22.0, 22.0 + omr * 60.0))
     state["_tunnel_geo"] = (key, active)
     return active
+
+
+def _tunnel_geometry_buf(state, dot_rows, dot_cols, n_bars):
+    """Packed native geometry for the kaleido tunnel overlay."""
+    key = (dot_rows, dot_cols, n_bars)
+    cached = state.get("_tunnel_geo_buf")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    cx = (dot_cols - 1) / 2.0
+    cy = (dot_rows - 1) / 2.0
+    _hypot = math.hypot
+    _atan2 = math.atan2
+    inv_cx = 1.0 / max(1.0, cx)
+    inv_cy = 1.0 / max(1.0, cy)
+    idx_arr = array("I")
+    ang_arr = array("f")
+    band_arr = array("I")
+    omr_arr = array("f")
+    hue_arr = array("f")
+    for y in range(dot_rows):
+        ny = (y - cy) * inv_cy
+        ny145 = ny * 1.45
+        row_base = y * dot_cols
+        for x in range(dot_cols):
+            nx = (x - cx) * inv_cx
+            r = _hypot(nx, ny145)
+            if r < 0.04 or r > 1.35:
+                continue
+            omr = 1.0 - r
+            idx_arr.append(row_base + x)
+            ang_arr.append(_atan2(ny, nx))
+            band_arr.append(min(n_bars - 1, int(min(0.999, r ** 0.86) * n_bars)))
+            omr_arr.append(omr * 22.0)
+            hue_arr.append(22.0 + omr * 60.0)
+    packed = (idx_arr, ang_arr, band_arr, omr_arr, hue_arr)
+    state["_tunnel_geo_buf"] = (key, packed)
+    return packed
+
+
+def _tunnel_geometry_fold_buf(state, dot_rows, dot_cols, n_bars, symmetry):
+    """Packed tunnel geometry with base angles folded for one symmetry value."""
+    base_key = (dot_rows, dot_cols, n_bars)
+    active = _tunnel_geometry_buf(state, dot_rows, dot_cols, n_bars)
+    cached = state.get("_tunnel_geo_fold_buf")
+    if cached is None or cached[0] != base_key:
+        cached = (base_key, {})
+        state["_tunnel_geo_fold_buf"] = cached
+    folded_by_sym = cached[1]
+    symmetry = max(1, int(symmetry))
+    folded = folded_by_sym.get(symmetry)
+    if folded is not None:
+        return folded
+
+    seg = math.pi / symmetry
+    seg2 = seg * 2.0
+    folded_ang = array("f")
+    for base_ang in active[1]:
+        folded_ang.append((base_ang + seg) % seg2)
+    folded = (active[0], folded_ang, active[2], active[3], active[4])
+    folded_by_sym[symmetry] = folded
+    return folded
 
 
 def _viz_rng(state, seed=0x9E3779B9):
@@ -1230,36 +1746,134 @@ def _gradient_for(game_tag):
     return theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL"))
 
 
+def _kaleido_overlay(inten, hue, active, bars, phase, symmetry, ang_off, f03, f09):
+    """Overlay the animated tunnel spokes onto an existing feedback field."""
+    _cos = math.cos
+    _int = int
+    _pi = math.pi
+    _pi_inv = 18.0 / math.pi
+    _ridge_pi_inv = 1.0 / math.pi
+    seg = math.pi / max(1, int(symmetry))
+    seg2 = seg * 2.0
+    sym26 = symmetry * 2.6
+    sym2 = symmetry * 2.0
+    inten_arr = inten
+    hue_arr = hue
+    for idx, base_ang, band_idx, omr22, hue_base in active:
+        ang = (base_ang + ang_off + seg) % seg2 - seg
+        if ang < 0.0:
+            ang = -ang
+        # Range-reduce to distance from nearest multiple of pi and reject
+        # off-spoke pixels before the sin (mirrors the native overlay). On a
+        # spoke |sin(theta)| == sin(|d|) exactly, so kept pixels are unchanged.
+        d = omr22 - phase + ang * sym26
+        q = d * _ridge_pi_inv
+        d -= _pi * (_int(q + 0.5) if q >= 0.0 else _int(q - 0.5))
+        if d < 0.0:
+            d = -d
+        if d >= 0.20135792079033079:
+            continue
+        # After the ridge reject ``d`` is in [0, asin(0.2)), so the cubic
+        # small-angle expansion is effectively exact and cheaper than sin().
+        d2 = d * d
+        lane = 1.0 - (d * (1.0 - d2 / 6.0)) * 5.0
+        band = bars[band_idx]
+        twist = 0.5 + 0.5 * _cos(ang * sym2 + f03)
+        val = (lane * lane * lane) * (0.20 + band * 0.90) * (0.35 + twist * 0.80)
+        if val <= 0.06:
+            continue
+        if val > inten_arr[idx]:
+            inten_arr[idx] = val
+            hue_arr[idx] = int((hue_base + ang * _pi_inv + f09) % 101)
+
+
+def _kaleido_overlay_flat(inten, hue, active, bars, phase, symmetry, ang_off, f09):
+    """Lower-cost tunnel spoke overlay used on very large feedback grids."""
+    _int = int
+    _pi = math.pi
+    _pi_inv = 18.0 / math.pi
+    _ridge_pi_inv = 1.0 / math.pi
+    seg = math.pi / max(1, int(symmetry))
+    seg2 = seg * 2.0
+    sym26 = symmetry * 2.6
+    inten_arr = inten
+    hue_arr = hue
+    for idx, base_ang, band_idx, omr22, hue_base in active:
+        ang = (base_ang + ang_off + seg) % seg2 - seg
+        if ang < 0.0:
+            ang = -ang
+        d = omr22 - phase + ang * sym26
+        q = d * _ridge_pi_inv
+        d -= _pi * (_int(q + 0.5) if q >= 0.0 else _int(q - 0.5))
+        if d < 0.0:
+            d = -d
+        if d >= 0.20135792079033079:
+            continue
+        d2 = d * d
+        lane = 1.0 - (d * (1.0 - d2 / 6.0)) * 5.0
+        band = bars[band_idx]
+        val = (lane * lane * lane) * (0.20 + band * 0.90) * 0.75
+        if val <= 0.06:
+            continue
+        if val > inten_arr[idx]:
+            inten_arr[idx] = val
+            hue_arr[idx] = int((hue_base + ang * _pi_inv + f09) % 101)
+
+
 def kaleido_tunnel_render_lines(bars, height, width, state, features=None, use_color=True, game_tag=None):
     """MilkDrop-ish feedback tunnel with kaleidoscope symmetry and beat flashes."""
     if height <= 0 or width <= 0:
         return [" " * max(1, width)] * max(1, height)
-    bars = list(bars or [0.0])
+    bars = bars or (0.0,)
     features = features or analyze_audio_features(bars, _feature_state(state))
     state["frame"] = state.get("frame", 0) + 1
     # Drive motion from a time-based clock (not the raw frame counter) so a higher
     # refresh rate makes the feedback motion *smoother*, not faster — the visual
     # speed matches the original 30fps feel at any actual fps.
     frame = anim_clock(state)
-    dot_rows, dot_cols = height * 4, width * 2
-    grad = _gradient_for(game_tag)
+    # Adaptive vertical resolution: at large terminals render the field at
+    # height*2 dot-rows (braille replicates each into two dot-rows) to halve the
+    # feedback/overlay/gather work. Shape is unchanged (normalized [-1,1] space).
+    v_dots = _kaleido_v_dots((height * 4) * (width * 2))
+    dot_rows, dot_cols = height * v_dots, width * 2
+    grad = _gradient_for(game_tag) if use_color else None
 
     symmetry = 5 + int(features.treble_att * 3.0) + int(features.centroid_att * 2.0) + (1 if features.onset > 0.18 else 0)
+    # Base the large-field simplifications on the FULL grid so they still trigger
+    # under low-res (where dot_rows is already halved).
+    large_feedback_field = (height * 4) * dot_cols >= _KALEIDO_LARGE_FIELD_CELLS
+    # The spoke overlay already supplies the strong kaleidoscope read. On larger
+    # grids the mirrored feedback fold costs a lot of per-pixel trig, so above a
+    # medium-size field we keep the tunnel warp but drop the redundant feedback
+    # mirror to keep frame time from scaling as hard with window size.
+    feedback_mirror = symmetry if not large_feedback_field else 0
+    # The treble ripple is visually nice but it is the single most expensive
+    # remaining per-pixel term once the mirror fold is gone. On larger grids the
+    # spoke overlay already provides enough motion/detail, so we drop just this
+    # ripple term to stop fullscreen cost from ballooning with window size.
+    feedback_warp_amp = features.treble_att * 0.05 if not large_feedback_field else 0.0
+    # Frame-rate-independent feedback: the warp/decay below are applied once per
+    # frame, so at high fps the tunnel would flow/fade proportionally faster.
+    # Scale every per-frame-accumulating term by the wall-clock motion scale
+    # (1.0 at the 30fps reference) so the visual SPEED is the same at any fps —
+    # higher fps just makes it smoother. (warp_freq is spatial, warp_phase is
+    # already time-based, so they aren't scaled.)
+    ms = _motion_scale(state)
     inten, hue = _feedback_transform(
         state,
         dot_rows,
         dot_cols,
-        decay=0.91 + features.bass_att * 0.05,
-        zoom=1.012 + features.overall * 0.06,
-        rot=0.012 + features.mids_att * 0.05,
-        drift_x=math.sin(frame * 0.022) * 0.025,
-        drift_y=math.cos(frame * 0.017) * 0.015,
-        hue_shift=1.2 + features.treble_att * 2.0 + features.centroid_att * 1.3,
-        mirror=symmetry,
+        decay=(0.91 + features.bass_att * 0.05) ** ms,
+        zoom=1.0 + (0.012 + features.overall * 0.06) * ms,
+        rot=(0.012 + features.mids_att * 0.05) * ms,
+        drift_x=math.sin(frame * 0.022) * 0.025 * ms,
+        drift_y=math.cos(frame * 0.017) * 0.015 * ms,
+        hue_shift=(1.2 + features.treble_att * 2.0 + features.centroid_att * 1.3) * ms,
+        mirror=feedback_mirror,
         # Per-pixel warp: bass sucks toward center, mids spiral, treble ripples.
-        swirl=0.06 + features.mids_att * 0.45,
-        pinch=features.bass_att * 0.55,
-        warp_amp=features.treble_att * 0.05,
+        swirl=(0.06 + features.mids_att * 0.45) * ms,
+        pinch=(features.bass_att * 0.55) * ms,
+        warp_amp=feedback_warp_amp * ms,
         warp_freq=5.0,
         warp_phase=frame * 0.045,
     )
@@ -1268,38 +1882,59 @@ def kaleido_tunnel_render_lines(bars, height, width, state, features=None, use_c
     cy = (dot_rows - 1) / 2.0
     n_bars = max(1, len(bars))
     phase = frame * (0.20 + features.bass * 0.35)
-    # Precomputed active-pixel geometry + locally-bound math (per-pixel hot loop).
-    active = _tunnel_geometry(state, dot_rows, dot_cols, n_bars)
-    _sin = math.sin
-    _cos = math.cos
-    _pi = math.pi
-    seg = _pi / max(1, int(symmetry))
-    seg2 = seg * 2.0
+    # Precomputed active-pixel geometry: the overlay loop only does per-frame
+    # angle folding + trig and iterates the active annulus pixels.
     ang_off = frame * 0.014
-    sym26 = symmetry * 2.6
-    sym2 = symmetry * 2.0
     f03 = frame * 0.03
     f09 = frame * 0.9
-    for idx, r, base_ang, band_idx, omr in active:
-        # Inlined kaleidoscope fold of (base_ang + time).
-        a = base_ang + ang_off + seg
-        ang = a % seg2 - seg
-        if ang < 0.0:
-            ang = -ang
-        ridge = _sin(omr * 22.0 - phase + ang * sym26)
-        lane = 1.0 - (ridge if ridge >= 0.0 else -ridge) * 5.0
-        if lane <= 0.0:
-            continue   # val would be 0 → skip the cos/pow for the empty majority
-        band = bars[band_idx]
-        twist = 0.5 + 0.5 * _cos(ang * sym2 + f03)
-        val = (lane * lane * lane) * (0.20 + band * 0.90) * (0.35 + twist * 0.80)
-        if val <= 0.06:
-            continue
-        if val > inten[idx]:
-            inten[idx] = val
-            hue[idx] = int((22 + omr * 60 + ang / _pi * 18 + f09) % 101)
+    if _NATIVE_FEEDBACK_BUFFERS and _HAS_OVERLAY_GEOM_BUF and not isinstance(inten, list):
+        if large_feedback_field and hasattr(_vizfast, "kaleido_overlay_geom_buf_typed_flat_folded"):
+            active = _tunnel_geometry_fold_buf(state, dot_rows, dot_cols, n_bars, symmetry)
+            seg = math.pi / max(1, int(symmetry))
+            seg2 = seg * 2.0
+            ang_off_mod = ang_off % seg2
+            _vizfast.kaleido_overlay_geom_buf_typed_flat_folded(
+                inten, hue,
+                active[0], active[1], active[2], active[3], active[4],
+                array("f", bars), phase, symmetry, ang_off_mod, f09,
+            )
+        elif large_feedback_field and hasattr(_vizfast, "kaleido_overlay_geom_buf_typed_flat"):
+            active = _tunnel_geometry_buf(state, dot_rows, dot_cols, n_bars)
+            _vizfast.kaleido_overlay_geom_buf_typed_flat(
+                inten, hue,
+                active[0], active[1], active[2], active[3], active[4],
+                array("f", bars), phase, symmetry, ang_off, f09,
+            )
+        elif _HAS_OVERLAY_GEOM_BUF_TYPED:
+            active = _tunnel_geometry_buf(state, dot_rows, dot_cols, n_bars)
+            _vizfast.kaleido_overlay_geom_buf_typed(
+                inten, hue,
+                active[0], active[1], active[2], active[3], active[4],
+                array("f", bars), phase, symmetry, ang_off, f03, f09,
+            )
+        else:
+            active = _tunnel_geometry_buf(state, dot_rows, dot_cols, n_bars)
+            _vizfast.kaleido_overlay_geom_buf(
+                inten, hue,
+                active[0], active[1], active[2], active[3], active[4],
+                bars, phase, symmetry, ang_off, f03, f09,
+            )
+    elif _HAS_OVERLAY:
+        active = _tunnel_geometry(state, dot_rows, dot_cols, n_bars)
+        if large_feedback_field:
+            _kaleido_overlay_flat(inten, hue, active, bars, phase, symmetry, ang_off, f09)
+        else:
+            _vizfast.kaleido_overlay(inten, hue, active, bars, phase, symmetry, ang_off, f03, f09)
+    else:
+        active = _tunnel_geometry(state, dot_rows, dot_cols, n_bars)
+        if large_feedback_field:
+            _kaleido_overlay_flat(inten, hue, active, bars, phase, symmetry, ang_off, f09)
+        else:
+            _kaleido_overlay(inten, hue, active, bars, phase, symmetry, ang_off, f03, f09)
 
-    flash = state.get("flash", 0.0) * 0.86 + min(1.0, features.onset * 2.4)
+    # 0.86 is a per-frame decay; scale it by the motion clock so beat flashes
+    # last the same wall-clock time (don't get snappier) at higher fps.
+    flash = state.get("flash", 0.0) * (0.86 ** ms) + min(1.0, features.onset * 2.4)
     state["flash"] = flash
     if flash > 0.04:
         radius = 1.0 + flash * dot_rows * 0.18
@@ -1307,32 +1942,39 @@ def kaleido_tunnel_render_lines(bars, height, width, state, features=None, use_c
         max_x = min(dot_cols - 1, int(cx + radius))
         min_y = max(0, int(cy - radius))
         max_y = min(dot_rows - 1, int(cy + radius))
-        for y in range(min_y, max_y + 1):
-            for x in range(min_x, max_x + 1):
-                dist = math.hypot(x - cx, (y - cy) * 1.2)
-                if dist > radius:
-                    continue
-                v = flash * max(0.0, 1.0 - dist / max(0.001, radius))
-                _plot(inten, hue, dot_rows, dot_cols, x, y, v, 96)
+        if _NATIVE_FEEDBACK_BUFFERS and not isinstance(inten, list):
+            _vizfast.flash_disc_buf(
+                inten, hue, dot_cols, min_x, max_x, min_y, max_y,
+                cx, cy, radius, flash, 96, 1.0, 1.2,
+            )
+        else:
+            for y in range(min_y, max_y + 1):
+                for x in range(min_x, max_x + 1):
+                    dist = math.hypot(x - cx, (y - cy) * 1.2)
+                    if dist > radius:
+                        continue
+                    v = flash * max(0.0, 1.0 - dist / max(0.001, radius))
+                    _plot(inten, hue, dot_rows, dot_cols, x, y, v, 96)
 
     _store_feedback(state, inten, hue)
     return _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
-                          use_color=use_color, threshold=0.05)
+                          use_color=use_color, threshold=0.05, field_v_dots=v_dots)
 
 
 def liquid_scope_render_lines(bars, height, width, state, features=None, use_color=True, game_tag=None):
     """Feedback oscilloscope with mirrored smear and kick flashes."""
     if height <= 0 or width <= 0:
         return [" " * max(1, width)] * max(1, height)
-    bars = list(bars or [0.0])
+    bars = bars or (0.0,)
     features = features or analyze_audio_features(bars, _feature_state(state))
     state["frame"] = state.get("frame", 0) + 1
     # Drive motion from a time-based clock (not the raw frame counter) so a higher
     # refresh rate makes the feedback motion *smoother*, not faster — the visual
     # speed matches the original 30fps feel at any actual fps.
     frame = anim_clock(state)
-    dot_rows, dot_cols = height * 4, width * 2
-    grad = _gradient_for(game_tag)
+    v_dots = 2 if _vis_use_lowres((height * 4) * (width * 2)) else 4
+    dot_rows, dot_cols = height * v_dots, width * 2
+    grad = _gradient_for(game_tag) if use_color else None
 
     inten, hue = _feedback_transform(
         state,
@@ -1391,30 +2033,41 @@ def liquid_scope_render_lines(bars, height, width, state, features=None, use_col
     state["scope_flash"] = flash
     if flash > 0.05:
         radius = 1.5 + flash * dot_rows * 0.10
-        for y in range(max(0, int(cy - radius)), min(dot_rows - 1, int(cy + radius)) + 1):
-            for x in range(max(0, int(cx - radius * 1.6)), min(dot_cols - 1, int(cx + radius * 1.6)) + 1):
-                dist = math.hypot((x - cx) / 1.6, y - cy)
-                if dist <= radius:
-                    _plot(inten, hue, dot_rows, dot_cols, x, y, flash * (1.0 - dist / max(0.001, radius)), 98)
+        min_x = max(0, int(cx - radius * 1.6))
+        max_x = min(dot_cols - 1, int(cx + radius * 1.6))
+        min_y = max(0, int(cy - radius))
+        max_y = min(dot_rows - 1, int(cy + radius))
+        if _NATIVE_FEEDBACK_BUFFERS and not isinstance(inten, list):
+            _vizfast.flash_disc_buf(
+                inten, hue, dot_cols, min_x, max_x, min_y, max_y,
+                cx, cy, radius, flash, 98, 1.6, 1.0,
+            )
+        else:
+            for y in range(min_y, max_y + 1):
+                for x in range(min_x, max_x + 1):
+                    dist = math.hypot((x - cx) / 1.6, y - cy)
+                    if dist <= radius:
+                        _plot(inten, hue, dot_rows, dot_cols, x, y, flash * (1.0 - dist / max(0.001, radius)), 98)
 
     _store_feedback(state, inten, hue)
     return _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
-                          use_color=use_color, threshold=0.05)
+                          use_color=use_color, threshold=0.05, field_v_dots=v_dots)
 
 
 def plasma_bloom_render_lines(bars, height, width, state, features=None, use_color=True, game_tag=None):
     """Feedback plasma field with breathing blooms and beat-synced rings."""
     if height <= 0 or width <= 0:
         return [" " * max(1, width)] * max(1, height)
-    bars = list(bars or [0.0])
+    bars = bars or (0.0,)
     features = features or analyze_audio_features(bars, _feature_state(state))
     state["frame"] = state.get("frame", 0) + 1
     # Drive motion from a time-based clock (not the raw frame counter) so a higher
     # refresh rate makes the feedback motion *smoother*, not faster — the visual
     # speed matches the original 30fps feel at any actual fps.
     frame = anim_clock(state)
-    dot_rows, dot_cols = height * 4, width * 2
-    grad = _gradient_for(game_tag)
+    v_dots = 2 if _vis_use_lowres((height * 4) * (width * 2)) else 4
+    dot_rows, dot_cols = height * v_dots, width * 2
+    grad = _gradient_for(game_tag) if use_color else None
 
     inten, hue = _feedback_transform(
         state,
@@ -1442,43 +2095,60 @@ def plasma_bloom_render_lines(bars, height, width, state, features=None, use_col
 
     cx = (dot_cols - 1) / 2.0
     cy = (dot_rows - 1) / 2.0
-    for y in range(dot_rows):
-        ny = (y - cy) / max(1.0, cy)
-        for x in range(dot_cols):
-            nx = (x - cx) / max(1.0, cx)
-            r = math.hypot(nx * 1.05, ny * 1.20)
-            if r > 1.35:
-                continue
-            swirl = (
-                math.sin(nx * 6.4 + phase * 1.5)
-                + math.sin(ny * 5.2 - phase * 1.1)
-                + math.sin((nx + ny) * 4.1 + phase * 0.7)
-            ) / 3.0
-            petals = 0.5 + 0.5 * math.cos(math.atan2(ny, nx) * (3.2 + features.contrast_att * 2.2) - phase * 0.5)
-            bloom = max(0.0, 1.0 - r * (1.02 + features.bass_att * 0.32))
-            val = max(0.0, swirl * 0.5 + 0.5 - 0.26)
-            val *= (bloom ** 1.9) * (0.30 + petals * 0.80) * (0.24 + features.overall * 0.96)
-            ring = max(0.0, 0.20 - abs(r - (0.16 + pulse * 0.26)))
-            val += ring * pulse * 1.7
-            if val <= 0.05:
-                continue
-            idx = y * dot_cols + x
-            if val > inten[idx]:
-                inten[idx] = val
-                hue[idx] = int((44 + swirl * 18 + petals * 20 + frame * 0.7 - r * 28) % 101)
+    if _NATIVE_FEEDBACK_BUFFERS and hasattr(_vizfast, "plasma_field_buf") and not isinstance(inten, list):
+        _vizfast.plasma_field_buf(
+            inten, hue, dot_rows, dot_cols,
+            phase, frame, pulse,
+            features.contrast_att, features.bass_att, features.overall,
+        )
+    else:
+        for y in range(dot_rows):
+            ny = (y - cy) / max(1.0, cy)
+            for x in range(dot_cols):
+                nx = (x - cx) / max(1.0, cx)
+                r = math.hypot(nx * 1.05, ny * 1.20)
+                if r > 1.35:
+                    continue
+                swirl = (
+                    math.sin(nx * 6.4 + phase * 1.5)
+                    + math.sin(ny * 5.2 - phase * 1.1)
+                    + math.sin((nx + ny) * 4.1 + phase * 0.7)
+                ) / 3.0
+                petals = 0.5 + 0.5 * math.cos(math.atan2(ny, nx) * (3.2 + features.contrast_att * 2.2) - phase * 0.5)
+                bloom = max(0.0, 1.0 - r * (1.02 + features.bass_att * 0.32))
+                val = max(0.0, swirl * 0.5 + 0.5 - 0.26)
+                val *= (bloom ** 1.9) * (0.30 + petals * 0.80) * (0.24 + features.overall * 0.96)
+                ring = max(0.0, 0.20 - abs(r - (0.16 + pulse * 0.26)))
+                val += ring * pulse * 1.7
+                if val <= 0.05:
+                    continue
+                idx = y * dot_cols + x
+                if val > inten[idx]:
+                    inten[idx] = val
+                    hue[idx] = int((44 + swirl * 18 + petals * 20 + frame * 0.7 - r * 28) % 101)
 
     if pulse > 0.04:
         radius = 1.0 + pulse * dot_rows * 0.12
-        for y in range(max(0, int(cy - radius)), min(dot_rows - 1, int(cy + radius)) + 1):
-            for x in range(max(0, int(cx - radius)), min(dot_cols - 1, int(cx + radius)) + 1):
-                dist = math.hypot(x - cx, (y - cy) * 1.15)
-                if dist <= radius:
-                    _plot(inten, hue, dot_rows, dot_cols, x, y,
-                          pulse * 0.65 * (1.0 - dist / max(0.001, radius)), 99)
+        min_x = max(0, int(cx - radius))
+        max_x = min(dot_cols - 1, int(cx + radius))
+        min_y = max(0, int(cy - radius))
+        max_y = min(dot_rows - 1, int(cy + radius))
+        if _NATIVE_FEEDBACK_BUFFERS and not isinstance(inten, list):
+            _vizfast.flash_disc_buf(
+                inten, hue, dot_cols, min_x, max_x, min_y, max_y,
+                cx, cy, radius, pulse * 0.65, 99, 1.0, 1.15,
+            )
+        else:
+            for y in range(min_y, max_y + 1):
+                for x in range(min_x, max_x + 1):
+                    dist = math.hypot(x - cx, (y - cy) * 1.15)
+                    if dist <= radius:
+                        _plot(inten, hue, dot_rows, dot_cols, x, y,
+                              pulse * 0.65 * (1.0 - dist / max(0.001, radius)), 99)
 
     _store_feedback(state, inten, hue)
     return _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
-                          use_color=use_color, threshold=0.05)
+                          use_color=use_color, threshold=0.05, field_v_dots=v_dots)
 
 
 _MILKDROP_PRESETS = (
@@ -1494,7 +2164,7 @@ def milkdrop_render_lines(bars, height, width, state, features=None, use_color=T
         state["display_label"] = "milkdrop"
         return [" " * max(1, width)] * max(1, height)
 
-    bars = list(bars or [0.0])
+    bars = bars or (0.0,)
     features = features or analyze_audio_features(bars, _feature_state(state))
     rng = _viz_rng(state, 0x4D494C4B)
     preset_count = len(_MILKDROP_PRESETS)
@@ -1549,7 +2219,7 @@ def fireworks_render_lines(bars, height, width, state, use_color=True, game_tag=
     state["frame"] = state.get("frame", 0) + 1
     features = features or analyze_audio_features(bars, _feature_state(state))
     bass, onset = _detect_beat(bars, state, sensitivity=1.4)
-    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL"))
+    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL")) if use_color else None
 
     cap = max(60, dot_cols * 3)
     cool = state.get("cool", 0)
@@ -1609,7 +2279,7 @@ def starfield_render_lines(bars, height, width, state, use_color=True, game_tag=
     bass, onset = _detect_beat(bars, state)
     overall = features.overall
     cx, cy = dot_cols / 2.0, dot_rows / 2.0
-    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL"))
+    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL")) if use_color else None
 
     field_density = max(0.35, 1.10 - features.contrast_att * 0.45)
     target = int(dot_cols * field_density * (0.7 + overall * 1.3))
@@ -1652,7 +2322,7 @@ def ripple_render_lines(bars, height, width, state, use_color=True, game_tag=Non
     bass, onset = _detect_beat(bars, state)
     cx, cy = dot_cols / 2.0, dot_rows / 2.0
     max_r = math.hypot(cx, cy)
-    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL"))
+    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL")) if use_color else None
 
     if onset > 0.045 and (not rings or rings[-1][0] > dot_rows * 0.14):
         rings.append([1.0, min(100, int(28 + onset * 115 + features.centroid_att * 26)), 1.0])
@@ -1692,7 +2362,7 @@ def aurora_render_lines(bars, height, width, state, features=None, use_color=Tru
     sampled = resample_bars(bars, width) if bars else [0.0] * width
     features = features or analyze_audio_features(bars, _feature_state(state))
     bass, _onset = _detect_beat(bars, state)
-    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL"))
+    grad = theme_visualizer_gradient("spectrum", active=bool(game_tag and game_tag != "ALL")) if use_color else None
     ramp = VIS_SHADE_BLOCKS
     last = len(ramp) - 1
     flow = frame * (0.55 + features.centroid_att * 0.80)
@@ -1735,7 +2405,7 @@ def polar_spectrum_render_lines(bars, height, width, state, features=None, use_c
     state["frame"] = state.get("frame", 0) + 1
     features = features or analyze_audio_features(bars, _feature_state(state))
     bass, onset = _detect_beat(bars, state)
-    grad = _gradient_for(game_tag)
+    grad = _gradient_for(game_tag) if use_color else None
     cx, cy = dot_cols / 2.0, dot_rows / 2.0
 
     # Soft bloom/trails: decay the previous ring and rotate it a touch so the
@@ -1795,7 +2465,7 @@ def chroma_wheel_render_lines(bars, height, width, state, features=None, use_col
     dot_rows, dot_cols = height * 4, width * 2
     state["frame"] = state.get("frame", 0) + 1
     features = features or analyze_audio_features(bars, _feature_state(state))
-    grad = _gradient_for(game_tag)
+    grad = _gradient_for(game_tag) if use_color else None
     bass, onset = _detect_beat(bars, state)
     cx, cy = dot_cols / 2.0, dot_rows / 2.0
     chroma = features.chroma or (0.0,) * 12
@@ -1883,7 +2553,7 @@ def features_debug_lines(bars, height, width, state, features=None, snapshot=Non
     if height <= 0 or width <= 0:
         return [" " * max(1, width)] * max(1, height)
     features = features or analyze_audio_features(bars, _feature_state(state))
-    grad = _gradient_for(game_tag)
+    grad = _gradient_for(game_tag) if use_color else None
     hist = state.setdefault("hist", {})
     state["frame"] = state.get("frame", 0) + 1
 
@@ -1932,6 +2602,142 @@ def features_debug_lines(bars, height, width, state, features=None, snapshot=Non
 
 
 # ─── Frame dispatch ───────────────────────────────────────────────────────────
+# ─── 3D audio orb ─────────────────────────────────────────────────────────────
+_ORB_POINTS_CACHE = {}
+
+
+def _orb_sphere_points(n):
+    """`n` roughly-even points on the unit sphere (golden-spiral), cached."""
+    cached = _ORB_POINTS_CACHE.get(n)
+    if cached is not None:
+        return cached
+    ga = math.pi * (3.0 - math.sqrt(5.0))  # golden angle
+    pts = []
+    for i in range(n):
+        y = 1.0 - 2.0 * (i + 0.5) / n
+        r = math.sqrt(max(0.0, 1.0 - y * y))
+        th = ga * i
+        pts.append((math.cos(th) * r, y, math.sin(th) * r))
+    _ORB_POINTS_CACHE[n] = pts
+    return pts
+
+
+def orb3d_render_lines(bars, height, width, state, features=None, use_color=True, game_tag=None):
+    """A floating 3D audio orb: a sphere of points that grow spectral spikes on
+    the beat, slowly rotating in perspective so you orbit around it. Each vertex
+    maps to a frequency band; loud bands shoot radial spikes that recede under
+    gravity. Pure 3D->2D perspective projection splatted into the braille dot
+    field; depth shades brightness so it reads as a real 3D object. Motion is
+    anim_clock-driven, so it's the same speed at any fps (just smoother)."""
+    if height <= 0 or width <= 0:
+        return [" " * max(1, width)] * max(1, height)
+    bars = bars or (0.0,)
+    features = features or analyze_audio_features(bars, _feature_state(state))
+    frame = anim_clock(state)
+    ms = _motion_scale(state)
+    dot_rows, dot_cols = height * 4, width * 2
+    grad = _gradient_for(game_tag) if use_color else None
+    size = dot_rows * dot_cols
+    inten = [0.0] * size
+    hue = [50] * size
+
+    n = 820
+    pts = _orb_sphere_points(n)
+    n_bars = len(bars)
+
+    # Per-vertex spike envelope: quick attack toward the band energy, slow
+    # gravity release — both fps-independent so spikes feel identical at any rate.
+    sp = state.get("orb_spikes")
+    if sp is None or len(sp) != n:
+        sp = [0.0] * n
+        state["orb_spikes"] = sp
+    attack = 1.0 - (0.45 ** ms)     # ~0.55 per frame at 30fps
+    release = 0.90 ** ms
+
+    # Beat pulse: the whole orb breathes outward on a kick.
+    pulse = state.get("orb_pulse", 0.0) * (0.82 ** ms) + min(1.0, features.onset * 2.2)
+    state["orb_pulse"] = pulse
+
+    # Camera / rotation (time-based → constant speed regardless of fps).
+    # Eye-level orbit: yaw spins the orb (= us walking around it); pitch stays ~0
+    # so we look at it straight on. A whisper of pitch keeps it from looking like a
+    # flat spinning pinwheel.
+    yaw = frame * 0.018
+    pitch = 0.08
+    cyaw, syaw = math.cos(yaw), math.sin(yaw)
+    cpit, spit = math.cos(pitch), math.sin(pitch)
+    cam = 2.7
+    fscale = min(dot_cols, dot_rows) * 0.61    # ~33% larger on screen
+    cx = (dot_cols - 1) / 2.0
+    cyc = (dot_rows - 1) / 2.0
+    bob = math.sin(frame * 0.013) * dot_rows * 0.025   # subtle float
+    base_r = 0.56 + pulse * 0.18                # beats visibly pump the whole orb
+    overall = features.overall
+
+    # Fixed world-space light: as the orb spins, its surface rotates THROUGH the
+    # light, so the bright spot stays put while dots flow past it — that's what
+    # sells "solid rotating sphere" instead of "transparent beehive".
+    lx, ly, lz = 0.50, 0.62, 0.60
+    _ln = 1.0 / math.sqrt(lx * lx + ly * ly + lz * lz)
+    lx *= _ln; ly *= _ln; lz *= _ln
+
+    for i in range(n):
+        x0, y0, z0 = pts[i]
+        band = bars[(i * n_bars) // n]
+        # Amplified so normal-volume music makes real spikes (band*band alone
+        # crushed everything below "loud" into a near-static ball).
+        target = band * band * 2.6
+        if target > 1.0:
+            target = 1.0
+        if target > sp[i]:
+            sp[i] += (target - sp[i]) * attack
+        else:
+            sp[i] *= release
+        spike = sp[i]
+
+        # Rotate the unit direction (yaw about Y, then pitch about X) -> normal.
+        xr = x0 * cyaw + z0 * syaw
+        zr0 = -x0 * syaw + z0 * cyaw
+        yr = y0 * cpit - zr0 * spit
+        zr = y0 * spit + zr0 * cpit
+
+        # Backface cull: only the camera-facing hemisphere draws, so you no longer
+        # see through to the far shell. Side spikes (near the silhouette) still show.
+        if zr < -0.15:
+            continue
+
+        # Lambert shading from the fixed light -> a lit ball with a bright spot.
+        lambert = xr * lx + yr * ly + zr * lz
+        if lambert < 0.0:
+            lambert = 0.0
+        surf = 0.10 + 0.78 * lambert
+
+        tip_r = base_r + spike * 1.45               # longer, more dramatic spikes
+        steps = 1 + int(spike * 10.0)             # longer spikes = more dots
+        inv_steps = 1.0 / steps
+        for s in range(steps + 1):
+            t = s * inv_steps
+            rr = base_r + (tip_r - base_r) * t
+            depth = cam - zr * rr
+            if depth < 0.25:
+                continue
+            inv = fscale / depth
+            sx = cx + xr * rr * inv
+            sy = cyc - yr * rr * inv + bob
+            if t < 0.001:
+                bright = surf * (0.72 + overall * 0.28)         # lit body
+            else:
+                bright = (0.4 + 0.6 * surf) * (0.22 + 0.9 * t) * (0.5 + spike)  # glowing spike
+            if bright <= 0.05:
+                continue
+            hcol = int(30.0 + spike * 120.0 + t * 24.0 + lambert * 18.0)
+            hcol = 0 if hcol < 0 else (100 if hcol > 100 else hcol)
+            _plot(inten, hue, dot_rows, dot_cols, sx, sy, bright if bright < 1.0 else 1.0, hcol)
+
+    return _braille_field(inten, hue, dot_rows, dot_cols, height, width, grad,
+                          use_color=use_color, threshold=0.05)
+
+
 # One entry point so callers don't carry a giant if/elif.  Each renderer is
 # adapted to a uniform (mode, bars, height, width, ctx) signature; `ctx` carries
 # the shared smoothing buffers and a dict of per-mode persistent state.  Adding a
@@ -2056,6 +2862,14 @@ def _vf_ripple(mode, bars, h, w, ctx):
 def _vf_aurora(mode, bars, h, w, ctx):
     return aurora_render_lines(
         bars, h, w, ctx.state("aurora"),
+        features=ctx.features, use_color=ctx.use_color, game_tag=ctx.game_tag,
+    )
+
+
+@_vis("orb3d")
+def _vf_orb3d(mode, bars, h, w, ctx):
+    return orb3d_render_lines(
+        bars, h, w, ctx.state("orb3d"),
         features=ctx.features, use_color=ctx.use_color, game_tag=ctx.game_tag,
     )
 

@@ -271,6 +271,7 @@ def build_layout_preview(term_cols, term_rows, layout_config=None):
                 maxw_override=bars_len,
                 title=VIS_MODES[vis_idx],
                 title2=VISUALIZER_TITLE_HINTS,
+                lines_fitted=True,
             )
             lines.extend(vbox)
         else:

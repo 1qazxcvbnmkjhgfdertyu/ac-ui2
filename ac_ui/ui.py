@@ -1,4 +1,4 @@
-import os, sys, time, random, subprocess, json, signal, threading, shutil, re, textwrap, tempfile, struct, math, errno, stat, wave, unicodedata
+import os, sys, time, random, subprocess, json, signal, threading, shutil, re, textwrap, struct, math, errno, stat, wave, unicodedata
 from collections import deque
 
 import ac_ui.colors as _clrs
@@ -17,7 +17,7 @@ from ac_ui.constants import (
     ASCII_ONLY,
     REFRESH_INTERVAL, IDLE_REFRESH, RESIZE_DEBOUNCE, REFRESH_OVERRIDE_SET,
     vis_frame_interval, default_vis_fps_map,
-    VIS_MODES, VIS_MODE, GRADIENT_ANIMATE, GRADIENT_SPEED,
+    VIS_MODES, VIS_MODE, HEAVY_VIS_MODES, GRADIENT_ANIMATE, GRADIENT_SPEED,
     VIS_ATTACK_MS, VIS_DECAY_MS, VIS_PEAK_DECAY_MS, VIS_TRAIL_DECAY_MS,
     TITLE_ANIMATE, TITLE_ANIM_FPS, BOX_BORDER_SPIN, BOX_BORDER_SPEED,
     FOCUS_THROTTLE, SHOW_TITLE_ART, DEBUG_ART, NO_MOTION,
@@ -89,23 +89,104 @@ from ac_ui.stats import (
 from ac_ui.eq import load_eq_bands, save_eq_bands, apply_mpv_eq, build_mpv_eq_filter
 from ac_ui.persist import load_ui_state, save_ui_state
 from ac_ui.town_tune import town_tune_cli, normalize_town_tune
-from ac_ui.editors import run_eq_editor, run_tune_editor, run_playlist_picker, run_playlist_editor, run_queue_manager, run_add_to_playlist
-from ac_ui.palette import run_command_palette
-from ac_ui.help_overlay import run_help_overlay
-from ac_ui.finder import run_fuzzy_finder, make_item
 from ac_ui.feedback import spinner_frame
 from ac_ui.keymap import load_key_aliases
 from ac_ui.plugins import REGISTRY as plugin_registry, load_plugins, PluginContext
-from ac_ui.menu import run_menu
 from ac_ui.scan import BackgroundScan
-from ac_ui.viewer import run_fullscreen_view
-from ac_ui.vis_fps_menu import run_vis_fps_menu
 from ac_ui.app import parse_cli_args, build_cache_cli  # noqa: F401 — re-exported for callers
-from ac_ui.layout_preview import build_layout_preview, layout_sweep_cli  # noqa: F401 — re-exported for callers
+
+_PCM_WINDOW_VIS_MODES = frozenset(("wave", "scope"))
+
+
+# ── Lazy feature imports ─────────────────────────────────────────────────────
+# The editors and the layout-sweep CLI are only reached through interactive key
+# handlers, so importing them on first use rather than at module load keeps that
+# work off every startup. (The palette, finder, menu, help and fullscreen view
+# are now live overlays in ac_ui.overlay, imported lazily at their open sites.)
+# make_item still builds finder entries at the "/" open site, so it stays here.
+def run_eq_editor(*a, **k):
+    from ac_ui.editors import run_eq_editor as _f; return _f(*a, **k)
+def run_tune_editor(*a, **k):
+    from ac_ui.editors import run_tune_editor as _f; return _f(*a, **k)
+def run_playlist_picker(*a, **k):
+    from ac_ui.editors import run_playlist_picker as _f; return _f(*a, **k)
+def run_queue_manager(*a, **k):
+    from ac_ui.editors import run_queue_manager as _f; return _f(*a, **k)
+def run_add_to_playlist(*a, **k):
+    from ac_ui.editors import run_add_to_playlist as _f; return _f(*a, **k)
+def make_item(*a, **k):
+    from ac_ui.finder import make_item as _f; return _f(*a, **k)
+def layout_sweep_cli(*a, **k):
+    from ac_ui.layout_preview import layout_sweep_cli as _f; return _f(*a, **k)
 from ac_ui.panels import history as _hist_panel, up_next as _up_next_panel, stats as _stats_panel, help as _help_panel
 from ac_ui.panels.now_playing import NowPlayingContext, render as _render_now_playing
 
+
+# Maximum share of wall-clock time the render loop is allowed to spend building
+# frames before the auto-governor stretches the wait. 0.5 => a heavy frame can
+# use at most ~half a core; cheaper frames are never affected.
+_RENDER_DUTY = 0.5
+
+
+def governed_refresh(target_interval, frame_work_ema, duty=_RENDER_DUTY):
+    """Pacing governor: never wait less than the target rate, but if building a
+    frame is expensive (a heavy visualizer on a slow machine or a huge terminal)
+    stretch the wait so rendering stays within ``duty`` of the wall clock.
+
+    Cheap frames keep the target rate; expensive ones degrade gracefully (lower
+    fps, bounded CPU) with no settings to choose. Pure + unit-tested.
+    """
+    if frame_work_ema <= 0.0 or duty >= 1.0:
+        return target_interval
+    # period must be >= work/duty, so the extra wait is work*(1-duty)/duty.
+    min_wait = frame_work_ema * (1.0 - duty) / duty
+    return max(target_interval, min_wait)
+
+
+# How long the spectrum must stay silent before the visualizer drops to its idle
+# rate, and what that idle rate is (10 fps). Restores instantly on the next sound.
+_AUDIO_IDLE_AFTER = 2.5
+_AUDIO_IDLE_INTERVAL = 0.10
+
+# Hardware floor: if even after pacing a heavy feedback visualizer still takes
+# longer than this to build a single frame (~12 fps ceiling), this machine simply
+# can't run it well (e.g. ~20-year-old single-core hardware) — fall back to a
+# cheap mode automatically so the app stays smooth. Cheap modes never hit this.
+_VIS_FALLBACK_CEILING = 0.080
+_VIS_FALLBACK_MODE = "spectrum"
+
+
+def vis_mode_overloaded(mode, frame_work_ema, ceiling=_VIS_FALLBACK_CEILING):
+    """True when ``mode`` is a heavy feedback visualizer that this machine can't
+    build fast enough to be usable (frame time over ``ceiling``). Cheap modes
+    never qualify. Pure + unit-tested."""
+    return mode in HEAVY_VIS_MODES and frame_work_ema > ceiling
+
+
+def idle_throttled_interval(base_interval, silent_seconds,
+                            idle_interval=_AUDIO_IDLE_INTERVAL, after=_AUDIO_IDLE_AFTER):
+    """Once audio has been silent for ``after`` seconds, pace at the slower idle
+    rate — heavy/animated visualizers are only drawing idle drift then, so this
+    saves power during paused or quiet passages. Restores instantly on sound.
+    Pure + unit-tested.
+    """
+    if silent_seconds >= after:
+        return max(base_interval, idle_interval)
+    return base_interval
+
 _active_tod_grad = _clrs._active_tod_grad
+
+
+def _footer_separator_line(term_cols, tod_grad):
+    """Return the pinned footer separator without depending on visualizer locals."""
+    chrome = theme_chrome()
+    divider = chrome.get("divider", BOX_CHARS["h"])
+    sep_chr = chrome.get("separator", divider)
+    width = max(1, term_cols - 1)
+    if USE_COLOR:
+        return c256(sep_chr * width, theme_role("border", tod_grad))
+    return "-" * width
+
 
 def main():
     rename_process("ac-ui")
@@ -113,6 +194,9 @@ def main():
     mode, allowed_games, cli_vis_mode, import_paths, tune_action, layout_opts = parse_cli_args(sys.argv)
     if mode == "import":
         sys.exit(import_files(import_paths))
+    if mode == "extract-ac":
+        from ac_ui.acgc_extract import extract_ac_cli
+        sys.exit(extract_ac_cli(import_paths))
     if mode == "build-cache":
         sys.exit(build_cache_cli(import_paths))
     if mode == "tune":
@@ -189,6 +273,7 @@ def main():
     last_render_key = None
     last_render_ts = 0.0
     last_lines = None
+    active_overlay = None  # live overlay composited over the still-animating frame
     last_loopback_ts = 0.0
     last_loopback_vol = None
     last_loopback_muted = None
@@ -293,6 +378,10 @@ def main():
     catalog_warm = BackgroundScan(lambda should_cancel: list_all_tracks()).start()
     debug_frame_times = deque(maxlen=30)
     debug_last_frame_ts = 0.0
+    frame_work_ema = 0.0  # smoothed per-frame build+render time, for the pacing governor
+    perf_degraded = False  # weak machine: shed per-frame border/gradient animation
+    vis_auto_fellback = False  # one-shot: dropped a too-heavy mode on weak hardware
+    last_audio_active_ts = time.monotonic()  # for the audio-idle visualizer throttle
     panel_focus = None   # None | "history" | "up_next"
     hist_sel = 0
     up_sel = 0
@@ -972,17 +1061,23 @@ def main():
     try:
         with RawMode():
             while True:
+                frame_work_t0 = time.monotonic()
                 now = time.time()
                 hour = int(time.strftime("%H", time.localtime(now)))
                 if now - last_wm_title_ts >= 1.0:
                     set_terminal_title("ac-ui")
                     last_wm_title_ts = now
-                if GRADIENT_ANIMATE:
+                # On a machine that can't keep up (perf_degraded, set by the
+                # governor below) freeze the per-frame border chrome: a static,
+                # un-pulsing border lets build_box take its single-escape uniform
+                # fast path and stops re-tinting/rebuilding boxes every frame.
+                if GRADIENT_ANIMATE and not perf_degraded:
                     _layout.BOX_GRADIENT_PHASE = (now * GRADIENT_SPEED) % 1.0
-                if BOX_BORDER_SPIN:
+                _layout.BOX_BORDER_SPIN = BOX_BORDER_SPIN and not perf_degraded
+                if _layout.BOX_BORDER_SPIN:
                     _layout.BOX_BORDER_POS = int(now * BOX_BORDER_SPEED)
                 # Beat-reactive border glow: feed last frame's bass energy to build_box.
-                _layout.BOX_PULSE = max(0.0, min(1.0, _bass_energy))
+                _layout.BOX_PULSE = 0.0 if perf_degraded else max(0.0, min(1.0, _bass_energy))
                 _pulse_bucket = int(_layout.BOX_PULSE * 6)   # quantize so boxes rebuild ~6 steps
                 if TITLE_ANIMATE and _term.TITLE_ART_BASE and (not background_mode) and (focused or not FOCUS_THROTTLE):
                     interval = 1.0 / max(1.0, TITLE_ANIM_FPS)
@@ -1171,14 +1266,17 @@ def main():
                 max_info_rows = max(0, _max_content_rows - 2)  # 2 for box borders
                 compact_info = max_info_rows < 10 or term_cols < 70 or ultra_compact
 
+                layout_preset = layout_state["preset"]
+                _fullscreen_layout = layout_preset in FULLSCREEN_LAYOUT_PRESETS
+
                 # Width Now Playing will actually be boxed at, computed up front so its
                 # content (long meters, art mosaic) is rendered to fit and never clipped
                 # by a later narrower rebuild.  Erring toward the sidebar-present (narrow)
                 # width is safe: if no sidebar shows, the box just pads on the right.
-                _np_preset = normalize_layout_config(layout_state, default_preset=DEFAULT_LAYOUT_PRESET)["preset"]
-                _np_pmw = resolve_panel_max_width(term_cols, _np_preset)
+                _np_pmw = resolve_panel_max_width(term_cols, layout_preset)
                 _np_will_sidebar = (
-                    (not ultra_compact) and (not compact_info)
+                    (not _fullscreen_layout)
+                    and (not ultra_compact) and (not compact_info)
                     and ((show_history_panel and not tiny_term)
                          or (show_up_next_panel and not (tiny_term or small_term)))
                 )
@@ -1323,7 +1421,7 @@ def main():
 
                 stats_box = None
                 stats_w = 0
-                if (not ultra_compact) and STATS_ENABLED and stats_data is not None:
+                if (not ultra_compact) and (not _fullscreen_layout) and STATS_ENABLED and stats_data is not None:
                     total_sec = int(stats_data.get("total_listen_seconds", 0) + session_listen)
                     hb = stats_data.get("hour_buckets", [0] * 24)
                     # Stretch Stats to the full content width (btop-style) rather
@@ -1340,13 +1438,7 @@ def main():
                     stats_w = stats_w_cache
 
                 max_content_end = _chrome_rows + _max_content_rows
-                layout_snapshot = normalize_layout_config(layout_state, default_preset=DEFAULT_LAYOUT_PRESET)
-                layout_preset = layout_snapshot["preset"]
-                # Fullscreen preset: the visualizer owns the whole screen, so drop
-                # the stats bar (panels are suppressed just below).
-                _fullscreen_layout = layout_preset in FULLSCREEN_LAYOUT_PRESETS
-                if _fullscreen_layout:
-                    stats_box = None
+                layout_snapshot = layout_state
 
                 if info_box and (len(lines) + len(info_box) > max_content_end):
                     max_rows = max(0, max_content_end - len(lines) - 2)
@@ -1610,11 +1702,10 @@ def main():
                 else:
                     bars_len = bars_len_cached
                 bars = list(cava_bars) if cava_bars else None
-                _wave_frames = max(1024, min(2048, max(1, bars_len) * 16))
-                _wave_left, _wave_right = _pcm.waveform_window(_wave_frames) if _pcm.ok else ((), ())
                 if spectrum_height_dyn > 0:
                     _spec_row0 = len(lines)
                     _vis_boxed = False
+                    _vis_label = VIS_MODES[vis_idx]
                     if bars and bars_len is not None and len(bars) > bars_len:
                         bars = bars[:bars_len]
                     vis_now = time.monotonic()
@@ -1627,6 +1718,17 @@ def main():
                     fall_alpha = smoothing_alpha_ms(VIS_DECAY_MS, vis_dt)
                     trail_alpha = smoothing_alpha_ms(VIS_TRAIL_DECAY_MS, vis_dt)
                     peak_alpha = smoothing_alpha_ms(VIS_PEAK_DECAY_MS, vis_dt)
+                    _pcm_window_needed = bool(
+                        _pcm.ok and (
+                            not bars
+                            or VIS_MODES[vis_idx] in _PCM_WINDOW_VIS_MODES
+                        )
+                    )
+                    if _pcm_window_needed:
+                        _wave_frames = max(1024, min(2048, max(1, bars_len) * 16))
+                        _wave_left, _wave_right = _pcm.waveform_window(_wave_frames)
+                    else:
+                        _wave_left, _wave_right = (), ()
                     if not bars and _pcm.ok and (_wave_left or _wave_right):
                         _pcm_fallback = build_live_audio_snapshot(
                             (),
@@ -1660,13 +1762,14 @@ def main():
                             vis_states.setdefault("_audio", {}),
                             waveform_left=_wave_left,
                             waveform_right=_wave_right,
+                            waveform_available=_pcm.ok,
                             sample_rate=_pcm.sample_rate if _pcm.ok else 0,
                             frame_dt=vis_dt,
                             fallback_bar_count=bars_len,
                         )
                         last_audio_source_kind = _audio_snapshot.source_kind
                         _bass_energy = update_bass_energy(
-                            list(_audio_snapshot.analysis_bars or _audio_snapshot.bars),
+                            (_audio_snapshot.analysis_bars or _audio_snapshot.bars),
                             _bass_energy, rise_alpha, vis_dt,
                         )
                         _audio_features = _audio_snapshot.features
@@ -1688,8 +1791,8 @@ def main():
 
                         # Frame the visualizer in its own titled box (matching every
                         # other panel) when there's room: the top border carries the
-                        # mode name and a live level read-out, and the bottom border
-                        # replaces the old section divider.  Under ~3 rows there's no
+                        # mode name and the bottom notch carries the control hints,
+                        # replacing the old section divider. Under ~3 rows there's no
                         # space for a frame, so fall back to a bare strip + divider.
                         _vis_boxed = spectrum_height_dyn >= 3
                         _vis_h = (spectrum_height_dyn - 1) if _vis_boxed else spectrum_height_dyn
@@ -1698,6 +1801,7 @@ def main():
                             use_color=spectrum_use_color, game_tag=game_tag, features=_audio_features,
                             snapshot=_audio_snapshot,
                         )
+                        _vis_label = _vis_ctx.label or draw_mode
                         # btop data_same: static modes reuse cached lines when bars unchanged.
                         if draw_mode in STATIC_VIS_MODES:
                             _cache_key = (
@@ -1713,12 +1817,13 @@ def main():
                         else:
                             vis_lines = render_frame(draw_mode, smooth_bars, _vis_h, bars_len, _vis_ctx)
                         if _vis_boxed:
-                            _vis_title = _vis_ctx.label or draw_mode
+                            _vis_title = _vis_label
                             if vis_shuffle:
                                 _vis_title = f"{_vis_title} {SYM_SHUFFLE}"
                             _vbox, _ = build_box(
                                 vis_lines, vis_lines, maxw_override=bars_len,
                                 title=_vis_title, title2=VISUALIZER_TITLE_HINTS,
+                                lines_fitted=True,
                             )
                             lines.extend(_vbox)
                         else:
@@ -1739,7 +1844,7 @@ def main():
                         while len(lines) < _spec_row0 + spectrum_height_dyn:
                             lines.append("")
                         # btop ├─ section divider with mode label (bare-strip fallback)
-                        _div_label = f" {(_vis_ctx.label or VIS_MODES[vis_idx])} "
+                        _div_label = f" {_vis_label} "
                         _div_pad = max(0, bars_len - len(_div_label) - 2)
                         _div_l = _div_pad // 2
                         _div_r = _div_pad - _div_l
@@ -1762,9 +1867,7 @@ def main():
                         lines.append(prefix + _div_line)
                     # Pinned footer: thin TOD-colored separator + always-visible controls hint
                     if footer_has_separator:
-                        _sep_chr = _chrome.get("separator", _divider)
-                        _sep_col = theme_role("border", _active_tod_grad)
-                        lines.append(c256(_sep_chr * max(1, term_cols - 1), _sep_col) if USE_COLOR else ("-" * max(1, term_cols - 1)))
+                        lines.append(_footer_separator_line(term_cols, _active_tod_grad))
                     for footer_line in footer_control_lines:
                         if USE_COLOR:
                             lines.append(colorize_hint_keys(
@@ -1872,13 +1975,24 @@ def main():
                 elif len(lines) > term_rows:
                     lines = lines[:term_rows]
 
-                if lines != last_lines:
+                # A live overlay (e.g. the frame-rate menu) is drawn ON TOP of
+                # the freshly-built frame, so the visualizer keeps animating in
+                # the cells the overlay box doesn't cover.
+                frame = lines
+                if active_overlay is not None:
+                    from ac_ui.overlay import composite_over
+                    frame = composite_over(
+                        lines, active_overlay.build(term_cols, term_rows), term_cols, term_rows,
+                    )
+                if frame != last_lines:
                     _ft = time.monotonic()
                     if debug_last_frame_ts:
                         debug_frame_times.append(_ft - debug_last_frame_ts)
                     debug_last_frame_ts = _ft
-                    render(lines, term_cols, term_rows)
-                    last_lines = list(lines)
+                    # The composed UI frame is already width-fitted by the layout
+                    # builders, so skip term.render's expensive ANSI-width pass.
+                    render(frame, term_cols, term_rows, lines_fitted=True)
+                    last_lines = list(frame)
 
                 flush_ui_state()
 
@@ -1892,6 +2006,47 @@ def main():
                     refresh_interval = REFRESH_INTERVAL
                 else:
                     refresh_interval = vis_frame_interval(VIS_MODES[vis_idx], vis_fps_map)
+                    # Auto pacing governor (self-tuning, no settings): track how
+                    # long this frame took to build+render and, when that's
+                    # expensive (a heavy visualizer on a slow machine or a very
+                    # large terminal), lengthen the wait so rendering can't hog
+                    # the CPU. Cheap frames are untouched and still hit the rate.
+                    _work = time.monotonic() - frame_work_t0
+                    frame_work_ema = _work if frame_work_ema == 0.0 else (
+                        frame_work_ema * 0.85 + _work * 0.15
+                    )
+                    refresh_interval = governed_refresh(refresh_interval, frame_work_ema)
+                    # Shed per-frame animation only when a machine is genuinely
+                    # struggling (< ~25 fps), restore it with clear headroom
+                    # (> ~50 fps). The wide gap stops it flip-flopping, and light
+                    # modes (which never get near 40 ms/frame) keep their animation.
+                    if frame_work_ema > 0.040:
+                        perf_degraded = True
+                    elif frame_work_ema < 0.020:
+                        perf_degraded = False
+                    # Hardware floor: a heavy mode this machine can't render at a
+                    # usable rate gets swapped for a cheap one, once, automatically
+                    # (keeps very old / single-core hardware smooth). Manual mode
+                    # changes after this are respected — we never override twice.
+                    if (not vis_auto_fellback
+                            and vis_mode_overloaded(VIS_MODES[vis_idx], frame_work_ema)
+                            and _VIS_FALLBACK_MODE in VIS_MODES):
+                        vis_idx = VIS_MODES.index(_VIS_FALLBACK_MODE)
+                        vis_auto_fellback = True
+                        frame_work_ema = 0.0
+                        last_lines = None
+                        state_banner = themed_banner(
+                            "Switched to a lighter visualizer for this machine", "accent", 3.0,
+                        )
+                    # Audio-idle throttle: track the last frame with real spectrum
+                    # energy; after a few silent seconds, slow the visualizer to
+                    # its idle rate (it's only drawing drift then).
+                    _mono = time.monotonic()
+                    if smooth_bars and max(smooth_bars) > 0.02:
+                        last_audio_active_ts = _mono
+                    refresh_interval = idle_throttled_interval(
+                        refresh_interval, _mono - last_audio_active_ts,
+                    )
                 fd = sys.stdin.fileno()
                 ch = _read_key(fd, timeout=refresh_interval)
                 if ch:
@@ -1907,16 +2062,101 @@ def main():
                         if FOCUS_THROTTLE:
                             focused = False
                         continue
+                    # A live overlay swallows all keys until it closes; the loop
+                    # keeps ticking audio + visualizer beneath it. On close we
+                    # apply the overlay's result by kind.
+                    if active_overlay is not None:
+                        if not active_overlay.handle(ch):
+                            last_lines = None
+                            continue
+                        _ov_kind = active_overlay.kind
+                        _ov_result = active_overlay.result
+                        active_overlay = None
+                        invalidate_render_cache(clear_screen=True)
+                        last_lines = None
+                        if _ov_kind == "fps":
+                            if _ov_result is not None:
+                                vis_fps_map = _ov_result
+                                persist_ui_state()
+                                state_banner = themed_banner(
+                                    f"FPS: {max(vis_fps_map.values())} (all visualizers)",
+                                    "accent", 2.2,
+                                )
+                            continue
+                        if _ov_kind == "finder":
+                            if _ov_result and start_specific_track(_ov_result, crossfade=True):
+                                _bm = parse_filename(os.path.basename(_ov_result))
+                                _bl = f"{_bm['game']}: {_bm['variant']}" if _bm else os.path.basename(_ov_result)
+                                state_banner = themed_banner(f"{SYM_NOTE} {_bl}", "accent", 1.5)
+                            continue
+                        if _ov_kind == "vispick":
+                            if _ov_result in VIS_MODES:
+                                vis_idx = VIS_MODES.index(_ov_result)
+                                persist_ui_state()
+                                state_banner = themed_banner(f"Vis: {_ov_result}", "label", 1.5)
+                            continue
+                        if _ov_kind == "import":
+                            # On success the overlay returns the library dir; drop
+                            # into free-play on it so the new music plays right away.
+                            if _ov_result:
+                                _enter_free_play(_ov_result)
+                                if free_play_mode:
+                                    start_free_play_track(crossfade=True)
+                                persist_ui_state()
+                            continue
+                        if _ov_kind == "extract_ac":
+                            if _ov_result:
+                                state_banner = themed_banner(
+                                    f"Extracted {_ov_result} AC hourly track(s)", "value", 2.5)
+                            continue
+                        if _ov_kind == "menu":
+                            _act = _ov_result
+                            if _act == "play":
+                                if panel_focus == "history":
+                                    _hlist = list(tuple(history)[-_hist_show:])
+                                    _sel = max(0, min(hist_sel, len(_hlist) - 1))
+                                    if _sel < len(_hlist) and start_specific_track(_hlist[_sel], crossfade=True):
+                                        next_candidates_ts = 0.0
+                                elif panel_focus == "up_next" and next_candidates:
+                                    _sel = max(0, min(up_sel, len(next_candidates) - 1))
+                                    if start_specific_track(next_candidates[_sel].path, crossfade=True):
+                                        next_candidates_ts = 0.0
+                            elif _act == "top" and panel_focus == "up_next" and free_play_mode and next_candidates:
+                                _sel = max(0, min(up_sel, len(next_candidates) - 1))
+                                _qi = getattr(next_candidates[_sel], "queue_index", -1)
+                                if fp_playlist and 0 <= _qi < len(fp_playlist):
+                                    fp_idx = move_queue_item_to_next(fp_playlist, fp_idx, _qi)
+                                    up_sel = 0; up_cache_key = None; next_candidates_key = None
+                                    state_banner = themed_banner("Moved to top of queue", "value", 1.5)
+                            elif _act == "pin":
+                                repeat_current = not repeat_current
+                                persist_ui_state()
+                                if current_track and mpv_proc and mpv_proc.poll() is None:
+                                    try:
+                                        mpv_command(current_ipc, ["set_property", "loop-file", "inf" if repeat_current else "no"])
+                                    except Exception:
+                                        pass
+                                state_banner = themed_banner(
+                                    f"{SYM_PIN} Pinned: will repeat" if repeat_current else "Unpinned",
+                                    "accent" if repeat_current else "label", 1.8,
+                                )
+                            continue
+                        if _ov_kind == "palette":
+                            # Re-dispatch the chosen command's key through the
+                            # normal handler chain below (don't `continue`).
+                            ch = _ov_result or ""
+                        else:
+                            continue  # help / viewer: nothing to apply
                     # Command palette: ':' or Ctrl+P opens a fuzzy launcher; the
                     # chosen action's primary key is fed back into the dispatch
                     # chain below, so palette and keyboard stay in lockstep.
                     if ch == ":" or ch == "\x10":
-                        _sel = run_command_palette(term_cols, term_rows)
-                        invalidate_render_cache(clear_screen=True)
+                        from ac_ui.overlay import PaletteOverlay
+                        active_overlay = PaletteOverlay()
                         last_lines = None
-                        ch = _sel or ""
+                        continue
                     # Track non-m keypresses to prevent auto-repeat toggling
-                    if ch.lower() == "q":
+                    if ch == "q":
                         handle_exit()
                     if ch.lower() == "n" and transition is None:
                         if free_play_mode and fp_playlist:
@@ -1962,26 +2202,54 @@ def main():
                         last_hour = hour  # prevent double-start next frame
                         next_candidates_ts = 0.0
                         state_banner = themed_banner(f"Variant: {variants_list[variant_idx]}", "accent", 1.5)
-                    if ch.lower() == "t":
+                    if ch == "t":
+                        # Open the visualizer picker as a LIVE overlay — the current
+                        # visualizer keeps animating behind it as a preview. Arrow
+                        # keys move, type to filter by name/alias, Enter applies.
+                        from ac_ui.overlay import VisPickerOverlay
+                        from ac_ui.finder import FinderItem
+                        from ac_ui.constants import VIS_MODE_ALIASES
+                        _alias_by_mode = {}
+                        for _a, _m in VIS_MODE_ALIASES.items():
+                            _alias_by_mode.setdefault(_m, []).append(_a)
+                        _vp_items = [
+                            FinderItem(_m.replace("_", " "), _m,
+                                       _m + " " + " ".join(_alias_by_mode.get(_m, ())))
+                            for _m in VIS_MODES
+                        ]
+                        active_overlay = VisPickerOverlay(
+                            "Visualizer", _vp_items, current=VIS_MODES[vis_idx])
+                        last_lines = None
+                    if ch == "]":
                         vis_idx = (vis_idx + 1) % len(VIS_MODES)
+                        persist_ui_state()
+                        state_banner = themed_banner(f"Vis: {VIS_MODES[vis_idx]}", "label", 1.2)
+                    if ch == "[":
+                        vis_idx = (vis_idx - 1) % len(VIS_MODES)
                         persist_ui_state()
                         state_banner = themed_banner(f"Vis: {VIS_MODES[vis_idx]}", "label", 1.2)
                     if ch == "R":
                         vis_idx = random.randrange(len(VIS_MODES))
                         persist_ui_state()
                         state_banner = themed_banner(f"Vis: {VIS_MODES[vis_idx]}", "label", 1.2)
-                    if ch == "r":
-                        # Frame-rate menu: set fps per visualizer type.
-                        _new_fps = run_vis_fps_menu(term_cols, term_rows, vis_fps_map, pinned=REFRESH_OVERRIDE_SET)
-                        invalidate_render_cache(clear_screen=True)
+                    if ch == "i":
+                        # Import music: in-app wizard (browse -> background import
+                        # -> free-play the new library). Live overlay.
+                        from ac_ui.overlay import ImportOverlay
+                        active_overlay = ImportOverlay()
                         last_lines = None
-                        if _new_fps is not None:
-                            vis_fps_map = _new_fps
-                            persist_ui_state()
-                            state_banner = themed_banner(
-                                f"FPS  reactive {vis_fps_map['fast']} / animated {vis_fps_map['normal']} / feedback {vis_fps_map['heavy']}",
-                                "accent", 2.2,
-                            )
+                    if ch == "X":
+                        # Extract authentic AC GameCube hourly music from the
+                        # user's disc via the ACGC PC port (background render).
+                        from ac_ui.overlay import ExtractAcOverlay
+                        active_overlay = ExtractAcOverlay()
+                        last_lines = None
+                    if ch == "r":
+                        # Frame-rate menu as a LIVE overlay: the visualizer keeps
+                        # animating beneath it (result applied on close above).
+                        from ac_ui.overlay import VisFpsOverlay
+                        active_overlay = VisFpsOverlay(vis_fps_map, pinned=REFRESH_OVERRIDE_SET)
+                        last_lines = None
                     if ch == "y":
                         # MilkDrop-style preset shuffle: endlessly drift between visualizers.
                         vis_shuffle = not vis_shuffle
@@ -2226,8 +2494,8 @@ def main():
                         last_key_ts = now_ts
                         continue
                     if ch == "?":
-                        run_help_overlay(term_cols, term_rows)
-                        invalidate_render_cache(clear_screen=True)
+                        from ac_ui.overlay import HelpOverlay
+                        active_overlay = HelpOverlay()
                         last_lines = None
                     if ch == "/" and transition is None:
                         # Library fuzzy finder: search the whole catalog and
@@ -2240,13 +2508,10 @@ def main():
                             )
                             for (p, m, _nm) in list_all_tracks()
                         ]
-                        _pick = run_fuzzy_finder("Find track", _items, term_cols, term_rows)
-                        invalidate_render_cache(clear_screen=True)
+                        from ac_ui.overlay import FinderOverlay
+                        active_overlay = FinderOverlay("Find track", _items)
                         last_lines = None
-                        if _pick and start_specific_track(_pick, crossfade=True):
-                            _bm = parse_filename(os.path.basename(_pick))
-                            _bl = f"{_bm['game']}: {_bm['variant']}" if _bm else os.path.basename(_pick)
-                            state_banner = themed_banner(f"{SYM_NOTE} {_bl}", "accent", 1.5)
+                        continue
                     if ch == "`":
                         show_debug = not show_debug
                     # Number-key panel focus (lazygit-style): jump focus straight
@@ -2349,8 +2614,8 @@ def main():
                                 max_shown=len(next_candidates) or 1,
                             )
                         if _zp:
-                            run_fullscreen_view(_ztitle, _zp, _zc, term_cols, term_rows)
-                            invalidate_render_cache(clear_screen=True)
+                            from ac_ui.overlay import ViewerOverlay
+                            active_overlay = ViewerOverlay(_ztitle, _zp, _zc)
                             last_lines = None
                     if ch == "x" and panel_focus:
                         # Contextual actions menu for the focused panel item.
@@ -2363,38 +2628,11 @@ def main():
                             else:
                                 _opts = [("Play now", "play")]
                         if _opts:
-                            _act = run_menu("Actions", _opts, term_cols, term_rows)
-                            invalidate_render_cache(clear_screen=True)
+                            # Live overlay; result applied in the routing block above.
+                            from ac_ui.overlay import MenuOverlay
+                            active_overlay = MenuOverlay("Actions", _opts)
                             last_lines = None
-                            if _act == "play":
-                                if panel_focus == "history":
-                                    _hlist = list(tuple(history)[-_hist_show:])
-                                    _sel = max(0, min(hist_sel, len(_hlist) - 1))
-                                    if _sel < len(_hlist) and start_specific_track(_hlist[_sel], crossfade=True):
-                                        next_candidates_ts = 0.0
-                                elif panel_focus == "up_next" and next_candidates:
-                                    _sel = max(0, min(up_sel, len(next_candidates) - 1))
-                                    if start_specific_track(next_candidates[_sel].path, crossfade=True):
-                                        next_candidates_ts = 0.0
-                            elif _act == "top" and panel_focus == "up_next" and free_play_mode and next_candidates:
-                                _sel = max(0, min(up_sel, len(next_candidates) - 1))
-                                _qi = getattr(next_candidates[_sel], "queue_index", -1)
-                                if fp_playlist and 0 <= _qi < len(fp_playlist):
-                                    fp_idx = move_queue_item_to_next(fp_playlist, fp_idx, _qi)
-                                    up_sel = 0; up_cache_key = None; next_candidates_key = None
-                                    state_banner = themed_banner("Moved to top of queue", "value", 1.5)
-                            elif _act == "pin":
-                                repeat_current = not repeat_current
-                                persist_ui_state()
-                                if current_track and mpv_proc and mpv_proc.poll() is None:
-                                    try:
-                                        mpv_command(current_ipc, ["set_property", "loop-file", "inf" if repeat_current else "no"])
-                                    except Exception:
-                                        pass
-                                state_banner = themed_banner(
-                                    f"{SYM_PIN} Pinned: will repeat" if repeat_current else "Unpinned",
-                                    "accent" if repeat_current else "label", 1.8,
-                                )
+                            continue
                     # Command plugins: dispatch any key registered by a plugin
                     # (also reachable by selecting the command in the palette).
                     if ch and plugin_keys and ch in plugin_keys:

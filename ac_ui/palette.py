@@ -2,24 +2,19 @@
 
 The palette is built from the central ``ACTIONS`` registry in ``constants.py``,
 so every action that has a key binding is automatically discoverable here with
-no extra wiring.  The pure pieces (``build_palette_commands``,
-``fuzzy_score``, ``rank_commands``, ``build_palette_lines``) are side-effect
-free and unit-tested; ``run_command_palette`` drives the interactive overlay on
-top of the shared :class:`Modal` framework and returns the *primary key* of the
-chosen action so the existing key-dispatch chain in ``ui.py`` can execute it.
+no extra wiring.  Everything in this module is pure and unit-tested
+(``build_palette_commands``, ``fuzzy_score``, ``rank_commands``,
+``build_palette_lines``); the interactive surface is ``PaletteOverlay`` in
+``ac_ui.overlay``, which renders these and feeds the chosen action's *primary
+key* back into the key-dispatch chain in ``ui.py``.
 """
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 
-from ac_ui.constants import ACTIONS, ASCII_ONLY
-import ac_ui.colors as _clrs
-from ac_ui.colors import USE_COLOR, c256, theme_role, visible_len
-from ac_ui.layout import build_box, colorize_hint_keys
-from ac_ui.modal import Modal
-from ac_ui.term import render, _read_key, truncate_plain
-
+from ac_ui.constants import ACTIONS
+from ac_ui.layout import empty_state_line, render_selectable_row, search_prompt_line
+from ac_ui.term import truncate_plain
 
 # Pretty display names for actions whose id is terse.  Anything missing falls
 # back to a title-cased id, so new actions still appear without edits here.
@@ -50,6 +45,7 @@ _TITLES = {
     "add_track": "Add current track to a playlist",
     "playlist_mgr": "Playlist manager",
     "queue_mgr": "Manage free-play queue",
+    "debug": "Debug overlay",
 }
 
 # How a raw key string should read in the palette's key column.
@@ -58,13 +54,76 @@ _KEY_DISPLAY = {
     "\t": "tab",
     "\r": "enter",
     "\n": "enter",
+    "\x10": "^P",
     "PAGEUP": "PgUp",
     "PAGEDOWN": "PgDn",
+}
+
+# Friendly, plain-language explanations shown in the help overlay and palette.
+# The pressed key is already shown in its own column, so these describe *what the
+# action does* in natural language (no bracketed key letters). Anything missing
+# falls back to the terse registry text, so new actions still appear.
+_DESCRIPTIONS = {
+    "next":       "Skip to the next track",
+    "tune":       "Open the town tune editor",
+    "eq":         "Open the equalizer",
+    "vis":        "Change the visualizer (t = next, R = random)",
+    "vis_fps":    "Set the visualizer's frame rate (smoothness)",
+    "vis_shuffle":"Keep switching visualizers automatically",
+    "mute":       "Mute or unmute the sound",
+    "quit":       "Quit ac-ui",
+    "sink":       "Choose which audio output device to play through",
+    "loop":       "Repeat the current track until the next hour",
+    "layout":     "Switch the screen layout (rail, stacked, wide, full)",
+    "help":       "Show or hide this help",
+    "palette":    "Open the command menu — search and run any action",
+    "find":       "Search your library and play any track",
+    "vol":        "Turn the volume up or down (steps of 5)",
+    "vol_pg":     "Turn the volume up or down in bigger steps (10)",
+    "game":       "Switch to the next game's soundtrack",
+    "variant":    "Switch to a different version of the music (e.g. weather)",
+    "history":    "Show or hide the recently-played panel",
+    "up_next":    "Show or hide the coming-up-next panel",
+    "pin":        "Pin the current track so it keeps repeating",
+    "ban":        "Skip this track and don't play it again",
+    "theme":      "Switch to the next color theme",
+    "hour_sim":   "Jump the clock forward an hour (preview the hourly chime)",
+    "bg_mode":    "Background mode — minimal drawing to save power",
+    "panel_nav":  "Move around panels — arrows, Enter to pick, x actions, z zoom",
+    "panel_focus_num": "Jump to a panel — 1 history, 2 up-next, 0 to unfocus",
+    "free_play":  "Turn free-play on or off (play from your own playlist)",
+    "add_track":  "Add the current track to a playlist",
+    "playlist_mgr":"Manage playlists — create, edit, or delete them",
+    "queue_mgr":  "Manage the free-play queue (reorder what plays next)",
+    "debug":      "Show or hide the debug / performance overlay",
 }
 
 
 def _key_display(key: str) -> str:
     return _KEY_DISPLAY.get(key, key)
+
+
+# Very short list labels (2-4 words) shown in the help screen so rows never
+# truncate. The full sentence (above, in _DESCRIPTIONS) is shown when you drill
+# into an entry. Anything missing falls back to the title.
+_SHORT = {
+    "next": "Skip track",          "tune": "Town tune editor",
+    "eq": "Equalizer",             "vis": "Change visualizer",
+    "vis_fps": "Frame rate",       "vis_shuffle": "Auto-shuffle visuals",
+    "mute": "Mute / unmute",       "quit": "Quit",
+    "sink": "Audio output",        "loop": "Repeat track",
+    "layout": "Screen layout",     "help": "Help",
+    "palette": "Command menu",     "find": "Find a track",
+    "vol": "Volume ±5",       "vol_pg": "Volume ±10",
+    "game": "Change game",         "variant": "Change variant",
+    "history": "History panel",    "up_next": "Up-next panel",
+    "pin": "Pin track",            "ban": "Ban track",
+    "theme": "Color theme",        "hour_sim": "Skip an hour",
+    "bg_mode": "Background mode",   "panel_nav": "Navigate panels",
+    "panel_focus_num": "Jump to panel", "free_play": "Free-play mode",
+    "add_track": "Add to playlist", "playlist_mgr": "Playlists",
+    "queue_mgr": "Queue",          "debug": "Debug overlay",
+}
 
 
 @dataclass(frozen=True)
@@ -75,6 +134,7 @@ class PaletteCommand:
     primary: str       # primary key fed back into ui.py dispatch
     key_label: str     # human-readable key for display
     search: str        # lowercased haystack for fuzzy matching
+    short: str = ""    # very short label for the help list (no truncation)
 
 
 def build_palette_commands(skip_ids: tuple[str, ...] = ("palette",)) -> list[PaletteCommand]:
@@ -89,10 +149,11 @@ def build_palette_commands(skip_ids: tuple[str, ...] = ("palette",)) -> list[Pal
             continue
         primary = keys[0]
         title = _TITLES.get(action_id) or action_id.replace("_", " ").capitalize()
-        desc = (help_text or label_full or "").strip()
+        desc = _DESCRIPTIONS.get(action_id) or (help_text or label_full or "").strip()
         key_label = " / ".join(_key_display(k) for k in keys)
+        short = _SHORT.get(action_id) or title
         search = f"{title} {desc} {action_id}".lower()
-        cmds.append(PaletteCommand(action_id, title, desc, primary, key_label, search))
+        cmds.append(PaletteCommand(action_id, title, desc, primary, key_label, search, short))
     # Append any registered command plugins so they're discoverable too.
     try:
         from ac_ui.plugins import REGISTRY as _plug
@@ -102,7 +163,7 @@ def build_palette_commands(skip_ids: tuple[str, ...] = ("palette",)) -> list[Pal
             title = cmd.label if cmd.label[:1].isupper() else cmd.label.capitalize()
             search = f"{cmd.label} {cmd.help} {cmd.action_id}".lower()
             cmds.append(PaletteCommand(
-                cmd.action_id, title, cmd.help, key, _key_display(key), search,
+                cmd.action_id, title, cmd.help, key, _key_display(key), search, title,
             ))
     except Exception:
         pass
@@ -165,24 +226,23 @@ def build_palette_lines(
     max_rows: int,
 ) -> tuple[list[str], list[str]]:
     """Pure renderer for the palette body: returns (plain_lines, color_lines)."""
-    marker = "> " if ASCII_ONLY else "▶ "
-    cursor = "_"
-    grad = _clrs._active_tod_grad if USE_COLOR else None
-
-    prompt_plain = truncate_plain(f"/ {query}{cursor}", inner_w)
-    if USE_COLOR:
-        prompt_color = c256(prompt_plain, theme_role("accent", grad))
-    else:
-        prompt_color = prompt_plain
+    n = len(matches)
+    result_word = "result" if n == 1 else "results"
+    prompt_plain, prompt_color = search_prompt_line(
+        query,
+        inner_w,
+        placeholder="Search commands",
+        count_text=f"{n} {result_word}",
+    )
 
     plain: list[str] = [prompt_plain, ""]
     color: list[str] = [prompt_color, ""]
 
     list_rows = max(1, max_rows - 2)
     if not matches:
-        empty = truncate_plain("  (no matches)", inner_w)
-        plain.append(empty)
-        color.append(c256(empty, theme_role("label_dim", grad)) if USE_COLOR else empty)
+        empty_plain, empty_color = empty_state_line("no matches", inner_w)
+        plain.append(empty_plain)
+        color.append(empty_color)
         return plain, color
 
     # Scrolling window that keeps the selection visible.
@@ -196,102 +256,14 @@ def build_palette_lines(
     for i, cmd in enumerate(window):
         real_idx = start + i
         is_sel = real_idx == selected
-        prefix = marker if is_sel else "  "
-        key_tag = f"[{cmd.key_label}]"
-        # Left: marker + title ; Right: key tag, right-aligned.
-        title = cmd.title
-        avail = inner_w - len(prefix) - len(key_tag) - 1
-        title = truncate_plain(title, max(1, avail))
-        pad = max(1, inner_w - len(prefix) - len(title) - len(key_tag))
-        row_plain = f"{prefix}{title}{' ' * pad}{key_tag}"
-        row_plain = truncate_plain(row_plain, inner_w)
+        row_plain, row_color = render_selectable_row(
+            cmd.title,
+            is_sel,
+            inner_w,
+            right=f"[{cmd.key_label}]",
+            dim=not is_sel,
+        )
         plain.append(row_plain)
-
-        if not USE_COLOR:
-            color.append(row_plain)
-            continue
-        if is_sel:
-            row_color = c256(row_plain, theme_role("accent", grad))
-        else:
-            # dim title, highlight the bracketed key tag
-            row_color = colorize_hint_keys(
-                row_plain,
-                theme_role("accent_soft", grad),
-                base_fg=theme_role("label", grad),
-                dim=True,
-            )
         color.append(row_color)
 
     return plain, color
-
-
-def run_command_palette(cols: int, rows: int, fd: int | None = None):
-    """Drive the interactive palette overlay.
-
-    Returns the primary key string of the chosen action (to be re-dispatched by
-    ui.py), or None if the user cancelled.
-    """
-    if fd is None:
-        fd = sys.stdin.fileno()
-    commands = build_palette_commands()
-    query = ""
-    selected = 0
-    inner_w = max(36, min(cols - 8, 70))
-    list_rows = max(3, min(14, rows - 8))
-    chosen: list[str | None] = [None]
-
-    with Modal():
-        last_out = None
-        while True:
-            matches = rank_commands(commands, query)
-            if selected >= len(matches):
-                selected = max(0, len(matches) - 1)
-            plain, color = build_palette_lines(matches, query, selected, inner_w, list_rows + 2)
-            box, _ = build_box(
-                plain, color,
-                maxw_override=inner_w,
-                title="Command Palette",
-                title2="[esc] close",
-            )
-            start_row = max(0, rows // 2 - len(box) // 2)
-            out = [""] * rows
-            for i, bline in enumerate(box):
-                r = start_row + i
-                if 0 <= r < rows:
-                    pad = max(0, (cols - visible_len(bline)) // 2)
-                    out[r] = " " * pad + bline
-            if out != last_out:
-                render(out, cols, rows)
-                last_out = list(out)
-
-            ch = _read_key(fd, timeout=0.08)
-            if not ch:
-                continue
-            if ch in ("ESC", "\x10"):          # Esc or Ctrl+P toggles closed
-                break
-            if ch in ("\r", "\n"):
-                if matches:
-                    chosen[0] = matches[selected].primary
-                break
-            if ch == "UP":
-                if matches:
-                    selected = (selected - 1) % len(matches)
-                last_out = None
-                continue
-            if ch == "DOWN":
-                if matches:
-                    selected = (selected + 1) % len(matches)
-                last_out = None
-                continue
-            if ch in ("\x7f", "\b", "BACKSPACE"):
-                query = query[:-1]
-                selected = 0
-                last_out = None
-                continue
-            if len(ch) == 1 and ch.isprintable():
-                query += ch
-                selected = 0
-                last_out = None
-                continue
-
-    return chosen[0]

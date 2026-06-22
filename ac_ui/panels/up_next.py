@@ -46,7 +46,7 @@ def render(
     only the numbered queue entries are emitted here.
     """
     if not candidates:
-        plain = [truncate_plain("(no candidates)", max_width)]
+        plain = [truncate_plain("No upcoming tracks", max_width)]
         if USE_COLOR:
             color = [paint(plain[0], fg=theme_role("label_dim", tod_grad), dim=True)]
         else:

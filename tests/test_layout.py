@@ -15,14 +15,14 @@ def test_box_always_labeled(maxw):
     box, _ = build_box(["x"], ["x"], maxw_override=maxw, title="Now Playing")
     top = strip_ansi(box[0])
     # Some recognizable fragment of the title survives in the top border.
-    assert "N" in top and "┤" in top and "├" in top
+    assert "N" in top and "┐" in top and "┌" in top
 
 
 def test_box_full_title_when_room():
     box, _ = build_box(["x" * 30], ["x" * 30], maxw_override=30, title="Now Playing")
     assert "Now Playing" in strip_ansi(box[0])
 
-def test_box_supports_multiple_right_title_blocks():
+def test_box_collapses_secondary_titles_into_bottom_notch():
     box, _ = build_box(
         ["x" * 32],
         ["x" * 32],
@@ -31,9 +31,11 @@ def test_box_supports_multiple_right_title_blocks():
         title2=("[y]shuffle", "[r]fps", "[t/R]vis"),
     )
     top = strip_ansi(box[0])
-    assert "[y]shuffle" in top
-    assert "[r]fps" in top
-    assert "[t/R]vis" in top
+    bottom = strip_ansi(box[-1])
+    assert "Visualizer" in top
+    assert "[y]shuffle" in bottom
+    assert "[r]fps" in bottom
+    assert "[t/R]vis" in bottom
 
 
 # ── resolve_panel_max_width is the single source of truth ──────────────────────
@@ -105,6 +107,18 @@ def test_uniform_border_matches_spinning_visible_output():
         assert strip_ansi(a) == strip_ansi(b)         # identical visible output
     # The flat path collapses per-char escapes, so the bottom border is shorter.
     assert flat[-1].count("\x1b") <= spin[-1].count("\x1b")
+
+
+def test_box_lines_fitted_fastpath_matches_regular():
+    lines = [
+        "\x1b[38;5;196m" + ("#" * 24) + "\x1b[0m",
+        "\x1b[38;5;82m" + ("@" * 24) + "\x1b[0m",
+    ]
+    regular, _ = build_box(lines, lines, maxw_override=24, title="Visualizer", title2="[r]fps")
+    fitted, _ = build_box(
+        lines, lines, maxw_override=24, title="Visualizer", title2="[r]fps", lines_fitted=True,
+    )
+    assert regular == fitted
 
 
 def test_below_panel_inner_width_splits_row():
@@ -193,12 +207,13 @@ def test_now_playing_fits_its_width(w):
 
 
 def test_preview_frames_visualizer():
-    # The visualizer is now its own titled box: mode name top-left, controls top-right.
+    # The visualizer is now its own titled box: mode name on the top border,
+    # controls in the secondary bottom notch.
     txt = "\n".join(build_layout_preview(100, 30))
-    assert "┤ bars ├" in txt, "visualizer should be framed with its mode title"
+    assert "┐ bars ┌" in txt, "visualizer should be framed with its mode title"
     assert "[t/R]vis" in txt and "[r]fps" in txt
-    # A closing bottom border exists for the frame.
-    assert any(set(strip_ansi(ln)) <= set("╰─╯ ") and "╰" in strip_ansi(ln)
+    # A closing bottom border with a btop-style secondary notch exists.
+    assert any("┘" in strip_ansi(ln) and "└" in strip_ansi(ln)
                for ln in build_layout_preview(100, 30))
 
 

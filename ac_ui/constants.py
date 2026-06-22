@@ -1,7 +1,12 @@
-import os, sys, re, math, shutil, json, tempfile
+import os, sys, re, math, shutil, json
 
 MUSIC_DIR = os.path.expanduser(os.environ.get("AC_UI_MUSIC_DIR", "~/.local/share/ac-terminal-radio/music"))
+# Destination for user-imported music (free-play library). Flat folder so the
+# free-play directory scanner finds every track; files are copied in (and only
+# transcoded when the player can't play the source format).
+LIBRARY_DIR = os.path.expanduser(os.environ.get("AC_UI_LIBRARY_DIR", "~/.local/share/ac-terminal-radio/library"))
 MPV = (os.environ.get("AC_UI_MPV", "mpv") or "mpv").strip() or "mpv"
+CAVA_BIN = (os.environ.get("AC_UI_CAVA_BIN", "cava") or "cava").strip() or "cava"
 
 PIANO_EXTRA_TICKETS = 1  # each piano track appears twice in the pool
 CAVA_HEIGHT = 8
@@ -107,6 +112,7 @@ def _ensure_parent_dir(path):
 
 
 def _atomic_write_text(path, text, encoding="utf-8"):
+    import tempfile
     _ensure_parent_dir(path)
     tmp_dir = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp_path = tempfile.mkstemp(prefix=".ac-ui-", suffix=".tmp", dir=tmp_dir)
@@ -188,7 +194,9 @@ ACTIONS = (
     ("next",    ("n",),                "full compact core mini", "[n]ext",           "[n]ext",    "[n]ext track"),
     ("tune",    ("T",),                "full compact core",      "[T]une",           "[T]une",    "[T]own tune editor"),
     ("eq",      ("E",),                "full compact core",      "[E]Q",             "[E]Q",      "[E]Q editor"),
-    ("vis",     ("t", "R"),            "full compact",           "[t/R]vis",         "[t/R]vis",  "[t] vis next   [R] random"),
+    ("vis",     ("t",),                "full compact",           "[t]vis",           "[t]vis",    "[t] visualizer list (pick from menu)"),
+    ("vis_nav", ("[", "]"),            "full",                   "[ [/] ]vis",       None,        "[ [ ] / [ ] ] visualizer prev / next"),
+    ("vis_random", ("R",),             "",                       None,               None,        "[R] random visualizer"),
     ("vis_fps", ("r",),                "full compact",           "[r]fps",           "[r]fps",    "[r] visualizer frame-rate menu"),
     ("vis_shuffle", ("y",),            "",                       None,               None,        "[y] visualizer shuffle"),
     ("mute",    ("m", " "),            "full compact core mini", "[m/space]mute",    "[m]ute",    "[m]/[space] mute"),
@@ -197,7 +205,7 @@ ACTIONS = (
     ("loop",    ("l",),                "full compact",           "[l]oop",           "[l]oop",    "[l] repeat until hour"),
     ("layout",  ("L",),                "full compact",           "[L]ayout",         "[L]ayout",  "[L] cycle layout"),
     ("help",    ("?",),                "full compact",           "[?]help",          "[?]help",   "[?] toggle help"),
-    ("palette", (":",),                "full compact",           "[:]palette",       "[:]cmds",   "[:] or [^P] command palette"),
+    ("palette", (":", "\x10"),         "full compact",           "[:]palette",       "[:]cmds",   "[:] or [^P] command palette"),
     ("find",    ("/",),                "full compact",           "[/]find",          "[/]find",   "[/] find & play any track"),
     ("vol",     ("+", "-", "="),       "full compact core mini", "[+/-]vol",         "[+/-]vol",  "[+/-] vol +/-5   [PgUp/Dn] vol +/-10"),
     ("vol_pg",  ("PAGEUP", "PAGEDOWN"),"full",                   "[PgUp/Dn]vol+/-10",None,        None),
@@ -213,9 +221,12 @@ ACTIONS = (
     ("panel_nav", ("\t",),             "",                       None,               None,        f"[tab] focus panel  [{SYM_ARROW_U}{SYM_ARROW_D}] navigate  [enter] select  [x] actions  [z] zoom"),
     ("panel_focus_num", ("1", "2", "0"), "",                     None,               None,        "[1] focus history  [2] focus up-next  [0] unfocus"),
     ("free_play",    ("f",),  "full compact", "[f]ree play",      "[f]ree",    "[f] toggle free play mode"),
+    ("import",       ("i",),  "full compact", "[i]mport",         "[i]mport",  "[i] import your music (wizard)"),
+    ("extract_ac",   ("X",),  "full",         "[X]tract AC",      None,        "[X] extract AC GameCube music from your disc"),
     ("add_track",    ("a",),  "full compact", "[a]dd to list",    "[a]dd",     "[a] add current track to a playlist"),
     ("playlist_mgr", ("F",),  "full compact", "[F]playlists",     "[F]lists",  "[F] playlist manager (create/edit/delete)"),
     ("queue_mgr",    ("Q",),  "full compact", "[Q]ueue",          "[Q]ueue",   "[Q] manage free-play queue"),
+    ("debug",        ("`",),  "",             None,               None,        None),
 )
 
 

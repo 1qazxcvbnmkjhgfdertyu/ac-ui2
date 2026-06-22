@@ -265,7 +265,12 @@ def _bar_views(source):
         right_bars = source.bars_right or raw_bars
         return raw_bars, mono_bars, left_bars, right_bars
 
-    raw_bars = _coerce_tuple(source)
+    if source is None:
+        raw_bars = ()
+    elif isinstance(source, (tuple, list)):
+        raw_bars = source
+    else:
+        raw_bars = _coerce_tuple(source)
     if CAVA_CHANNELS == "stereo" and len(raw_bars) >= 2:
         left_bars = raw_bars[0::2]
         right_bars = raw_bars[1::2]
@@ -288,25 +293,45 @@ def analyze_audio_features(source, state=None):
     n = len(bars)
     bass_end = max(1, n // 6)
     treble_start = max(bass_end + 1, (n * 2) // 3)
-    bass = sum(bars[:bass_end]) / bass_end
-    mids_slice = bars[bass_end:treble_start]
-    mids = sum(mids_slice) / len(mids_slice) if mids_slice else bass
-    treble_slice = bars[treble_start:]
-    treble = sum(treble_slice) / len(treble_slice) if treble_slice else mids
-    overall = sum(bars) / n
-    total = sum(bars)
-    if total > 1e-9 and n > 1:
-        centroid = sum((i / (n - 1)) * v for i, v in enumerate(bars)) / total
+    bass_total = mids_total = treble_total = total = weighted_total = 0.0
+    for i, v in enumerate(bars):
+        total += v
+        weighted_total += i * v
+        if i < bass_end:
+            bass_total += v
+        elif i < treble_start:
+            mids_total += v
+        else:
+            treble_total += v
+
+    bass = bass_total / bass_end
+    mids_count = treble_start - bass_end
+    mids = (mids_total / mids_count) if mids_count > 0 else bass
+    treble_count = n - treble_start
+    treble = (treble_total / treble_count) if treble_count > 0 else mids
+    overall = total / n
+    centroid = (weighted_total / ((n - 1) * total)) if total > 1e-9 and n > 1 else 0.0
+
+    contrast_acc = 0.0
+    for v in bars:
+        delta = v - overall
+        contrast_acc += delta * delta
+    contrast = min(1.0, math.sqrt(contrast_acc / n) * 2.2)
+
+    if left_bars is bars and right_bars is bars:
+        left = overall
+        right = overall
+        width = 0.0
     else:
-        centroid = 0.0
-    contrast = min(1.0, math.sqrt(sum((b - overall) ** 2 for b in bars) / n) * 2.2)
-    stereo_n = min(len(left_bars), len(right_bars))
-    left = sum(left_bars) / max(1, len(left_bars))
-    right = sum(right_bars) / max(1, len(right_bars))
-    width = (
-        sum(abs(l - r) for l, r in zip(left_bars[:stereo_n], right_bars[:stereo_n])) / stereo_n
-        if stereo_n > 0 else 0.0
-    )
+        left_n = len(left_bars)
+        right_n = len(right_bars)
+        left = (sum(left_bars) / left_n) if left_n > 0 else 0.0
+        right = (sum(right_bars) / right_n) if right_n > 0 else 0.0
+        stereo_n = min(left_n, right_n)
+        width = (
+            sum(abs(l - r) for l, r in zip(left_bars[:stereo_n], right_bars[:stereo_n])) / stereo_n
+            if stereo_n > 0 else 0.0
+        )
 
     if state is None:
         state = {}
@@ -387,7 +412,15 @@ def _condition_signal(values, count, state=None, gain_key="wave_gain", *, max_ga
 
 def conditioned_waveform_mono(source, count, state=None, gain_key="wave_gain"):
     if isinstance(source, AudioSnapshot):
-        values = source.waveform_mono or source.waveform_left or source.waveform_right
+        values = source.waveform_mono
+        if not values:
+            left = source.waveform_left
+            right = source.waveform_right
+            if left and right:
+                n = min(len(left), len(right))
+                values = tuple((l + r) * 0.5 for l, r in zip(left[:n], right[:n]))
+            else:
+                values = left or right
     else:
         values = source
     values = _focused_window(values, count, cycles=6, min_frames=192, max_frames=960)
@@ -563,12 +596,6 @@ def build_audio_snapshot(
     wave_left = _coerce_tuple(waveform_left)
     wave_right = _coerce_tuple(waveform_right)
     wave_mono = _coerce_tuple(waveform_mono)
-    if not wave_mono:
-        if wave_left and wave_right:
-            n = min(len(wave_left), len(wave_right))
-            wave_mono = tuple((l + r) * 0.5 for l, r in zip(wave_left[:n], wave_right[:n]))
-        else:
-            wave_mono = tuple(wave_left or wave_right)
 
     snap = AudioSnapshot(
         bars=raw_bars,
@@ -594,6 +621,7 @@ def build_live_audio_snapshot(
     waveform_left=None,
     waveform_right=None,
     waveform_mono=None,
+    waveform_available=False,
     sample_rate=0,
     frame_dt=0.0,
     fallback_bar_count=0,
@@ -618,9 +646,10 @@ def build_live_audio_snapshot(
     bars_left = None
     bars_right = None
     has_waveform = bool(wave_left or wave_right or wave_mono)
+    waveform_available = bool(waveform_available or has_waveform)
 
     if raw_bars:
-        source_kind = "cava+pcm" if has_waveform else "cava"
+        source_kind = "cava+pcm" if waveform_available else "cava"
     elif has_waveform and sample_rate > 0 and int(fallback_bar_count or 0) > 0:
         spec_mono, spec_left, spec_right = spectrum_bars_from_waveform(
             wave_left or wave_mono,

@@ -39,7 +39,7 @@ def render(
     if history:
         entries = [_fmt_hist(s) for s in history]
     else:
-        entries = ["(none yet)"]
+        entries = ["No history yet"]
 
     plain = [truncate_plain(s, max_width) for s in entries]
 

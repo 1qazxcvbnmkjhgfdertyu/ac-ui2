@@ -1,6 +1,8 @@
 """Tests for the searchable help overlay pure logic (help_overlay.py)."""
+from ac_ui.colors import strip_ansi, visible_len
 from ac_ui.palette import build_palette_commands
 from ac_ui.help_overlay import (
+    build_help_detail_box,
     build_help_groups,
     filter_help_groups,
     build_help_lines,
@@ -62,3 +64,29 @@ def test_no_matches_message():
     filtered = filter_help_groups(groups, "zzzzzz")
     plain, _c, _t = build_help_lines(filtered, "zzzzzz", 0, inner_w=50, max_rows=8)
     assert any("no matching" in p for p in plain)
+
+
+def test_rows_use_short_labels_and_never_truncate():
+    # Short labels keep every row well within the width — no "..." truncation.
+    groups = build_help_groups()
+    plain, _c, _t = build_help_lines(groups, "", 0, inner_w=60, max_rows=200)
+    for line in plain:
+        assert "…" not in line and "..." not in line
+        assert len(line) <= 60
+
+
+def test_selected_row_is_marked_and_visible():
+    groups = build_help_groups()
+    # selected=0 is the first command; it must be marked and inside the window.
+    plain, _c, _t = build_help_lines(groups, "", 0, inner_w=60, max_rows=200, selected=0)
+    marked = [p for p in plain if p.strip().startswith((">", "▶"))]
+    assert len(marked) == 1
+
+
+def test_detail_box_has_key_and_full_description():
+    cmd = next(c for c in build_palette_commands(skip_ids=()) if c.action_id == "loop")
+    box = build_help_detail_box(cmd, 60)
+    text = "\n".join(strip_ansi(line) for line in box)
+    assert cmd.key_label in text          # shows the key
+    assert "Repeat" in text               # shows the full plain-language sentence
+    assert all(visible_len(line) == visible_len(box[0]) for line in box)

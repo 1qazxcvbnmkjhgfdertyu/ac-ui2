@@ -7,17 +7,12 @@ same everywhere.  The library `/` search is the first consumer.
 """
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from typing import Any
 
-import ac_ui.colors as _clrs
-from ac_ui.colors import USE_COLOR, c256, theme_role, visible_len
-from ac_ui.constants import ASCII_ONLY
-from ac_ui.layout import build_box
-from ac_ui.modal import Modal
+from ac_ui.layout import empty_state_line, render_selectable_row, search_prompt_line
 from ac_ui.palette import fuzzy_score
-from ac_ui.term import render, _read_key, truncate_plain
+from ac_ui.term import truncate_plain
 
 
 @dataclass(frozen=True)
@@ -54,26 +49,22 @@ def build_finder_lines(
     max_rows: int,
 ) -> tuple[list[str], list[str]]:
     """Pure renderer: returns (plain_lines, color_lines)."""
-    marker = "> " if ASCII_ONLY else "▶ "
-    grad = _clrs._active_tod_grad if USE_COLOR else None
-
     count = f"{len(matches)}/{total}"
-    prompt_plain = truncate_plain(f"/ {query}_", max(1, inner_w - len(count) - 1))
-    head = prompt_plain + " " * max(1, inner_w - len(prompt_plain) - len(count)) + count
-    head = truncate_plain(head, inner_w)
-    if USE_COLOR:
-        head_color = c256(head, theme_role("accent", grad))
-    else:
-        head_color = head
+    head, head_color = search_prompt_line(
+        query,
+        inner_w,
+        placeholder="Search library",
+        count_text=count,
+    )
 
     plain: list[str] = [head, ""]
     color: list[str] = [head_color, ""]
 
     list_rows = max(1, max_rows - 2)
     if not matches:
-        empty = truncate_plain("  (no matches)", inner_w)
-        plain.append(empty)
-        color.append(c256(empty, theme_role("label_dim", grad)) if USE_COLOR else empty)
+        empty_plain, empty_color = empty_state_line("no matches", inner_w)
+        plain.append(empty_plain)
+        color.append(empty_color)
         return plain, color
 
     if selected < 0:
@@ -84,87 +75,7 @@ def build_finder_lines(
     for i, it in enumerate(matches[start:start + list_rows]):
         real_idx = start + i
         is_sel = real_idx == selected
-        prefix = marker if is_sel else "  "
-        row = truncate_plain(f"{prefix}{it.label}", inner_w)
-        plain.append(row)
-        if not USE_COLOR:
-            color.append(row)
-        elif is_sel:
-            color.append(c256(row, theme_role("accent", grad)))
-        else:
-            color.append(c256(row, theme_role("label", grad)))
+        row_plain, row_color = render_selectable_row(it.label, is_sel, inner_w, dim=not is_sel)
+        plain.append(row_plain)
+        color.append(row_color)
     return plain, color
-
-
-def run_fuzzy_finder(
-    title: str,
-    items: list[FinderItem],
-    cols: int,
-    rows: int,
-    fd: int | None = None,
-):
-    """Drive the finder overlay. Returns the chosen item's value, or None."""
-    if fd is None:
-        fd = sys.stdin.fileno()
-    query = ""
-    selected = 0
-    total = len(items)
-    inner_w = max(40, min(cols - 6, 80))
-    list_rows = max(4, min(18, rows - 7))
-    chosen = [None]
-
-    with Modal():
-        last_out = None
-        while True:
-            matches = rank_items(items, query)
-            if selected >= len(matches):
-                selected = max(0, len(matches) - 1)
-            plain, color = build_finder_lines(
-                matches, query, selected, total, inner_w, list_rows + 2,
-            )
-            box, _ = build_box(
-                plain, color, maxw_override=inner_w,
-                title=title, title2="[esc] close",
-            )
-            start_row = max(0, rows // 2 - len(box) // 2)
-            out = [""] * rows
-            for i, bline in enumerate(box):
-                r = start_row + i
-                if 0 <= r < rows:
-                    pad = max(0, (cols - visible_len(bline)) // 2)
-                    out[r] = " " * pad + bline
-            if out != last_out:
-                render(out, cols, rows)
-                last_out = list(out)
-
-            ch = _read_key(fd, timeout=0.08)
-            if not ch:
-                continue
-            if ch == "ESC":
-                break
-            if ch in ("\r", "\n"):
-                if matches:
-                    chosen[0] = matches[selected].value
-                break
-            if ch == "UP":
-                if matches:
-                    selected = (selected - 1) % len(matches)
-                last_out = None
-                continue
-            if ch == "DOWN":
-                if matches:
-                    selected = (selected + 1) % len(matches)
-                last_out = None
-                continue
-            if ch in ("\x7f", "\b", "BACKSPACE"):
-                query = query[:-1]
-                selected = 0
-                last_out = None
-                continue
-            if len(ch) == 1 and ch.isprintable():
-                query += ch
-                selected = 0
-                last_out = None
-                continue
-
-    return chosen[0]

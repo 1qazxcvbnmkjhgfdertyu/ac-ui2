@@ -89,7 +89,7 @@ def render(ctx: NowPlayingContext) -> tuple[list[str], list[str]]:
 
     def _push(text: str, colored: str) -> None:
         plain.append(truncate_plain(text, w))
-        color.append(colored)
+        color.append(truncate_ansi_visible(colored, w))
 
     danger_col = theme_role("danger", grad)
     value_soft_col = theme_role("value_soft", grad)
@@ -170,12 +170,13 @@ def render(ctx: NowPlayingContext) -> tuple[list[str], list[str]]:
                 else:
                     sym_glyph = paint(SYM_PLAY, fg=title_col, bold=True)
                 pin_str = f" {paint('[pinned]', fg=accent_soft_col)}" if ctx.repeat_current else ""
-                color.append(
+                track_plain = f"{SYM_PLAY} {display_name}{' [pinned]' if ctx.repeat_current else ''}{dur_tag}"
+                track_color = (
                     f"{sym_glyph} "
                     f"{paint(display_name, fg=title_col, bold=True)}{pin_str}"
                     f"{paint(dur_tag, fg=theme_role('label', grad), dim=True)}"
                 )
-                plain.append(truncate_plain(f"{SYM_PLAY} {display_name}{dur_tag}", w))
+                _push(track_plain, track_color)
             else:
                 pin_str = " [pinned]" if ctx.repeat_current else ""
                 _add(f"{SYM_PLAY} {display_name}{pin_str}{dur_tag}", "36")
@@ -193,11 +194,11 @@ def render(ctx: NowPlayingContext) -> tuple[list[str], list[str]]:
                 pb_bar = "[" + "=" * filled + "-" * (bar_w - filled) + "]"
             pos_plain = f"  {display_hour:02d}h  {fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}"
             if USE_COLOR:
-                plain.append(truncate_plain(pos_plain, w))
-                color.append(
+                _push(
+                    pos_plain,
                     f"  {paint(f'{display_hour:02d}h', fg=accent_col)}"
                     f"  {paint(f'{fmt_mmss(t_pos_s)} / {fmt_mmss(t_dur_s)}', fg=label_dim_col, dim=True)}"
-                    f"  {pb_bar}"
+                    f"  {pb_bar}",
                 )
             else:
                 _add(f"{pos_plain}  {pb_bar}", "2")
@@ -209,35 +210,40 @@ def render(ctx: NowPlayingContext) -> tuple[list[str], list[str]]:
         if USE_COLOR:
             pulse_dot = paint(SYM_PULSE_ON, fg=pulse_col, bold=True) if (ctx.pulse_bright and not ctx.muted) else paint(SYM_PULSE_OFF, fg=pulse_col, dim=True)
             muted_tag = f"  {paint(f'{SYM_MUTED_MARK} MUTED', fg=danger_col, bold=True)}" if ctx.muted else ""
-            meta_plain = f"  {flt_sum}  {ctx.vis_mode}{flash_plain}"
-            plain.append(truncate_plain(meta_plain, w))
-            color.append(
-                f"  {paint(flt_sum, fg=accent_soft_col, dim=True)}"
-                f"  {paint(ctx.vis_mode, fg=label_dim_col, dim=True)}"
+            meta_plain = f"  Filter: {flt_sum}  Visual: {ctx.vis_mode}{flash_plain}"
+            _push(
+                meta_plain,
+                f"  {paint('Filter:', fg=label_dim_col, dim=True)} {paint(flt_sum, fg=accent_soft_col)}"
+                f"  {paint('Visual:', fg=label_dim_col, dim=True)} {paint(ctx.vis_mode, fg=theme_role('label', grad))}"
                 f"  {pulse_dot}{muted_tag}{ctx.vol_flash_str}"
             )
         else:
-            _add(f"  {flt_sum}  {ctx.vis_mode}{flash_plain}", "2")
+            _add(f"  Filter: {flt_sum}  Visual: {ctx.vis_mode}{flash_plain}", "2")
 
         # Line 4: countdown to next hour
         uvalue = f"{ctx.remaining // 60:02d}:{ctx.remaining % 60:02d}"
         if USE_COLOR:
             hr_pct = min(100, int(ctx.remaining / 3600 * 100))
-            cbar_w = max(4, min(w - 18, 96))
+            cbar_w = max(4, min(w - 28, 96))
             cbar = meter_bar(hr_pct, cbar_w, grad)
-            plain.append(truncate_plain(f"  Until: {uvalue}", w))
-            color.append(f"  {paint('Until:', fg=label_dim_col, dim=True)} {paint(uvalue, fg=value_soft_col)}  {cbar}")
+            _push(
+                f"  Until next hour: {uvalue}",
+                f"  {paint('Until next hour:', fg=label_dim_col, dim=True)} {paint(uvalue, fg=value_soft_col)}  {cbar}",
+            )
         else:
-            _add(f"  Until: {uvalue}", "95")
+            _add(f"  Until next hour: {uvalue}", "95")
 
         # Line 5: pick reason
         if ctx.track_pick_reason and not ctx.showing_chime:
-            reason_plain = f"  next via: {ctx.track_pick_reason}"
+            reason_plain = f"  Next pick: {ctx.track_pick_reason}"
             if USE_COLOR:
                 plain.append(truncate_plain(reason_plain, w))
-                color.append(f"  {paint('next via:', fg=label_dim_col, dim=True)} {paint(ctx.track_pick_reason, fg=good_col)}")
+                color.append(truncate_ansi_visible(
+                    f"  {paint('Next pick:', fg=label_dim_col, dim=True)} {paint(ctx.track_pick_reason, fg=good_col)}",
+                    w,
+                ))
             else:
-                _add(f"  next via: {ctx.track_pick_reason}", "2")
+                _add(reason_plain, "2")
 
     # Compose the themed album-art mosaic onto the left of the body.
     if _side_art and color:

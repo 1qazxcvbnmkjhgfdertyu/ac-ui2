@@ -26,7 +26,7 @@ SAMPLES = [
     "",
     "hello world",
     "n next  q quit  +/- vol",
-    "│ Now Playing ├──────╮",       # box-drawing (non-ASCII, width 1)
+    "╭─┐ Now Playing ┌────╮",      # box-drawing (non-ASCII, width 1)
     "⠋⠙⠹ braille ⠸⠼",                # braille (non-ASCII, width 1)
     "日本語のテキスト",               # wide CJK (width 2 each)
     "mix 日本 abc ▓▒░",

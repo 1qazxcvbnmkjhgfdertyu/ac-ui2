@@ -230,7 +230,7 @@ def test_history_panel_empty():
     from ac_ui.panels.history import render
     # btop-style: the panel name is in the box border, not an internal header line.
     plain, color = render([], max_width=40, tod_grad=_clrs._active_tod_grad)
-    assert "(none yet)" in plain[0]
+    assert "No history yet" in plain[0]
 
 
 def test_history_panel_entries():
@@ -246,7 +246,7 @@ def test_up_next_panel_empty():
     import ac_ui.colors as _clrs
     from ac_ui.panels.up_next import render
     plain, color = render([], max_width=40, tod_grad=_clrs._active_tod_grad)
-    assert "no candidates" in plain[-1]
+    assert "No upcoming tracks" in plain[-1]
 
 
 def test_up_next_panel_truncation():

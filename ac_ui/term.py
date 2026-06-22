@@ -176,42 +176,56 @@ def animate_title_art(base_lines, phase=0.0):
     return out, True
 
 
-def render(lines, width=None, height=None):
+def render(lines, width=None, height=None, *, lines_fitted=False):
     """Differential renderer: only outputs lines that changed since last frame."""
     global _render_prev_lines, _render_prev_raw_lines, _render_prev_width
     if width is None or height is None:
         size = shutil.get_terminal_size(fallback=(80, 24))
         width = size.columns
         height = size.lines
+    if not isinstance(lines, list):
+        lines = list(lines)
     if len(lines) < height:
         lines = lines + [""] * (height - len(lines))
     elif len(lines) > height:
         lines = lines[:height]
 
-    # Clip each line to terminal width
-    clipped = []
-    same_width = _render_prev_width == width
-    for idx, line in enumerate(lines):
-        if same_width and idx < len(_render_prev_raw_lines) and line == _render_prev_raw_lines[idx]:
-            clipped.append(_render_prev_lines[idx])
-            continue
-        vis = len(line) if "\x1b[" not in line and line.isascii() else visible_len(line)
-        if vis >= width:
-            line = truncate_ansi_visible(line, max(0, width - 1))
-        clipped.append(line)
+    if lines_fitted:
+        clipped = lines
+    else:
+        # Clip each line to terminal width
+        clipped = []
+        same_width = _render_prev_width == width
+        for idx, line in enumerate(lines):
+            if same_width and idx < len(_render_prev_raw_lines) and line == _render_prev_raw_lines[idx]:
+                clipped.append(_render_prev_lines[idx])
+                continue
+            vis = len(line) if "\x1b[" not in line and line.isascii() else visible_len(line)
+            if vis >= width:
+                line = truncate_ansi_visible(line, max(0, width - 1))
+            clipped.append(line)
 
     # Extend previous frame buffer to match current height
     prev = _render_prev_lines
     if len(prev) != len(clipped):
         prev = [""] * len(clipped)
 
-    buf = []
+    changed = []
     for idx, (new_line, old_line) in enumerate(zip(clipped, prev)):
         if new_line != old_line:
-            buf.append(f"\033[{idx + 1};1H{new_line}\033[K")
+            changed.append((idx, new_line))
 
-    if buf:
-        sys.stdout.write("".join(buf))
+    if changed:
+        # Full-screen visualizers tend to change almost every row. In that case
+        # a top-home full repaint is materially cheaper than emitting a cursor
+        # move for every line.
+        if len(changed) * 5 >= len(clipped) * 3:
+            sys.stdout.write("\033[H\033[K" + "\r\n\033[K".join(clipped) + "\033[K")
+        else:
+            buf = []
+            for idx, new_line in changed:
+                buf.append(f"\033[{idx + 1};1H{new_line}\033[K")
+            sys.stdout.write("".join(buf))
         sys.stdout.flush()
 
     _render_prev_lines = clipped

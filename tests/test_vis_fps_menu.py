@@ -23,22 +23,19 @@ def test_cycle_fps_snaps_unknown_value():
     assert cycle_fps(58, 0) == near
 
 
-def test_build_lines_shows_all_three_tiers():
-    fps = {"fast": 60, "normal": 30, "heavy": 24}
-    plain, color = build_vis_fps_lines(fps, selected=0, inner_w=60)
+def test_build_lines_shows_single_rate():
+    plain, color = build_vis_fps_lines(45, inner_w=60)
     assert len(plain) == len(color)
     body = "\n".join(plain)
-    assert "60 fps" in body and "30 fps" in body and "24 fps" in body
+    assert "45 fps" in body
+    assert "all visualizers" in body.lower()
     for line in plain:
         assert len(line) <= 60
 
 
-def test_build_lines_marks_selection():
-    fps = default_vis_fps_map()
-    plain, _c = build_vis_fps_lines(fps, selected=1, inner_w=60)
-    # The three tier rows are the first three lines; row 1 is selected.
-    assert plain[1].strip().startswith((">", "▶"))
-    assert not plain[0].strip().startswith((">", "▶"))
+def test_build_lines_warns_when_pinned():
+    plain, _c = build_vis_fps_lines(60, inner_w=64, pinned=True)
+    assert any("AC_UI_REFRESH" in line for line in plain)
 
 
 def test_persist_normalizes_vis_fps():

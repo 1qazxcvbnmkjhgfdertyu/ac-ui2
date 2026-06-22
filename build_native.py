@@ -41,7 +41,7 @@ def main():
     include = sysconfig.get_path("include")
     cc = os.environ.get("CC", "cc")
     cmd = [cc, "-shared", "-fPIC", "-O3", "-ffast-math",
-           "-I", include, CSRC, "-o", out]
+           "-I", include, CSRC, "-o", out, "-lm"]
     print("·", " ".join(cmd))
     rc = subprocess.call(cmd)
     if rc != 0:

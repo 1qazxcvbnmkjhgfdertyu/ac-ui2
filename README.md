@@ -35,6 +35,45 @@ Optional:
 - `lolcat`
 - an `AnimalCrossing` renderer binary on `PATH` or in the local asset root
 
+## Quick Install
+
+From a clone of the repo:
+
+```bash
+./install.sh
+```
+
+What it does:
+
+- detects a usable `Python 3.11+`
+- prints or runs distro-specific system dependency commands when it can
+- installs `ac-ui` with `pipx` when available, otherwise into a per-user venv
+- wires up a real `ac-ui` command instead of relying on `./ac-ui`
+- runs `ac-ui doctor` at the end
+
+Useful installer flags:
+
+```bash
+./install.sh --yes
+./install.sh --skip-deps
+./install.sh --with-optional
+./install.sh --venv
+```
+
+If you prefer to install manually:
+
+```bash
+python3 -m pip install .
+python3 -m ac_ui doctor
+```
+
+If you use `pipx`:
+
+```bash
+pipx install .
+ac-ui doctor
+```
+
 ## Music Library
 
 By default `ac-ui` reads music from:
@@ -79,6 +118,7 @@ Useful commands:
 
 ```bash
 ./ac-ui --help
+./ac-ui doctor
 ./ac-ui tune show
 ./ac-ui tune play
 ./ac-ui tune reset
@@ -95,6 +135,12 @@ The launcher script at repo root stays intentionally small:
 ```
 
 It simply loads the packaged implementation from `ac_ui/` and runs `ac_ui.ui:main`.
+Packaged installs also expose:
+
+```bash
+ac-ui
+python -m ac_ui
+```
 
 Useful local checks during refactors:
 
@@ -140,6 +186,14 @@ Relevant environment variables:
 - `AC_UI_AUDIO_DEVICE=<mpv-device>`
 - `AC_UI_CAVA_INPUT=pulse`
 - `AC_UI_CAVA_SOURCE=<monitor-source>`
+- `AC_UI_CAVA_BIN=/path/to/cava`
+
+If `AC_UI_CAVA_BIN` is unset, `ac-ui` uses the normal `cava` on `PATH`. That
+gives you a clean fallback while keeping a forked binary available for testing:
+
+```bash
+AC_UI_CAVA_BIN=/path/to/cava-fork/cava ./ac-ui
+```
 
 If you want to bypass the private sink and point directly at a known sink:
 

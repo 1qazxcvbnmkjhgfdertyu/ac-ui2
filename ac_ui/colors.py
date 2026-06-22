@@ -109,11 +109,23 @@ class TerminalColor:
     r: int
     g: int
     b: int
-    ansi: int
+    # Lazily-resolved 256-colour palette index. Computing it eagerly for every
+    # gradient/theme colour at import time cost ~100ms (a 256-entry nearest
+    # search per colour); the value is only ever read in 256-colour mode, so we
+    # defer it to first access and cache on the (frozen) instance.
+    _ansi: int | None = None
 
     @property
     def rgb(self) -> tuple[int, int, int]:
         return self.r, self.g, self.b
+
+    @property
+    def ansi(self) -> int:
+        a = self._ansi
+        if a is None:
+            a = ansi256_from_rgb((self.r, self.g, self.b))
+            object.__setattr__(self, "_ansi", a)
+        return a
 
     def __int__(self) -> int:
         return int(self.ansi)
@@ -196,7 +208,7 @@ def _to_terminal_color(value) -> TerminalColor:
         return TerminalColor(r, g, b, value)
     if isinstance(value, (tuple, list)) and len(value) == 3:
         rgb = tuple(_clamp8(c) for c in value)
-        return TerminalColor(rgb[0], rgb[1], rgb[2], ansi256_from_rgb(rgb))
+        return TerminalColor(rgb[0], rgb[1], rgb[2])
     raise TypeError(f"Unsupported color value: {value!r}")
 
 
@@ -338,8 +350,19 @@ def _rgb_lerp(start, end, t):
 def _make_gradient(c_start, c_end, steps=101):
     if steps <= 1:
         return (_to_terminal_color(c_start),)
+    # Resolve the endpoints once instead of re-resolving them (and re-clamping
+    # the result) on every step — this builds the 101-entry gradients used at
+    # import time with a single TerminalColor construction per entry.
+    sr, sg, sb = _to_terminal_color(c_start).rgb
+    er, eg, eb = _to_terminal_color(c_end).rgb
+    dr, dg, db = er - sr, eg - sg, eb - sb
+    denom = steps - 1
     return tuple(
-        _to_terminal_color(_rgb_lerp(c_start, c_end, i / max(1, steps - 1)))
+        TerminalColor(
+            _clamp8(sr + dr * (i / denom)),
+            _clamp8(sg + dg * (i / denom)),
+            _clamp8(sb + db * (i / denom)),
+        )
         for i in range(steps)
     )
 
@@ -431,12 +454,14 @@ _BASE_THEME_CHROME = {
         "h": "─",
         "v": "│",
     },
-    "title_left": "┤",
-    "title_right": "├",
+    "title_left": "┐",
+    "title_right": "┌",
+    "title_left_down": "┘",
+    "title_right_down": "└",
     "section_left": "├",
     "section_right": "┤",
-    "header_left": "┤",
-    "header_right": "├",
+    "header_left": "┐",
+    "header_right": "┌",
     "divider": "─",
     "separator": "─",
 }
@@ -452,6 +477,8 @@ _ASCII_THEME_CHROME = {
     },
     "title_left": "+",
     "title_right": "+",
+    "title_left_down": "+",
+    "title_right_down": "+",
     "section_left": "+",
     "section_right": "+",
     "header_left": "+",
@@ -1040,6 +1067,7 @@ def theme_chrome(name: str | None = None) -> dict:
         resolved["box_chars"] = dict(_ASCII_THEME_CHROME["box_chars"])
         for glyph_key in (
             "title_left", "title_right",
+            "title_left_down", "title_right_down",
             "section_left", "section_right",
             "header_left", "header_right",
             "divider", "separator",

@@ -1,4 +1,6 @@
-import os, sys, subprocess, json, time, stat, errno, shutil, socket, tempfile, hashlib
+import os, sys, subprocess, json, time, stat, errno, shutil
+# socket/tempfile/hashlib are imported lazily inside the few functions that use
+# them (MIDI conversion + IPC) to keep them off the startup import path.
 
 import ac_ui.diagnostics as _diag
 import ac_ui.colors as _clrs
@@ -530,6 +532,7 @@ def convert_midi_to_wav(midi_path):
     timidity_bin = shutil.which("timidity")
     if not timidity_bin:
         return None
+    import tempfile
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="ac_ui_midi_")
@@ -562,6 +565,7 @@ def _midi_cache_key(midi_path: str) -> str:
         raw = f"{os.path.abspath(midi_path)}:{st.st_mtime_ns}:{st.st_size}"
     except OSError:
         raw = os.path.abspath(midi_path)
+    import hashlib
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 

@@ -33,3 +33,4 @@ layout_sweep/
 stats.json
 stats.csv
 state.json
+.venv/

@@ -1,11 +1,14 @@
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "ac-ui"
 version = "0.1.0"
 requires-python = ">=3.11"
+
+[project.scripts]
+ac-ui = "ac_ui.app:main_cli"
 
 [tool.setuptools.packages.find]
 where = ["."]

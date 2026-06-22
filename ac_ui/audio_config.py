@@ -117,6 +117,7 @@ VIS_MODES = (
     "ascii",
     "fireworks", "starfield", "ripple", "aurora",
     "kaleido_tunnel", "liquid_scope", "plasma_bloom", "milkdrop",
+    "orb3d",
     "polar", "chroma",
     "features",
 )
@@ -160,6 +161,10 @@ VIS_MODE_ALIASES = {
     "milk": "milkdrop",
     "preset": "milkdrop",
     "shuffle": "milkdrop",
+    "orb": "orb3d",
+    "sphere": "orb3d",
+    "ball": "orb3d",
+    "3d": "orb3d",
     "donut": "polar",
     "ring": "polar",
     "circle": "polar",
@@ -225,6 +230,7 @@ VIS_TIER_LABELS = {
 FAST_VIS_MODES = frozenset({
     "bars", "peaks", "shades", "outline", "spectrum", "braille", "wave",
     "scope", "butterfly", "led_matrix", "heartbeat", "polar", "chroma", "features",
+    "orb3d",
 })
 # Per-pixel feedback/tunnel modes — the expensive ones.
 HEAVY_VIS_MODES = frozenset({

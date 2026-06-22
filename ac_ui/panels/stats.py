@@ -36,7 +36,7 @@ def render(
     peak_pct = int(peak_v / max(1, hb_total) * 100)
     active_count = sum(1 for v in hb if v > 0)
     avg_per_h = format_seconds(int(hb_total / max(1, active_count))) if active_count > 0 else "--"
-    top_hours_text = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "(none yet)"
+    top_hours_text = ", ".join([f"{h:02d}:00" for h, v in top if v > 0]) or "No listening yet"
     _hist_plain, marker_plain, axis_plain = build_hour_histogram_lines(hb, hour, max_width)
 
     # btop-style multi-row area graph of the 24h listening histogram.
@@ -50,7 +50,7 @@ def render(
         truncate_plain(f"Most-listened hours: {top_hours_text}", max_width),
         truncate_plain(
             f"Busiest hour: {peak_h:02d}:00 ({peak_pct}% of total)" if peak_v > 0
-            else "Busiest hour: (not enough listening yet)",
+            else "Busiest hour: No listening yet",
             max_width,
         ),
         truncate_plain(f"Hours used: {active_count} of 24   Avg used hour: {avg_per_h}", max_width),
@@ -94,7 +94,7 @@ def render(
             (
                 f"{paint('Busiest hour:', fg=_lc, dim=True)} {paint(f'{peak_h:02d}:00 ({peak_pct}% of total)', fg=_pc)}"
                 if peak_v > 0 else
-                f"{paint('Busiest hour:', fg=_lc, dim=True)} {paint('(not enough listening yet)', fg=_cc)}"
+                f"{paint('Busiest hour:', fg=_lc, dim=True)} {paint('No listening yet', fg=_cc)}"
             ),
             f"{paint('Hours used:', fg=_lc, dim=True)} {paint(f'{active_count} of 24', fg=_cc)}   {paint('Avg used hour:', fg=_lc, dim=True)} {paint(avg_per_h, fg=_cc)}",
             *graph_colored,

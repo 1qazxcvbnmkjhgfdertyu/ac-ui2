@@ -78,20 +78,28 @@ def config_set_cli(argv: list[str]) -> bool:
     while i < len(argv):
         a = argv[i]
         if a == "--set-theme" and i + 1 < len(argv):
-            theme = argv[i + 1]; i += 2; continue
+            theme = argv[i + 1]
+            i += 2
+            continue
         if a.startswith("--set-theme="):
-            theme = a.split("=", 1)[1]; i += 1; continue
+            theme = a.split("=", 1)[1]
+            i += 1
+            continue
         if a == "--set-layout" and i + 1 < len(argv):
-            layout = argv[i + 1]; i += 2; continue
+            layout = argv[i + 1]
+            i += 2
+            continue
         if a.startswith("--set-layout="):
-            layout = a.split("=", 1)[1]; i += 1; continue
+            layout = a.split("=", 1)[1]
+            i += 1
+            continue
         i += 1
     if theme is None and layout is None:
         return False
 
-    from ac_ui.persist import load_ui_state, save_ui_state
     from ac_ui.colors import THEME_NAMES
     from ac_ui.constants import LAYOUT_PRESETS
+    from ac_ui.persist import load_ui_state, save_ui_state
 
     state = load_ui_state()
     if theme is not None:
@@ -114,9 +122,27 @@ def config_set_cli(argv: list[str]) -> bool:
     return True
 
 
+def main_cli(argv: list[str] | None = None) -> int:
+    """Top-level console entry point for repo, pip, and ``python -m ac_ui`` runs."""
+    if argv is None:
+        argv = sys.argv
+    cleaned = apply_cli_runtime_env(list(argv))
+    if cleaned:
+        cleaned[0] = "ac-ui"
+    sys.argv = cleaned
+    if config_set_cli(cleaned):
+        return 0
+    if len(cleaned) >= 2 and cleaned[1] == "doctor":
+        from ac_ui.install import doctor_cli
+        return doctor_cli(cleaned[2:])
+    from ac_ui.ui import main as ui_main
+    ui_main()
+    return 0
+
+
 def parse_cli_args(argv: list[str]) -> tuple:
     """Parse sys.argv and return (mode, games, vis_mode, import_paths, tune_action, layout_opts)."""
-    from ac_ui.constants import VIS_MODES, VIS_MODE, normalize_vis_mode
+    from ac_ui.constants import VIS_MODE, VIS_MODES, normalize_vis_mode
 
     mode = "run"
     games = None
@@ -130,6 +156,7 @@ def parse_cli_args(argv: list[str]) -> tuple:
         if arg in ("-h", "--help"):
             print("Usage:")
             print("  ac-ui [--games GCN,WW] [--vis MODE] [--bars N] [--true-color] [--ascii-only]")
+            print("  ac-ui doctor [--json] [--install-commands] [--with-optional]")
             print("  ac-ui import <files...>")
             print("  ac-ui tune [show|play|reset]")
             print("  ac-ui stats")
@@ -195,6 +222,10 @@ def parse_cli_args(argv: list[str]) -> tuple:
             mode = "import"
             import_paths = argv[i + 1:]
             break
+        if arg == "extract-ac":
+            mode = "extract-ac"
+            import_paths = argv[i + 1:]
+            break
         if arg == "tune":
             mode = "tune"
             if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
@@ -241,11 +272,14 @@ def build_cache_cli(playlist_paths: list[str]) -> int:
     Usage: ac-ui build-cache [playlist_path ...]
     With no args, uses free_play_dir from saved state.
     """
-    from ac_ui.tracks import scan_free_play_dir, free_play_source_name
     from ac_ui.audio import (
-        convert_midi_to_wav, lookup_midi_cache, store_to_midi_cache, _MIDI_EXTENSIONS,
+        _MIDI_EXTENSIONS,
+        convert_midi_to_wav,
+        lookup_midi_cache,
+        store_to_midi_cache,
     )
     from ac_ui.persist import load_ui_state
+    from ac_ui.tracks import free_play_source_name, scan_free_play_dir
 
     if not playlist_paths:
         state = load_ui_state()

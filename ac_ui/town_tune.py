@@ -1,4 +1,4 @@
-import os, json, random, struct, wave, shutil, subprocess, tempfile, time
+import os, json, random, struct, wave, shutil, subprocess, time
 
 from ac_ui.constants import (
     TOWN_TUNE_PATH, TOWN_TUNE_HOLD, TOWN_TUNE_OFF, TOWN_TUNE_RANDOM,
@@ -463,6 +463,7 @@ def _wait_for_ipc_socket(ipc_path, timeout=0.75):
 def spawn_town_tune(audio_device=None, notes=None):
     if not TOWN_TUNE_ENABLED:
         return None, None
+    import tempfile
     notes = load_town_tune() if notes is None else normalize_town_tune(notes)
     tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".wav", delete=False)
     tmp.close()
@@ -481,6 +482,7 @@ def spawn_town_tune(audio_device=None, notes=None):
 def spawn_town_tune_note(tok, audio_device=None, notes=None, cursor=None):
     if not TOWN_TUNE_ENABLED:
         return None, None
+    import tempfile
     tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-note-", suffix=".wav", delete=False)
     tmp.close()
     try:
@@ -514,6 +516,7 @@ def town_tune_cli(action=None):
         if not _resolve_command_path(MPV):
             print(f"Required player not found: {MPV}")
             return 1
+        import tempfile
         tmp = tempfile.NamedTemporaryFile(prefix="ac-ui-tune-", suffix=".wav", delete=False)
         tmp.close()
         try:
